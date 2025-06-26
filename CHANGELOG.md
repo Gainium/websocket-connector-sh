@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refactor price connector worker system
 - Update package dependencies and linting configuration
 - Enhanced environment variable handling
+- Update kucoin-api dependency to 1.0.4 with broker partner header condition fix (check secrets existence)
 
 ### Fixed
 - Fix environment name configuration

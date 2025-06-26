@@ -99,8 +99,8 @@
     levn "^0.4.1"
 
 "@gainium/kucoin-api@git+https://github.com/Gainium/kucoin-api.git":
-  version "1.0.3"
-  resolved "git+https://github.com/Gainium/kucoin-api.git#ed763b81fdc7ad8a58d1cdd802dcc2d44bdd78e1"
+  version "1.0.4"
+  resolved "git+https://github.com/Gainium/kucoin-api.git#4b6d5b0097e160d4dccc3cab594ef2466592a8e3"
   dependencies:
     isomorphic-unfetch "^3.1.0"
     isomorphic-ws "^5.0.0"
