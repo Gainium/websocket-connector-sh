@@ -70,4 +70,11 @@ export default defineConfig([
       'unused-imports/no-unused-imports': 'error',
     },
   },
+
+  {
+    files: ['**/*.js', '**/*.mjs', '**/*.cjs'],
+    rules: {
+      '@typescript-eslint/no-require-imports': 'off',
+    },
+  },
 ])

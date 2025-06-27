@@ -308,7 +308,7 @@ export class WebsocketClient extends EventEmitter implements IWebsocketClient {
         store.setConnectionState(wsKey, WsConnectionStateEnum.CONNECTING)
       }
 
-      const url = getWsUrlForWsKey(wsKey, this.options)
+      const url = getWsUrlForWsKey(wsKey, this.options, this.logger)
       const ws = await this.connectToWsUrl(url, wsKey)
 
       return store.setWs(wsKey, ws)

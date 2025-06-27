@@ -537,7 +537,7 @@ class UserConnector {
   @IdMute(mutex, () => `closeStreamBybit`)
   private async closeBybitConnection(client: BybitClient) {
     client.closeAll(true)
-    client.on('error', () => null)
+    client.on('exception', () => null)
     client.on('update', () => null)
   }
 
@@ -985,19 +985,7 @@ class UserConnector {
               pingInterval: 20000,
             },
             {
-              silly: () => null,
-              debug: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bybit debug log ${JSON.stringify({ msg })} ${
-                    api.provider
-                  }`,
-                ),
-              notice: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bybit notice log ${JSON.stringify({
-                    msg,
-                  })} ${api.provider}`,
-                ),
+              trace: () => null,
               info: (...msg) => {
                 if (msg[0] === 'Websocket reconnected') {
                   this.redis?.publish(
@@ -1011,12 +999,6 @@ class UserConnector {
                   })} ${api.provider}`,
                 )
               },
-              warning: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bybit warning log ${JSON.stringify({
-                    msg: msg?.[0],
-                  })} ${api.provider}`,
-                ),
               error: (...msg) =>
                 this.logger(
                   `${id} ${userId} bybit error log ${JSON.stringify({
@@ -1069,7 +1051,7 @@ class UserConnector {
           const close = () => {
             this.closeBybitConnection(client)
           }
-          client.on('error', async (error: Error | string) => {
+          client.on('exception', async (error: Error | string) => {
             const message = typeof error !== 'string' ? error.message : error
             let m = `${message}`
             try {
@@ -1912,7 +1894,7 @@ class UserConnector {
     }
     return msg.events
       .map((data) =>
-        data.orders
+        (data.orders ?? [])
           .filter((order) => order.status !== OrderStatus.PENDING)
           .map((order) => {
             const updateTime = +new Date(msg.timestamp)

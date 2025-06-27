@@ -22,7 +22,7 @@ class CommonConnector {
       connectTime: number
     }
   } = {}
-  watchdog: NodeJS.Timer | null = null
+  watchdog: NodeJS.Timeout | null = null
   timeout = 50000
   tradeTimeout = 50000
   connectTime = 50000

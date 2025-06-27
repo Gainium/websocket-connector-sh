@@ -205,7 +205,7 @@ const getAllExchangeInfo = async (
     }
     if (exchange === ExchangeEnum.bitgetUsdm) {
       return await Promise.all(
-        ['USDT-FUTURES', 'USDC-FUTURES'].map(async (productType) => {
+        (['USDT-FUTURES', 'USDC-FUTURES'] as const).map(async (productType) => {
           return await rest
             .getFuturesContractConfig({
               productType,
@@ -232,7 +232,7 @@ const getAllExchangeInfo = async (
   ) {
     const rest = new OKXRESTClient(undefined, OKXEnv())
     const type: InstrumentType = exchange === ExchangeEnum.okx ? 'SPOT' : 'SWAP'
-    const markets = await rest.getInstruments(type).catch(() => {
+    const markets = await rest.getInstruments({ instType: type }).catch(() => {
       logger.warn('Failed to get okx  markets')
       return [] as Instrument[]
     })

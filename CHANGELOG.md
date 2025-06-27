@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [2025-06-27]
+
+### Changed
+- Bumped dependencies to fix known vulnerabilities.
+- Updated code to fit new version of exchange packages.
+
 ## [2025-06-26]
 
 ### Added

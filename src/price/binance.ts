@@ -48,7 +48,7 @@ class BinanceConnector extends CommonConnector {
   )
   private binanceTimers: Map<
     ExchangeEnum,
-    { timer: NodeJS.Timer | null; execute: boolean }
+    { timer: NodeJS.Timeout | null; execute: boolean }
   > = new Map()
   constructor(
     private subscribedCandlesMap: Map<ExchangeEnum, Set<string>> = new Map(),

@@ -20,7 +20,7 @@ const mutex = new IdMutex()
 const maxCandlesPerConnection = 1000
 
 class OkxConnector extends CommonConnector {
-  private timer: Map<Market, NodeJS.Timer | null> = new Map()
+  private timer: Map<Market, NodeJS.Timeout | null> = new Map()
   private inQueueCandles: Map<
     Market,
     Map<

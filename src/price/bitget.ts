@@ -98,7 +98,7 @@ class BitgetConnector extends CommonConnector {
       id: 0,
     },
   ]
-  private timer: Map<Market, NodeJS.Timer | null> = new Map()
+  private timer: Map<Market, NodeJS.Timeout | null> = new Map()
   private inQueueCandles: Map<Market, Map<string, MapValue>> = new Map()
 
   constructor(
