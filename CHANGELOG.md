@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.0.4] - 2025-06-30
+
+### Changed
+- Switched to npm package manager
+- Removed yarn.lock file (no longer needed with npm)
+
 ## [2025-06-27]
 
 ### Changed
