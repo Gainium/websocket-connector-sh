@@ -139,11 +139,7 @@ class BybitConnector extends CommonConnector {
       reconnectTimeout: this.wsReconnect,
       market: 'v5' as const,
     }
-    const client = new BybitWSClient(settings, {
-      info: wsLoggerOptions.info,
-      error: wsLoggerOptions.error,
-      trace: wsLoggerOptions.silly,
-    })
+    const client = new BybitWSClient(settings, wsLoggerOptions)
     client.on('update', this.bybitGetCallback(exchange, type))
     client.on('open', this.commonWsOpenCb(exchange, type))
     client.on('exception', this.bybitRestartCb(exchange))

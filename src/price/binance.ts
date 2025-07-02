@@ -4,6 +4,7 @@ import { IdMute, IdMutex } from '../utils/mutex'
 import sleep from '../utils/sleep'
 import {
   WebsocketClient as BinanceWSClient,
+  WS_KEY_MAP,
   WsMessage24hrTickerRaw,
   WsRawMessage,
 } from 'binance'
@@ -130,7 +131,7 @@ class BinanceConnector extends CommonConnector {
         `${e.toUpperCase()} ${type} opened ${`${data.wsKey}`.slice(
           0,
           100,
-        )} ${`${data.ws.target.url}`.slice(0, 100)}`,
+        )} ${`${data.wsUrl}`.slice(0, 100)}`,
       )
     }
   }
@@ -157,7 +158,7 @@ class BinanceConnector extends CommonConnector {
     if (current) {
       current.removeAllListeners()
       current.closeAll(false)
-      current.on('error', () => null)
+      current.on('exception', () => null)
     }
     const settings: { [x: string]: unknown } = {
       reconnectTimeout: this.wsReconnect,
@@ -171,7 +172,7 @@ class BinanceConnector extends CommonConnector {
     const client = new BinanceWSClient(settings, wsLoggerOptions)
     client.on('message', this.binanceGetCallback(exchange, type))
     client.on('open', this.binanceOpenCb(exchange, type))
-    client.on('error', this.binanceErrorCb(exchange))
+    client.on('exception', this.binanceErrorCb(exchange))
     return client
   }
 
@@ -365,47 +366,31 @@ class BinanceConnector extends CommonConnector {
       i++
       await sleep(1000)
       if (us) {
+        //@ts-ignore
         this.binanceClientCandleUs.connectToWsUrl(
-          //@ts-ignore
-          `${this.binanceClientCandleUs.getWsBaseUrl(
-            'spot',
-            wsKey,
-          )}/ws/${wsKey}`,
-          wsKey,
-          forceNew,
+          `${await this.binanceClientCandleUs.getWsUrl(WS_KEY_MAP.main)}?streams=${wsKey}`,
+          WS_KEY_MAP.main,
         )
       } else {
         if (futures) {
           if (futures === 'coinm') {
+            //@ts-ignore
             this.binanceClientCandleCoinm.connectToWsUrl(
-              //@ts-ignore
-              `${this.binanceClientCandleCoinm.getWsBaseUrl(
-                'coinm',
-                wsKey,
-              )}/ws/${wsKey}`,
-              wsKey,
-              forceNew,
+              `${await this.binanceClientCandleCoinm.getWsUrl(WS_KEY_MAP.coinm)}?streams=${wsKey}`,
+              WS_KEY_MAP.coinm,
             )
           } else if (futures === 'usdm') {
+            //@ts-ignore
             this.binanceClientCandleUsdm.connectToWsUrl(
-              //@ts-ignore
-              `${this.binanceClientCandleUsdm.getWsBaseUrl(
-                'usdm',
-                wsKey,
-              )}/ws/${wsKey}`,
-              wsKey,
-              forceNew,
+              `${await this.binanceClientCandleUsdm.getWsUrl(WS_KEY_MAP.usdm)}?streams=${wsKey}`,
+              WS_KEY_MAP.usdm,
             )
           }
         } else {
+          //@ts-ignore
           this.binanceClientCandle.connectToWsUrl(
-            //@ts-ignore
-            `${this.binanceClientCandle.getWsBaseUrl(
-              'spot',
-              wsKey,
-            )}/ws/${wsKey}`,
-            wsKey,
-            forceNew,
+            `${await this.binanceClientCandle.getWsUrl(WS_KEY_MAP.main)}?streams=${wsKey}`,
+            WS_KEY_MAP.main,
           )
         }
       }

@@ -19,6 +19,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.0.5] - 2025-07-02
+
+### Changed
+- Updated multiple dev dependencies to latest versions:
+  - @eslint/js: ^9.29.0 → ^9.30.1
+  - @types/node: ^24.0.4 → ^24.0.10
+  - @typescript-eslint/eslint-plugin: ^8.35.0 → ^8.35.1
+  - @typescript-eslint/parser: ^8.35.0 → ^8.35.1
+  - eslint: ^9.29.0 → ^9.30.1
+  - globals: ^16.2.0 → ^16.3.0
+- Updated runtime dependencies:
+  - binance: ^2.15.22 → ^3.0.0 (major version update)
+  - dotenv: ^16.6.0 → ^17.0.1 (major version update)
+  - ws: ^8.18.2 → ^8.18.3
+- Updated code to work with new binance package v3.0.0:
+  - Added WS_KEY_MAP import
+  - Updated websocket event handling (data.ws.target.url → data.wsUrl)
+  - Changed error event listener ('error' → 'exception')
+- Updated other exchange connectors to maintain compatibility
+
 ## [1.0.4] - 2025-06-30
 
 ### Changed

@@ -1,4 +1,8 @@
-import { ExchangeEnum, mapPaperToReal, wsLoggerOptions } from '../utils/common'
+import {
+  ExchangeEnum,
+  mapPaperToReal,
+  obsoleteWsLoggerOptions,
+} from '../utils/common'
 import logger from '../utils/logger'
 import { IdMute, IdMutex } from '../utils/mutex'
 import { WsPublicKlineChannel } from 'okx-api'
@@ -139,7 +143,11 @@ class OkxConnector extends CommonConnector {
       reconnectTimeout: this.wsReconnect,
       market: OKXEnv(),
     }
-    const client = new OKXWSClient(settings, wsLoggerOptions, type === 'candle')
+    const client = new OKXWSClient(
+      settings,
+      obsoleteWsLoggerOptions,
+      type === 'candle',
+    )
     client.on('update', this.okxGetCallback(exchange, type))
     client.on('open', this.commonWsOpenCb(exchange, type))
     client.on('error', this.okxRestartCb(exchange))

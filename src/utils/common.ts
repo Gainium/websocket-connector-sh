@@ -86,6 +86,12 @@ export const mapPaperToReal = (exchange: ExchangeEnum, warn = true) => {
 }
 
 export const wsLoggerOptions = {
+  trace: () => null,
+  info: () => null,
+  error: () => null,
+}
+
+export const obsoleteWsLoggerOptions = {
   silly: () => null,
   debug: () => null,
   notice: () => null,

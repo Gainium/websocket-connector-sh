@@ -1,4 +1,8 @@
-import { ExchangeEnum, mapPaperToReal, wsLoggerOptions } from '../utils/common'
+import {
+  ExchangeEnum,
+  mapPaperToReal,
+  obsoleteWsLoggerOptions,
+} from '../utils/common'
 import logger from '../utils/logger'
 import { IdMute, IdMutex } from '../utils/mutex'
 import {
@@ -164,7 +168,7 @@ class BitgetConnector extends CommonConnector {
       reconnectTimeout: this.wsReconnect,
       market: 'v5' as const,
     }
-    const client = new WSClient(settings, wsLoggerOptions)
+    const client = new WSClient(settings, obsoleteWsLoggerOptions)
     client.on('update', this.bitgetGetCallback(exchange, type))
     client.on('open', this.commonWsOpenCb(exchange, type))
     client.on('exception', this.bitgetRestartCb(exchange))

@@ -682,7 +682,7 @@ class UserConnector {
         client.on('open', (data) => {
           this.logger(
             //@ts-ignore
-            `${id} connection opened open: ${data.wsKey} ${data.ws.target.url} ${api.provider}`,
+            `${id} connection opened open: ${data.wsKey} ${data.wsUrl} ${api.provider}`,
           )
         })
 
@@ -700,7 +700,7 @@ class UserConnector {
         })
 
         // Recommended: receive error events (e.g. first reconnection failed)
-        client.on('error', async (data) => {
+        client.on('exception', async (data) => {
           this.logger(
             `${id} ${userId} ws saw error ${data.wsKey} ${data?.error?.message} ${api.provider}`,
             true,
