@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.0.6] - 2025-07-03
+
+### Fixed
+- Fixed Bybit ticker issue where only 500 tickers were being used to receive ticker updates
+
 ## [1.0.5] - 2025-07-02
 
 ### Changed

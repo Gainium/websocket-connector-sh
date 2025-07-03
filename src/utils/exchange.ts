@@ -1,4 +1,9 @@
-import { RestClientV5 as BybitRESTClient, CategoryV5 } from 'bybit-api'
+import {
+  APIResponseV3WithTime,
+  RestClientV5 as BybitRESTClient,
+  CategoryV5,
+  InstrumentInfoResponseV5,
+} from 'bybit-api'
 import { ExchangeEnum } from './common'
 import {
   Instrument,
@@ -159,13 +164,41 @@ const getAllExchangeInfo = async (
         : exchange === ExchangeEnum.bybitUsdm
           ? 'linear'
           : 'inverse'
-    const markets = await rest
+    const markets: APIResponseV3WithTime<
+      InstrumentInfoResponseV5<typeof categoryV5>
+    > | null = await rest
       .getInstrumentsInfo<typeof categoryV5>({ category: categoryV5 })
       .catch(() => {
         logger.warn('Failed to get bybit markets')
-        return { result: { list: [] } }
+        return null
       })
-    return markets.result.list.map((m) => m.symbol)
+    const allMarkets = new Set<string>()
+    ;(markets?.result.list ?? []).forEach((m) => {
+      allMarkets.add(m.symbol)
+    })
+    if (markets?.result.nextPageCursor) {
+      let cursor: string | null = markets.result.nextPageCursor
+      while (cursor) {
+        const nextMarkets: APIResponseV3WithTime<
+          InstrumentInfoResponseV5<typeof categoryV5>
+        > | null = await rest
+          .getInstrumentsInfo<typeof categoryV5>({
+            category: categoryV5,
+            cursor,
+          })
+          .catch(() => {
+            logger.warn('Failed to get bybit markets')
+            return null
+          })
+
+        ;(nextMarkets?.result.list ?? []).forEach((m) => {
+          allMarkets.add(m.symbol)
+        })
+
+        cursor = nextMarkets?.result.nextPageCursor || null
+      }
+    }
+    return [...allMarkets]
   }
   if (
     [
