@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.0.7] - 2025-07-16
+
+### Added
+- Added support for changing Bybit host (com, eu, nl, tr, kz, ge)
+- Added BybitHost enum with supported host options
+- Added bybitHostMap for mapping host types to WebSocket URLs
+- Added bybitHost optional parameter to OpenStreamInput interface
+
+### Changed
+- Updated Bybit WebSocket connector to use configurable host URL
+- Enhanced UserConnector to support dynamic Bybit host selection
+
 ## [1.0.6] - 2025-07-03
 
 ### Fixed

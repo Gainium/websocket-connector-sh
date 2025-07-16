@@ -69,6 +69,24 @@ export const paperExchanges = [
   ExchangeEnum.paperMexc,
 ]
 
+export enum BybitHost {
+  eu = 'eu',
+  com = 'com',
+  nl = 'nl',
+  tr = 'tr',
+  kz = 'kz',
+  ge = 'ge',
+}
+
+export const bybitHostMap: Record<BybitHost, string> = {
+  [BybitHost.eu]: 'wss://stream.bybit.eu/v5/private',
+  [BybitHost.com]: 'wss://stream.bybit.com/v5/private',
+  [BybitHost.nl]: 'wss://stream.bybit.nl/v5/private',
+  [BybitHost.tr]: 'wss://stream.bybit-tr.com/v5/private',
+  [BybitHost.kz]: 'wss://stream.bybit.kz/v5/private',
+  [BybitHost.ge]: 'wss://stream.bybitgeorgia.ge/v5/private',
+}
+
 export interface AssetBalance {
   asset: string
   free: string
@@ -152,6 +170,7 @@ type OpenStreamInput = {
     key: string
     secret: string
     passphrase?: string
+    bybitHost?: BybitHost
     provider: ExchangeEnum
     environment?: 'live' | 'sandbox'
     keysType?: CoinbaseKeysType
@@ -983,6 +1002,9 @@ class UserConnector {
               sleepTimeout: 650,
               pongTimeout: 20000,
               pingInterval: 20000,
+              wsUrl:
+                bybitHostMap[api.bybitHost || BybitHost.com] ||
+                bybitHostMap[BybitHost.com],
             },
             {
               trace: () => null,
