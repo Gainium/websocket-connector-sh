@@ -1002,6 +1002,7 @@ class UserConnector {
               sleepTimeout: 650,
               pongTimeout: 20000,
               pingInterval: 20000,
+              reconnectTimeout: 2000,
               wsUrl:
                 bybitHostMap[api.bybitHost || BybitHost.com] ||
                 bybitHostMap[BybitHost.com],
