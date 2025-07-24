@@ -110,6 +110,8 @@ interface WsKeyPendingTopicSubscriptions<TWSRequestEvent extends object> {
   rejector: TopicsPendingSubscriptionsRejector<TWSRequestEvent>
 }
 
+const key = 'bybitConnect'
+
 /**
  * Base WebSocket abstraction layer. Handles connections, tracking each connection as a unique "WS Key"
  */
@@ -537,12 +539,16 @@ export abstract class BaseWebsocketClient<
   /**
    * Request connection to a specific websocket, instead of waiting for automatic connection.
    */
-  @IdMute(mutex, () => 'bybitConnect')
+  @IdMute(mutex, () => key)
   public async connect(
     wsKey: TWSKey,
     customUrl?: string | undefined,
     throwOnError?: boolean,
   ): Promise<WSConnectedResult | undefined> {
+    this.logger.trace(`Connecting to websocket with key: ${wsKey}`, {
+      ...WS_LOGGER_CATEGORY,
+      wsKey,
+    })
     try {
       if (this.wsStore.isWsOpen(wsKey)) {
         this.logger.error(
@@ -636,6 +642,7 @@ export abstract class BaseWebsocketClient<
             { ...WS_LOGGER_CATEGORY, wsKey, error },
           )
           this.executeReconnectableClose(wsKey, 'unhandled onWsError')
+          mutex.release(key)
         } else {
           this.logger.info(
             `${wsKey} socket forcefully closed. Will not reconnect.`,
