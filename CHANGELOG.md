@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.0.10] - 2025-08-05
+
+### Fixed
+- Binance fix reconnect init
+
 ## [1.0.9] - 2025-07-25
 
 ### Fixed

@@ -145,8 +145,7 @@ class BinanceConnector extends CommonConnector {
         )} ${JSON.stringify(data.error ?? data ?? '')}`,
       )
       this.stopBinance()
-      this.initBinanceWS()
-      this.reconnectBinanceCandleStream()
+      this.init()
     }
   }
 
