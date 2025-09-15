@@ -8,7 +8,7 @@ import HealthServer from './src/utils/healthServer'
 const healthServer = new HealthServer()
 healthServer.start()
 
-new Connector()
+export const stream = new Connector()
 
 let retry = 0
 

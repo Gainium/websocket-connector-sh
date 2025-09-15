@@ -180,10 +180,10 @@ type OpenStreamInput = {
 
 type User = {
   close: () => void
-  timer: NodeJS.Timer | null
+  timer: NodeJS.Timeout | null
   pending: boolean
   id: string
-  provider: string
+  provider: ExchangeEnum
 }
 
 type BybitOrderMessage = {
@@ -483,6 +483,7 @@ class UserConnector {
     coinm: [],
     usdm: [],
   }
+  private subscribeMsgsMap: Map<string, OpenStreamInput> = new Map()
   /** Constructor method
    * Determine class variables
    * Start server
@@ -597,7 +598,7 @@ class UserConnector {
           : 'undefined'
       }`,
   )
-  public async openStreamCallback(msg: OpenStreamInput, uuid?: string) {
+  private async openStreamCallback(msg: OpenStreamInput, uuid?: string) {
     if (!msg || !msg.userId || !msg.api) {
       return this.logger('Not enough data', true)
     }
@@ -1721,6 +1722,7 @@ class UserConnector {
     if (find) {
       return
     }
+    this.subscribeMsgsMap.set(id, msg)
     const usersMap: Map<string, number> = new Map()
     this.users.forEach((u) => {
       usersMap.set(u.provider, (usersMap.get(u.provider) ?? 0) + 1)
@@ -1731,6 +1733,31 @@ class UserConnector {
       `userStreamInfo${id}`,
       `Subscribed to user ${id}`,
     )
+  }
+
+  @IdMute(mutex, () => 'restartStreams')
+  public async restartStreams() {
+    let c = 0
+    for (const user of this.users) {
+      c++
+      if (paperExchanges.includes(user.provider)) {
+        continue
+      }
+      const count = this.subscribersMap.get(user.id) || 0
+      const msg = this.subscribeMsgsMap.get(user.id)
+      if (count && msg) {
+        for (let i = 0; i < count; i++) {
+          this.closeStreamCallback(user.id)
+        }
+        await sleep(250)
+        for (let i = 0; i < count; i++) {
+          await this.openStreamCallback(msg, undefined)
+        }
+        this.logger(
+          `Restarted ${c} of ${this.users.length} ${user.id} ${msg.userId}`,
+        )
+      }
+    }
   }
 
   /** Close stream callback
