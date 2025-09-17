@@ -63,3 +63,8 @@ export enum ExchangeIntervals {
 }
 
 export type Market = 'spot' | 'linear' | 'inverse'
+
+export type BinancePayload = {
+  isIntl: boolean
+  isUs: boolean
+}

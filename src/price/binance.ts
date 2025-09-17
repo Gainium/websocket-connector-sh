@@ -10,7 +10,11 @@ import {
 } from 'binance'
 import CommonConnector from './common'
 
-import type { StreamType, SubscribeCandlePayload } from './types'
+import type {
+  StreamType,
+  SubscribeCandlePayload,
+  BinancePayload,
+} from './types'
 
 const mutex = new IdMutex()
 
@@ -51,19 +55,31 @@ class BinanceConnector extends CommonConnector {
     ExchangeEnum,
     { timer: NodeJS.Timeout | null; execute: boolean }
   > = new Map()
+  private isIntl: boolean
+  private isUs: boolean
   constructor(
     private subscribedCandlesMap: Map<ExchangeEnum, Set<string>> = new Map(),
+    config?: BinancePayload,
   ) {
     super()
     this.binanceCandleCb = this.binanceCandleCb.bind(this)
     this.binanceOpenCb = this.binanceOpenCb.bind(this)
     this.binanceErrorCb = this.binanceErrorCb.bind(this)
     this.binanceTickerCb = this.binanceTickerCb.bind(this)
-    this.mainData = {
-      [ExchangeEnum.binance]: this.base,
-      [ExchangeEnum.binanceUS]: this.base,
-      [ExchangeEnum.binanceCoinm]: this.base,
-      [ExchangeEnum.binanceUsdm]: this.base,
+    this.isIntl = config ? config.isIntl : true
+    this.isUs = config ? config.isUs : false
+    if (this.isIntl) {
+      this.mainData = {
+        [ExchangeEnum.binance]: this.base,
+        [ExchangeEnum.binanceCoinm]: this.base,
+        [ExchangeEnum.binanceUsdm]: this.base,
+      }
+    }
+    if (this.isUs) {
+      this.mainData = {
+        ...this.mainData,
+        [ExchangeEnum.binanceUS]: this.base,
+      }
     }
     logger.info(`Binance Worker | >🚀 Price <-> Backend stream`)
   }
@@ -237,24 +253,27 @@ class BinanceConnector extends CommonConnector {
     }
     if (process) {
       if (
-        [ExchangeEnum.binance, ExchangeEnum.paperBinance].includes(exchange)
+        [ExchangeEnum.binance, ExchangeEnum.paperBinance].includes(exchange) &&
+        this.isIntl
       ) {
         this.connectBinanceCandleStreams()
       }
-      if (exchange === ExchangeEnum.binanceUS) {
+      if (exchange === ExchangeEnum.binanceUS && this.isUs) {
         this.connectBinanceCandleStreams(true)
       }
       if (
         [ExchangeEnum.binanceUsdm, ExchangeEnum.paperBinanceUsdm].includes(
           exchange,
-        )
+        ) &&
+        this.isIntl
       ) {
         this.connectBinanceCandleStreams(false, 'usdm')
       }
       if (
         [ExchangeEnum.binanceCoinm, ExchangeEnum.paperBinanceCoinm].includes(
           exchange,
-        )
+        ) &&
+        this.isIntl
       ) {
         this.connectBinanceCandleStreams(false, 'coinm')
       }
@@ -271,10 +290,14 @@ class BinanceConnector extends CommonConnector {
   }
 
   private async initBinanceWS() {
-    this.binanceClient.subscribeAll24hrTickers('spot')
-    this.binanceClientCoinm.subscribeAll24hrTickers('coinm')
-    this.binanceClientUsdm.subscribeAll24hrTickers('usdm')
-    this.binanceClientUs.subscribeAll24hrTickers('spot')
+    if (this.isIntl) {
+      this.binanceClient.subscribeAll24hrTickers('spot')
+      this.binanceClientCoinm.subscribeAll24hrTickers('coinm')
+      this.binanceClientUsdm.subscribeAll24hrTickers('usdm')
+    }
+    if (this.isUs) {
+      this.binanceClientUs.subscribeAll24hrTickers('spot')
+    }
   }
 
   private async closeBinanceCandleStream(
@@ -293,10 +316,14 @@ class BinanceConnector extends CommonConnector {
   }
 
   private async reconnectBinanceCandleStream() {
-    this.connectBinanceCandleStreams(true)
-    this.connectBinanceCandleStreams(false)
-    this.connectBinanceCandleStreams(false, 'coinm')
-    this.connectBinanceCandleStreams(false, 'usdm')
+    if (this.isUs) {
+      this.connectBinanceCandleStreams(true)
+    }
+    if (this.isIntl) {
+      this.connectBinanceCandleStreams(false)
+      this.connectBinanceCandleStreams(false, 'coinm')
+      this.connectBinanceCandleStreams(false, 'usdm')
+    }
   }
 
   private helperGetExchangeEnum(us = false, futures?: 'coinm' | 'usdm') {

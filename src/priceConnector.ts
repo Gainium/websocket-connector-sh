@@ -52,12 +52,26 @@ const mutex = new IdMutex()
 const isCandle = priceRole === 'candle'
 const isAll = priceRole === 'all'
 
+const exchanges = (process.env.PRICE_CONNECTOR_EXCHANGES || '')
+  .trim()
+  .split(',')
+  .filter(Boolean)
+
 /** Connector class connects to every pair websocket stream separataly. This is a option to controll every pair socket stream, and reload it if necessary */
 class Connector {
   private redis = RedisClient.getInstance()
   private rabbit = new RabbitClient()
   private workers: Map<ExchangeEnum, Worker> = new Map()
   private subscribedCandlesMap: Map<ExchangeEnum, Set<string>> = new Map()
+  private isBinance = exchanges.length ? exchanges.includes('binance') : true
+  private isBinanceUS = exchanges.length
+    ? exchanges.includes('binanceus')
+    : true
+  private isBybit = exchanges.length ? exchanges.includes('bybit') : true
+  private isKucoin = exchanges.length ? exchanges.includes('kucoin') : true
+  private isOkx = exchanges.length ? exchanges.includes('okx') : true
+  private isCoinbase = exchanges.length ? exchanges.includes('coinbase') : true
+  private isBitget = exchanges.length ? exchanges.includes('bitget') : true
   constructor() {
     this.initWorker = this.initWorker.bind(this)
     if (isCandle || isAll) {
@@ -188,6 +202,10 @@ class Connector {
           payload: {
             subscribedCandlesMap: this.subscribedCandlesMap,
           },
+          binance: {
+            isIntl: this.isBinance,
+            isUs: this.isBinanceUS,
+          },
         },
       },
     })
@@ -213,12 +231,24 @@ class Connector {
         JSON.stringify({ restart: 'priceConnector' }),
       )
     }
-    this.initWorker(ExchangeEnum.bybit)
-    this.initWorker(ExchangeEnum.binance)
-    this.initWorker(ExchangeEnum.okx)
-    this.initWorker(ExchangeEnum.coinbase)
-    this.initWorker(ExchangeEnum.kucoin)
-    this.initWorker(ExchangeEnum.bitget)
+    if (this.isBybit) {
+      this.initWorker(ExchangeEnum.bybit)
+    }
+    if (this.isBinance || this.isBinanceUS) {
+      this.initWorker(ExchangeEnum.binance)
+    }
+    if (this.isOkx) {
+      this.initWorker(ExchangeEnum.okx)
+    }
+    if (this.isCoinbase) {
+      this.initWorker(ExchangeEnum.coinbase)
+    }
+    if (this.isKucoin) {
+      this.initWorker(ExchangeEnum.kucoin)
+    }
+    if (this.isBitget) {
+      this.initWorker(ExchangeEnum.bitget)
+    }
   }
 
   stop() {

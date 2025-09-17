@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.0.12] - 2025-09-17
+
+### Added
+- Connect to selected exchanges using PRICE_CONNECTOR_EXCHANGES env value
+
 ## [1.0.11] - 2025-09-15
 
 ### Added

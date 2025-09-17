@@ -9,6 +9,7 @@ import BitgetConnector from './bitget'
 import logger from '../utils/logger'
 import sleep from '../utils/sleep'
 import { skipReason } from '../../type'
+import type { BinancePayload } from './types'
 
 type ConnectorType =
   | ExchangeEnum.binance
@@ -24,9 +25,13 @@ type Payload = {
   subscribedTopics: Map<ExchangeEnum, Set<string>>
 }
 
-const createConnector = (exchange: ConnectorType, payload: Payload) => {
+const createConnector = (
+  exchange: ConnectorType,
+  payload: Payload,
+  binancePayload?: BinancePayload,
+) => {
   if (exchange === ExchangeEnum.binance) {
-    return new BinanceConnector(payload.subscribedCandlesMap)
+    return new BinanceConnector(payload.subscribedCandlesMap, binancePayload)
   }
   if (exchange === ExchangeEnum.bitget) {
     return new BitgetConnector(payload.subscribedCandlesMap)
@@ -51,6 +56,7 @@ const createConnector = (exchange: ConnectorType, payload: Payload) => {
 const data = workerData.data as {
   exchange: ConnectorType
   payload: Payload
+  binance?: BinancePayload
 }
 
 let retry = 0
@@ -62,7 +68,7 @@ let retryStart = 0
 const retryTimeout = 60 * 1000
 
 const getStream = () => {
-  const str = createConnector(data.exchange, data.payload)
+  const str = createConnector(data.exchange, data.payload, data.binance)
   if (str) {
     str.init()
   }
