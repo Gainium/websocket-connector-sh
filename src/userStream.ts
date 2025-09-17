@@ -1,5 +1,6 @@
 import { convert, convertFutures } from './utils/binance'
 import { WebsocketClient } from 'binance'
+import * as hl from '@nktkas/hyperliquid'
 import KucoinApi from '@gainium/kucoin-api'
 import Coinbase, {
   OrderSide,
@@ -25,6 +26,7 @@ import { v4 } from 'uuid'
 import Rabbit from './utils/rabbit'
 import { rabbitUsersStreamKey, serviceLogRedis } from '../type'
 import { RestClientV5 } from 'bybit-api'
+import HyperliquidAsset from './utils/hyperliquid'
 
 const mutex = new IdMutex()
 
@@ -47,6 +49,8 @@ export type PaperExchangeType =
   | ExchangeEnum.paperBitgetCoinm
   | ExchangeEnum.paperBitgetCoinm
   | ExchangeEnum.paperMexc
+  | ExchangeEnum.paperHyperliquid
+  | ExchangeEnum.paperHyperliquidInverse
 
 export const paperExchanges = [
   ExchangeEnum.paperFtx,
@@ -67,6 +71,8 @@ export const paperExchanges = [
   ExchangeEnum.paperBitgetUsdm,
   ExchangeEnum.paperBitgetCoinm,
   ExchangeEnum.paperMexc,
+  ExchangeEnum.paperHyperliquid,
+  ExchangeEnum.paperHyperliquidInverse,
 ]
 
 export enum BybitHost {
@@ -1665,6 +1671,51 @@ class UserConnector {
           )
         }
       }
+      if (
+        [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidInverse].includes(
+          api.provider,
+        )
+      ) {
+        /** Open stream and set callback  */
+        try {
+          /** New exchange instance */
+          const client = new hl.SubscriptionClient({
+            transport: new hl.WebSocketTransport({
+              url:
+                process.env.HYPERLIQUIDENV === 'demo'
+                  ? 'wss://api.hyperliquid-testnet.xyz/ws'
+                  : 'wss://api.hyperliquid.xyz/ws',
+            }),
+          })
+          client.orderUpdates({ user: api.key as `0x${string}` }, async (msg) =>
+            (await this.prepareHyperliquidOrder(msg)).map((o) =>
+              this.userStreamEvent(id, o),
+            ),
+          )
+
+          /** Save user id and close function in users array */
+          findUser = { ...findUser, close }
+
+          this.subscribersMap.set(id, (this.subscribersMap.get(id) ?? 0) + 1)
+
+          /** Log stream created for user */
+          this.logger(
+            `Stream for ${userId} room ${id} was successfully created ${api.provider}`,
+          )
+          /** Log bot subscribed to the user */
+          this.logger(
+            `Was subscribed to the user ${userId} room ${id} ${api.provider}`,
+          )
+          await sleep(2000)
+        } catch (err) {
+          findUser = { ...findUser, pending: false }
+          this.saveUser(findUser)
+          return this.logger(
+            `${(err as Error)?.message ?? err} ${api.provider}`,
+            true,
+          )
+        }
+      }
       if (paperExchanges.includes(api.provider)) {
         const exchange = mapPaperToReal(api.provider as PaperExchangeType)
         if (!exchange) {
@@ -1865,7 +1916,8 @@ class UserConnector {
           !id.includes('CMB-RO') &&
           !id.includes('CMBRO') &&
           !id.includes('CMB-H') &&
-          !id.includes('CMBH')
+          !id.includes('CMBH') &&
+          !id.startsWith('0x')
         ) {
           return
         }
@@ -2092,6 +2144,43 @@ class UserConnector {
       uniqueMessageId: `executionReport${msg.updatedAt}${msg.symbol}${msg.status}${msg.amount}${msg.price}${msg.externalId}`,
       liquidation: msg.externalId.startsWith('liquidation_'),
     }
+  }
+
+  private async prepareHyperliquidOrder(
+    data: hl.OrderStatus<hl.Order>[],
+  ): Promise<(UserDataStreamEvent & { uniqueMessageId?: string })[]> {
+    return await Promise.all(
+      data.map(async (order) => {
+        let quote = +order.order.limitPx * +order.order.sz
+        if (isNaN(quote) || !isFinite(quote)) {
+          quote = 0
+        }
+        return {
+          creationTime: new Date(order.statusTimestamp).getTime(),
+          eventTime: new Date(order.statusTimestamp).getTime(),
+          eventType: 'executionReport',
+          newClientOrderId: order.order.cloid ?? '',
+          orderId: order.order.oid,
+          orderTime: new Date(order.order.timestamp).getTime(),
+          orderStatus:
+            order.status === 'filled'
+              ? 'FILLED'
+              : order.status === 'open'
+                ? 'NEW'
+                : 'CANCELED',
+          orderType: order.status === 'open' ? 'LIMIT' : 'MARKET',
+          originalClientOrderId: order.order.cloid ?? '',
+          price: `${order.order.limitPx}`,
+          quantity: `${order.order.origSz}`,
+          side: order.order.side === 'A' ? 'BUY' : 'SELL',
+          symbol: await HyperliquidAsset.getPairByCoin(order.order.coin),
+          totalQuoteTradeQuantity: `${quote}`,
+          totalTradeQuantity: `${order.order.sz}`,
+          uniqueMessageId: `executionReport${JSON.stringify(order)}`,
+          liquidation: false,
+        }
+      }),
+    )
   }
 
   private prepareOkxOutboundAccountInfo(
