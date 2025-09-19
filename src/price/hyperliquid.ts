@@ -4,7 +4,6 @@ import { ExchangeEnum, mapPaperToReal } from '../utils/common'
 import logger from '../utils/logger'
 import { IdMute, IdMutex } from '../utils/mutex'
 import CommonConnector from './common'
-import HyperliquidAsset from '../utils/hyperliquid'
 
 import type { Ticker, StreamType, SubscribeCandlePayload } from './types'
 
@@ -59,7 +58,7 @@ class HyperliquidConnector extends CommonConnector {
       {
         e: 'kline',
         E: +new Date(),
-        s: await HyperliquidAsset.getPairByCoin(msg.s),
+        s: msg.s,
         k: {
           o: msg.o,
           h: msg.h,
@@ -298,7 +297,7 @@ class HyperliquidConnector extends CommonConnector {
           low: price,
           volume: '10000000',
           volumeQuote: '10000000',
-          symbol: await HyperliquidAsset.getPairByCoin(coin),
+          symbol: coin,
           bestBid: price,
           bestAsk: price,
           bestAskQnt: price,

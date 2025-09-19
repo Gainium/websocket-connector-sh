@@ -26,7 +26,6 @@ import { v4 } from 'uuid'
 import Rabbit from './utils/rabbit'
 import { rabbitUsersStreamKey, serviceLogRedis } from '../type'
 import { RestClientV5 } from 'bybit-api'
-import HyperliquidAsset from './utils/hyperliquid'
 
 const mutex = new IdMutex()
 
@@ -2173,7 +2172,7 @@ class UserConnector {
           price: `${order.order.limitPx}`,
           quantity: `${order.order.origSz}`,
           side: order.order.side === 'A' ? 'BUY' : 'SELL',
-          symbol: await HyperliquidAsset.getPairByCoin(order.order.coin),
+          symbol: order.order.coin,
           totalQuoteTradeQuantity: `${quote}`,
           totalTradeQuantity: `${order.order.sz}`,
           uniqueMessageId: `executionReport${JSON.stringify(order)}`,
