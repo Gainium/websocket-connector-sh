@@ -303,7 +303,7 @@ class HyperliquidConnector extends CommonConnector {
           bestAskQnt: price,
           bestBidQnt: price,
         }
-        if (coin.startsWith('@')) {
+        if (coin.startsWith('@') || coin.includes('/')) {
           spot.push(v)
         } else {
           inverse.push(v)

@@ -6,6 +6,7 @@ import KucoinConnector from './kucoin'
 import OkxConnector from './okx'
 import CoinbaseConnector from './coinbase'
 import BitgetConnector from './bitget'
+import HyperliquidConnector from './hyperliquid'
 import logger from '../utils/logger'
 import sleep from '../utils/sleep'
 import { skipReason } from '../../type'
@@ -19,6 +20,7 @@ type ConnectorType =
   | ExchangeEnum.coinbase
   | ExchangeEnum.bitget
   | ExchangeEnum.mexc
+  | ExchangeEnum.hyperliquid
 
 type Payload = {
   subscribedCandlesMap: Map<ExchangeEnum, Set<string>>
@@ -50,6 +52,9 @@ const createConnector = (
   }
   if (exchange === ExchangeEnum.coinbase) {
     return new CoinbaseConnector()
+  }
+  if (exchange === ExchangeEnum.hyperliquid) {
+    return new HyperliquidConnector(payload.subscribedCandlesMap)
   }
 }
 
