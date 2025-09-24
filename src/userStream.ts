@@ -26,6 +26,7 @@ import { v4 } from 'uuid'
 import Rabbit from './utils/rabbit'
 import { rabbitUsersStreamKey, serviceLogRedis } from '../type'
 import { RestClientV5 } from 'bybit-api'
+import ExpirableMap from './utils/expirableMap'
 
 const mutex = new IdMutex()
 
@@ -49,7 +50,7 @@ export type PaperExchangeType =
   | ExchangeEnum.paperBitgetCoinm
   | ExchangeEnum.paperMexc
   | ExchangeEnum.paperHyperliquid
-  | ExchangeEnum.paperHyperliquidInverse
+  | ExchangeEnum.paperHyperliquidLinear
 
 export const paperExchanges = [
   ExchangeEnum.paperFtx,
@@ -71,7 +72,7 @@ export const paperExchanges = [
   ExchangeEnum.paperBitgetCoinm,
   ExchangeEnum.paperMexc,
   ExchangeEnum.paperHyperliquid,
-  ExchangeEnum.paperHyperliquidInverse,
+  ExchangeEnum.paperHyperliquidLinear,
 ]
 
 export enum BybitHost {
@@ -465,6 +466,11 @@ export type PaperBalance = {
   balance: { asset: string; free: number; locked: number }[]
 }
 
+const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
+  5 * 60 * 1000,
+  true,
+)
+
 class UserConnector {
   private redisSet = RedisClient.getInstance()
   private redis = RedisClient.getInstance()
@@ -599,7 +605,9 @@ class UserConnector {
                   ? 'bitget'
                   : msg.api.provider.startsWith('kucoin')
                     ? 'kucoin'
-                    : msg.api.provider
+                    : msg.api.provider.startsWith('hyperliquid')
+                      ? 'hyperliquid'
+                      : msg.api.provider
           : 'undefined'
       }`,
   )
@@ -1671,7 +1679,7 @@ class UserConnector {
         }
       }
       if (
-        [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidInverse].includes(
+        [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidLinear].includes(
           api.provider,
         )
       ) {
@@ -1686,11 +1694,29 @@ class UserConnector {
                   : 'wss://api.hyperliquid.xyz/ws',
             }),
           })
-          client.orderUpdates({ user: api.key as `0x${string}` }, async (msg) =>
-            (await this.prepareHyperliquidOrder(msg)).map((o) =>
-              this.userStreamEvent(id, o),
-            ),
-          )
+          const close = (
+            await client.orderUpdates(
+              { user: api.key as `0x${string}` },
+              async (msg) =>
+                (await this.prepareHyperliquidOrder(msg)).map((o) =>
+                  this.userStreamEvent(id, o),
+                ),
+            )
+          ).unsubscribe
+
+          client.userFills({ user: api.key as `0x${string}` }, (data) => {
+            if (data.isSnapshot) {
+              return
+            }
+            for (const f of data.fills) {
+              if (!f.cloid) {
+                continue
+              }
+              const get = hyperliquidExpirableMap.get(f.cloid) ?? []
+              get.push(f)
+              hyperliquidExpirableMap.set(f.cloid, get)
+            }
+          })
 
           /** Save user id and close function in users array */
           findUser = { ...findUser, close }
@@ -2149,36 +2175,51 @@ class UserConnector {
     data: hl.OrderStatus<hl.Order>[],
   ): Promise<(UserDataStreamEvent & { uniqueMessageId?: string })[]> {
     return await Promise.all(
-      data.map(async (order) => {
-        let quote = +order.order.limitPx * +order.order.sz
-        if (isNaN(quote) || !isFinite(quote)) {
-          quote = 0
-        }
-        return {
-          creationTime: new Date(order.statusTimestamp).getTime(),
-          eventTime: new Date(order.statusTimestamp).getTime(),
-          eventType: 'executionReport',
-          newClientOrderId: order.order.cloid ?? '',
-          orderId: order.order.oid,
-          orderTime: new Date(order.order.timestamp).getTime(),
-          orderStatus:
-            order.status === 'filled'
-              ? 'FILLED'
-              : order.status === 'open'
-                ? 'NEW'
-                : 'CANCELED',
-          orderType: order.status === 'open' ? 'LIMIT' : 'MARKET',
-          originalClientOrderId: order.order.cloid ?? '',
-          price: `${order.order.limitPx}`,
-          quantity: `${order.order.origSz}`,
-          side: order.order.side === 'A' ? 'BUY' : 'SELL',
-          symbol: order.order.coin,
-          totalQuoteTradeQuantity: `${quote}`,
-          totalTradeQuantity: `${order.order.sz}`,
-          uniqueMessageId: `executionReport${JSON.stringify(order)}`,
-          liquidation: false,
-        }
-      }),
+      data
+        .filter((o) => o.order.cloid)
+        .map(async (order) => {
+          let filledSize = +order.order.origSz - +order.order.sz
+          let quote = +order.order.limitPx * filledSize
+          let price = `${order.order.limitPx}`
+          const pricePrecision =
+            price.indexOf('.') >= 0 ? price.split('.')[1].length : 0
+          if (isNaN(quote) || !isFinite(quote)) {
+            quote = 0
+          }
+          const get = hyperliquidExpirableMap.get(`${order.order.cloid}`)
+          if (get) {
+            filledSize = get.reduce((a, c) => a + +c.sz, 0)
+            quote = get.reduce((a, c) => a + +c.sz * +c.px, 0)
+            price = `${(filledSize ? quote / filledSize : +order.order.limitPx).toFixed(pricePrecision)}`
+            if (order.status === 'filled') {
+              hyperliquidExpirableMap.delete(`${order.order.cloid}`)
+            }
+          }
+          return {
+            creationTime: new Date(order.statusTimestamp).getTime(),
+            eventTime: new Date(order.statusTimestamp).getTime(),
+            eventType: 'executionReport',
+            newClientOrderId: order.order.cloid ?? '',
+            orderId: order.order.oid,
+            orderTime: new Date(order.order.timestamp).getTime(),
+            orderStatus:
+              order.status === 'filled'
+                ? 'FILLED'
+                : order.status === 'open'
+                  ? 'NEW'
+                  : 'CANCELED',
+            orderType: 'LIMIT',
+            originalClientOrderId: order.order.cloid ?? '',
+            price,
+            quantity: `${order.order.origSz}`,
+            side: order.order.side === 'A' ? 'BUY' : 'SELL',
+            symbol: order.order.coin,
+            totalQuoteTradeQuantity: `${quote}`,
+            totalTradeQuantity: `${filledSize}`,
+            uniqueMessageId: `executionReport${JSON.stringify(order)}`,
+            liquidation: false,
+          }
+        }),
     )
   }
 

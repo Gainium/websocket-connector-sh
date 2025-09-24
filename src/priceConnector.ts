@@ -117,7 +117,7 @@ class Connector {
       const coinbaseWorker = this.workers.get(ExchangeEnum.coinbase)
       const hyperliquidWorker = this.workers.get(ExchangeEnum.hyperliquid)
       if (
-        [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidInverse].includes(
+        [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidLinear].includes(
           exchange,
         ) &&
         hyperliquidWorker

@@ -42,7 +42,7 @@ class HyperliquidConnector extends CommonConnector {
     this.hyperliquidCandleCb = this.hyperliquidCandleCb.bind(this)
     this.mainData = {
       [ExchangeEnum.hyperliquid]: this.base,
-      [ExchangeEnum.hyperliquidInverse]: this.base,
+      [ExchangeEnum.hyperliquidLinear]: this.base,
     }
     logger.info(`Hyperliquid Worker | >🚀 Price <-> Backend stream`)
   }
@@ -50,7 +50,7 @@ class HyperliquidConnector extends CommonConnector {
   private async hyperliquidTickerCb(msg: hl.WsAllMids) {
     const convert = await this.convertHyperliquidTicker(msg.mids)
     this.cbWs(convert.spot, ExchangeEnum.hyperliquid)
-    this.cbWs(convert.inverse, ExchangeEnum.hyperliquidInverse)
+    this.cbWs(convert.linear, ExchangeEnum.hyperliquidLinear)
   }
 
   private async hyperliquidCandleCb(msg: hl.Candle) {
@@ -71,7 +71,7 @@ class HyperliquidConnector extends CommonConnector {
       },
       msg.s.startsWith('@')
         ? ExchangeEnum.hyperliquid
-        : ExchangeEnum.hyperliquidInverse,
+        : ExchangeEnum.hyperliquidLinear,
     )
   }
 
@@ -117,8 +117,8 @@ class HyperliquidConnector extends CommonConnector {
     if (process) {
       if (
         [
-          ExchangeEnum.hyperliquidInverse,
-          ExchangeEnum.paperHyperliquidInverse,
+          ExchangeEnum.hyperliquidLinear,
+          ExchangeEnum.paperHyperliquidLinear,
           ExchangeEnum.hyperliquid,
           ExchangeEnum.paperHyperliquid,
         ].includes(exchange)
@@ -283,9 +283,9 @@ class HyperliquidConnector extends CommonConnector {
 
   private async convertHyperliquidTicker(
     data: hl.WsAllMids['mids'],
-  ): Promise<{ spot: Ticker[]; inverse: Ticker[] }> {
+  ): Promise<{ spot: Ticker[]; linear: Ticker[] }> {
     const spot: Ticker[] = []
-    const inverse: Ticker[] = []
+    const linear: Ticker[] = []
     await Promise.all(
       Object.entries(data).map(async ([coin, price]) => {
         const v = {
@@ -306,11 +306,11 @@ class HyperliquidConnector extends CommonConnector {
         if (coin.startsWith('@') || coin.includes('/')) {
           spot.push(v)
         } else {
-          inverse.push(v)
+          linear.push(v)
         }
       }),
     )
-    return { spot, inverse }
+    return { spot, linear }
   }
 }
 
