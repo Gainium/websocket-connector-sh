@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.1.1] - 2025-09-26
+
+### Changed
+- Hyperliquid user stream logic. 
+
 ## [1.1.0] - 2025-09-24
 
 ### Added

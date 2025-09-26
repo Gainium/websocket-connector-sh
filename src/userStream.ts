@@ -1685,15 +1685,34 @@ class UserConnector {
       ) {
         /** Open stream and set callback  */
         try {
+          const transport = new hl.WebSocketTransport({
+            url:
+              process.env.HYPERLIQUIDENV === 'demo'
+                ? 'wss://api.hyperliquid-testnet.xyz/ws'
+                : 'wss://api.hyperliquid.xyz/ws',
+            reconnect: {
+              maxRetries: 100,
+              connectionDelay: (attempt) =>
+                Math.min((1 << attempt) * 150, 10000),
+            },
+          })
+          transport.socket.onclose = (event) => {
+            this.logger(`Hyperliquid closed: ${event.reason} ${id}`)
+          }
+          transport.socket.onerror = (event) => {
+            this.logger(
+              `Hyperliquid error: ${JSON.stringify(event)} ${id}`,
+              true,
+            )
+          }
+          transport.socket.onopen = () => {
+            this.logger(`Hyperliquid connected ${id}`)
+          }
           /** New exchange instance */
           const client = new hl.SubscriptionClient({
-            transport: new hl.WebSocketTransport({
-              url:
-                process.env.HYPERLIQUIDENV === 'demo'
-                  ? 'wss://api.hyperliquid-testnet.xyz/ws'
-                  : 'wss://api.hyperliquid.xyz/ws',
-            }),
+            transport,
           })
+
           const close = (
             await client.orderUpdates(
               { user: api.key as `0x${string}` },
@@ -1718,8 +1737,13 @@ class UserConnector {
             }
           })
 
+          const closeFn = async () => {
+            await close()
+            transport.close()
+          }
+
           /** Save user id and close function in users array */
-          findUser = { ...findUser, close }
+          findUser = { ...findUser, close: closeFn }
 
           this.subscribersMap.set(id, (this.subscribersMap.get(id) ?? 0) + 1)
 
