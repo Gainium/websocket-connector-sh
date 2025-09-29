@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.1.2] - 2025-09-29
+
+### Changed
+- Increased hyperliquid expirable map timeout. 
+- Price connector transport settings. 
+
+### Fixed
+- Order update timestamp. 
+
 ## [1.1.1] - 2025-09-26
 
 ### Changed

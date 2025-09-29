@@ -467,7 +467,7 @@ export type PaperBalance = {
 }
 
 const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
-  5 * 60 * 1000,
+  5 * 60 * 60 * 1000,
   true,
 )
 
@@ -2225,7 +2225,7 @@ class UserConnector {
             eventType: 'executionReport',
             newClientOrderId: order.order.cloid ?? '',
             orderId: order.order.oid,
-            orderTime: new Date(order.order.timestamp).getTime(),
+            orderTime: new Date(order.statusTimestamp).getTime(),
             orderStatus:
               order.status === 'filled'
                 ? 'FILLED'

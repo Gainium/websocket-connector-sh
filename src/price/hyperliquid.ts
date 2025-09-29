@@ -85,13 +85,27 @@ class HyperliquidConnector extends CommonConnector {
         get.forEach((g) => g.unsubscribe())
       }
     }
+    const transport = new hl.WebSocketTransport({
+      url:
+        process.env.HYPERLIQUIDENV === 'demo'
+          ? 'wss://api.hyperliquid-testnet.xyz/ws'
+          : 'wss://api.hyperliquid.xyz/ws',
+      reconnect: {
+        maxRetries: 100,
+        connectionDelay: (attempt) => Math.min((1 << attempt) * 150, 10000),
+      },
+    })
+    transport.socket.onclose = (event) => {
+      logger.info(`Hyperliquid closed: ${event.reason}`)
+    }
+    transport.socket.onerror = (event) => {
+      logger.error(`Hyperliquid error: ${JSON.stringify(event)}`)
+    }
+    transport.socket.onopen = () => {
+      logger.info(`Hyperliquid connected`)
+    }
     const client = new hl.SubscriptionClient({
-      transport: new hl.WebSocketTransport({
-        url:
-          process.env.HYPERLIQUIDENV === 'demo'
-            ? 'wss://api.hyperliquid-testnet.xyz/ws'
-            : 'wss://api.hyperliquid.xyz/ws',
-      }),
+      transport,
     })
     return client
   }
