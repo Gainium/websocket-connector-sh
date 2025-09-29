@@ -72,6 +72,9 @@ class Connector {
   private isOkx = exchanges.length ? exchanges.includes('okx') : true
   private isCoinbase = exchanges.length ? exchanges.includes('coinbase') : true
   private isBitget = exchanges.length ? exchanges.includes('bitget') : true
+  private isHyperliquid = exchanges.length
+    ? exchanges.includes('hyperliquid')
+    : true
   constructor() {
     this.initWorker = this.initWorker.bind(this)
     if (isCandle || isAll) {
@@ -112,7 +115,18 @@ class Connector {
       const okxWorker = this.workers.get(ExchangeEnum.okx)
       const bitgetWorker = this.workers.get(ExchangeEnum.bitget)
       const coinbaseWorker = this.workers.get(ExchangeEnum.coinbase)
-
+      const hyperliquidWorker = this.workers.get(ExchangeEnum.hyperliquid)
+      if (
+        [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidLinear].includes(
+          exchange,
+        ) &&
+        hyperliquidWorker
+      ) {
+        hyperliquidWorker.postMessage({
+          do: 'subscribeCandle',
+          data: { symbol, interval, exchange },
+        })
+      }
       if (
         [
           ExchangeEnum.bybit,
@@ -249,6 +263,9 @@ class Connector {
     if (this.isBitget) {
       this.initWorker(ExchangeEnum.bitget)
     }
+    if (this.isHyperliquid) {
+      this.initWorker(ExchangeEnum.hyperliquid)
+    }
   }
 
   stop() {
@@ -259,6 +276,8 @@ class Connector {
     const kucoinWorker = this.workers.get(ExchangeEnum.kucoin)
     const okxWorker = this.workers.get(ExchangeEnum.okx)
     const coinbaseWorker = this.workers.get(ExchangeEnum.coinbase)
+    const bitgetWorker = this.workers.get(ExchangeEnum.bitget)
+    const hyperliquidWorker = this.workers.get(ExchangeEnum.hyperliquid)
     bybitWorker?.on('exit', () => null)
     bybitWorker?.terminate()
     binanceWorker?.on('exit', () => null)
@@ -269,6 +288,10 @@ class Connector {
     coinbaseWorker?.terminate()
     kucoinWorker?.on('exit', () => null)
     kucoinWorker?.terminate()
+    bitgetWorker?.on('exit', () => null)
+    bitgetWorker?.terminate()
+    hyperliquidWorker?.on('exit', () => null)
+    hyperliquidWorker?.terminate()
   }
 }
 

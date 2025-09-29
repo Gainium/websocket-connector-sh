@@ -1,5 +1,6 @@
 import { convert, convertFutures } from './utils/binance'
 import { WebsocketClient } from 'binance'
+import * as hl from '@nktkas/hyperliquid'
 import KucoinApi from '@gainium/kucoin-api'
 import Coinbase, {
   OrderSide,
@@ -25,6 +26,7 @@ import { v4 } from 'uuid'
 import Rabbit from './utils/rabbit'
 import { rabbitUsersStreamKey, serviceLogRedis } from '../type'
 import { RestClientV5 } from 'bybit-api'
+import ExpirableMap from './utils/expirableMap'
 
 const mutex = new IdMutex()
 
@@ -47,6 +49,8 @@ export type PaperExchangeType =
   | ExchangeEnum.paperBitgetCoinm
   | ExchangeEnum.paperBitgetCoinm
   | ExchangeEnum.paperMexc
+  | ExchangeEnum.paperHyperliquid
+  | ExchangeEnum.paperHyperliquidLinear
 
 export const paperExchanges = [
   ExchangeEnum.paperFtx,
@@ -67,6 +71,8 @@ export const paperExchanges = [
   ExchangeEnum.paperBitgetUsdm,
   ExchangeEnum.paperBitgetCoinm,
   ExchangeEnum.paperMexc,
+  ExchangeEnum.paperHyperliquid,
+  ExchangeEnum.paperHyperliquidLinear,
 ]
 
 export enum BybitHost {
@@ -460,6 +466,11 @@ export type PaperBalance = {
   balance: { asset: string; free: number; locked: number }[]
 }
 
+const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
+  5 * 60 * 1000,
+  true,
+)
+
 class UserConnector {
   private redisSet = RedisClient.getInstance()
   private redis = RedisClient.getInstance()
@@ -594,7 +605,9 @@ class UserConnector {
                   ? 'bitget'
                   : msg.api.provider.startsWith('kucoin')
                     ? 'kucoin'
-                    : msg.api.provider
+                    : msg.api.provider.startsWith('hyperliquid')
+                      ? 'hyperliquid'
+                      : msg.api.provider
           : 'undefined'
       }`,
   )
@@ -1665,6 +1678,93 @@ class UserConnector {
           )
         }
       }
+      if (
+        [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidLinear].includes(
+          api.provider,
+        )
+      ) {
+        /** Open stream and set callback  */
+        try {
+          const transport = new hl.WebSocketTransport({
+            url:
+              process.env.HYPERLIQUIDENV === 'demo'
+                ? 'wss://api.hyperliquid-testnet.xyz/ws'
+                : 'wss://api.hyperliquid.xyz/ws',
+            reconnect: {
+              maxRetries: 100,
+              connectionDelay: (attempt) =>
+                Math.min((1 << attempt) * 150, 10000),
+            },
+          })
+          transport.socket.onclose = (event) => {
+            this.logger(`Hyperliquid closed: ${event.reason} ${id}`)
+          }
+          transport.socket.onerror = (event) => {
+            this.logger(
+              `Hyperliquid error: ${JSON.stringify(event)} ${id}`,
+              true,
+            )
+          }
+          transport.socket.onopen = () => {
+            this.logger(`Hyperliquid connected ${id}`)
+          }
+          /** New exchange instance */
+          const client = new hl.SubscriptionClient({
+            transport,
+          })
+
+          const close = (
+            await client.orderUpdates(
+              { user: api.key as `0x${string}` },
+              async (msg) =>
+                (await this.prepareHyperliquidOrder(msg)).map((o) =>
+                  this.userStreamEvent(id, o),
+                ),
+            )
+          ).unsubscribe
+
+          client.userFills({ user: api.key as `0x${string}` }, (data) => {
+            if (data.isSnapshot) {
+              return
+            }
+            for (const f of data.fills) {
+              if (!f.cloid) {
+                continue
+              }
+              const get = hyperliquidExpirableMap.get(f.cloid) ?? []
+              get.push(f)
+              hyperliquidExpirableMap.set(f.cloid, get)
+            }
+          })
+
+          const closeFn = async () => {
+            await close()
+            transport.close()
+          }
+
+          /** Save user id and close function in users array */
+          findUser = { ...findUser, close: closeFn }
+
+          this.subscribersMap.set(id, (this.subscribersMap.get(id) ?? 0) + 1)
+
+          /** Log stream created for user */
+          this.logger(
+            `Stream for ${userId} room ${id} was successfully created ${api.provider}`,
+          )
+          /** Log bot subscribed to the user */
+          this.logger(
+            `Was subscribed to the user ${userId} room ${id} ${api.provider}`,
+          )
+          await sleep(2000)
+        } catch (err) {
+          findUser = { ...findUser, pending: false }
+          this.saveUser(findUser)
+          return this.logger(
+            `${(err as Error)?.message ?? err} ${api.provider}`,
+            true,
+          )
+        }
+      }
       if (paperExchanges.includes(api.provider)) {
         const exchange = mapPaperToReal(api.provider as PaperExchangeType)
         if (!exchange) {
@@ -1865,7 +1965,8 @@ class UserConnector {
           !id.includes('CMB-RO') &&
           !id.includes('CMBRO') &&
           !id.includes('CMB-H') &&
-          !id.includes('CMBH')
+          !id.includes('CMBH') &&
+          !id.startsWith('0x')
         ) {
           return
         }
@@ -2092,6 +2193,58 @@ class UserConnector {
       uniqueMessageId: `executionReport${msg.updatedAt}${msg.symbol}${msg.status}${msg.amount}${msg.price}${msg.externalId}`,
       liquidation: msg.externalId.startsWith('liquidation_'),
     }
+  }
+
+  private async prepareHyperliquidOrder(
+    data: hl.OrderStatus<hl.Order>[],
+  ): Promise<(UserDataStreamEvent & { uniqueMessageId?: string })[]> {
+    return await Promise.all(
+      data
+        .filter((o) => o.order.cloid)
+        .map(async (order) => {
+          let filledSize = +order.order.origSz - +order.order.sz
+          let quote = +order.order.limitPx * filledSize
+          let price = `${order.order.limitPx}`
+          const pricePrecision =
+            price.indexOf('.') >= 0 ? price.split('.')[1].length : 0
+          if (isNaN(quote) || !isFinite(quote)) {
+            quote = 0
+          }
+          const get = hyperliquidExpirableMap.get(`${order.order.cloid}`)
+          if (get) {
+            filledSize = get.reduce((a, c) => a + +c.sz, 0)
+            quote = get.reduce((a, c) => a + +c.sz * +c.px, 0)
+            price = `${(filledSize ? quote / filledSize : +order.order.limitPx).toFixed(pricePrecision)}`
+            if (order.status === 'filled') {
+              hyperliquidExpirableMap.delete(`${order.order.cloid}`)
+            }
+          }
+          return {
+            creationTime: new Date(order.statusTimestamp).getTime(),
+            eventTime: new Date(order.statusTimestamp).getTime(),
+            eventType: 'executionReport',
+            newClientOrderId: order.order.cloid ?? '',
+            orderId: order.order.oid,
+            orderTime: new Date(order.order.timestamp).getTime(),
+            orderStatus:
+              order.status === 'filled'
+                ? 'FILLED'
+                : order.status === 'open'
+                  ? 'NEW'
+                  : 'CANCELED',
+            orderType: 'LIMIT',
+            originalClientOrderId: order.order.cloid ?? '',
+            price,
+            quantity: `${order.order.origSz}`,
+            side: order.order.side === 'A' ? 'BUY' : 'SELL',
+            symbol: order.order.coin,
+            totalQuoteTradeQuantity: `${quote}`,
+            totalTradeQuantity: `${filledSize}`,
+            uniqueMessageId: `executionReport${JSON.stringify(order)}`,
+            liquidation: false,
+          }
+        }),
+    )
   }
 
   private prepareOkxOutboundAccountInfo(
