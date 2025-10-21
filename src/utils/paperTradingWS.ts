@@ -9,7 +9,8 @@ export const connectPaper = (
   cbOrder: (msg: PaperOrderMessage) => void,
   cbAccount: (msg: PaperOutboundAccountInfo) => void,
 ) => {
-  const manager = new Manager(`ws://${paper}`, {
+  const prefix = paper.startsWith('ws://') ? '' : 'ws://'
+  const manager = new Manager(`${prefix}${paper}`, {
     transports: ['websocket', 'polling'],
   })
 
