@@ -1571,10 +1571,15 @@ class UserConnector {
             ) {
               const convertedMessage =
                 msg.arg.instType === 'SPOT'
-                  ? this.prepareBitgetSpotOutboundAccountInfo(msg.data, msg.ts)
+                  ? this.prepareBitgetSpotOutboundAccountInfo(
+                      msg.data,
+                      msg.ts,
+                      uuid || userId,
+                    )
                   : this.prepareBitgetFuturesOutboundAccountInfo(
                       msg.data,
                       msg.ts,
+                      uuid || userId,
                     )
               if (convertedMessage) {
                 this.userStreamEvent(id, convertedMessage)
@@ -2323,6 +2328,7 @@ class UserConnector {
   private prepareBitgetSpotOutboundAccountInfo(
     msg: BitgetSpotBalance[],
     time: number,
+    userId: string,
   ): OutboundAccountPosition | undefined {
     const balances = msg.map((m) => ({
       asset: m.coin,
@@ -2334,13 +2340,14 @@ class UserConnector {
       eventTime: time,
       eventType: 'outboundAccountPosition',
       lastAccountUpdate: 0,
-      uniqueMessageId: `outboundAccountPosition${time}${balances[0]?.asset}${balances[0]?.free}${balances[0]?.locked}`,
+      uniqueMessageId: `outboundAccountPosition${userId}${JSON.stringify(balances)}bitget`,
     }
   }
 
   private prepareBitgetFuturesOutboundAccountInfo(
     msg: BitgetFuturesBalance[],
     time: number,
+    userId: string,
   ): OutboundAccountPosition | undefined {
     const balances = msg.map((m) => ({
       asset: m.marginCoin,
@@ -2352,7 +2359,7 @@ class UserConnector {
       eventTime: time,
       eventType: 'outboundAccountPosition',
       lastAccountUpdate: 0,
-      uniqueMessageId: `outboundAccountPosition${time}${balances[0]?.asset}${balances[0]?.free}${balances[0]?.locked}`,
+      uniqueMessageId: `outboundAccountPosition${userId}${JSON.stringify(balances)}bitgetFutures`,
     }
   }
 

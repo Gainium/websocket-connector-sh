@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.1.4] - 2025-10-22
+
+### Changed
+- Bitget unique message id. 
+
 ## [1.1.3] - 2025-10-21
 
 ### Fixed
