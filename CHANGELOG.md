@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.1.5] - 2025-11-06
+
+### Changed
+- Hyperliquid candle connect.  
+
 ## [1.1.4] - 2025-10-22
 
 ### Changed

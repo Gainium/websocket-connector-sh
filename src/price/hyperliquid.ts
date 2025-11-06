@@ -200,7 +200,9 @@ class HyperliquidConnector extends CommonConnector {
   private async getCandleClient(count: number) {
     const find = [
       ...this.hyperliquidClientCandle.filter(
-        (c) => c.count < maxCandlesPerConnection,
+        (c) =>
+          c.count < maxCandlesPerConnection &&
+          count + c.count <= maxCandlesPerConnection,
       ),
     ].sort((a, b) => a.count - b.count)[0]
     if (find) {
@@ -274,17 +276,42 @@ class HyperliquidConnector extends CommonConnector {
         interval: hl.WsCandleParameters['interval']
       }[][],
     )
+    let i = 0
     for (const chunk of chunks) {
+      i++
       const client = await this.getCandleClient(chunk.length)
       if (client) {
-        for (const c of chunk) {
-          const unsubscribe = await client.candle(
-            { coin: c.coin, interval: c.interval },
-            this.hyperliquidCandleCb,
+        await Promise.all(
+          chunk.map(async (c) => {
+            await new Promise(async (res, rej) => {
+              const t = setTimeout(() => rej(new Error('Timeout')), 5 * 1000)
+              try {
+                const unsubscribe = await client.candle(
+                  { coin: c.coin, interval: c.interval },
+                  this.hyperliquidCandleCb,
+                )
+                const get = this.unsubscribeMap.get('candle') ?? []
+                get.push(unsubscribe)
+                this.unsubscribeMap.set('candle', get)
+                res([])
+              } catch (e) {
+                rej(e)
+              } finally {
+                clearTimeout(t)
+              }
+            }).catch((e) => {
+              logger.error(
+                `Error subscribing Hyperliquid candle ${c.coin} ${c.interval}: ${e}`,
+              )
+            })
+          }),
+        )
+        if (i < chunks.length) {
+          const secondsToSleep = (chunk.length / 2000) * 60 * 1000
+          logger.info(
+            `Sleeping ${secondsToSleep / 1000} seconds before next Hyperliquid candle chunk`,
           )
-          const get = this.unsubscribeMap.get('candle') ?? []
-          get.push(unsubscribe)
-          this.unsubscribeMap.set('candle', get)
+          await new Promise((r) => setTimeout(r, secondsToSleep))
         }
       }
     }
