@@ -2207,6 +2207,7 @@ class UserConnector {
       data
         .filter((o) => o.order.cloid)
         .map(async (order) => {
+          const isFilled = order.status === 'filled'
           let filledSize = +order.order.origSz - +order.order.sz
           let quote = +order.order.limitPx * filledSize
           let price = `${order.order.limitPx}`
@@ -2217,13 +2218,20 @@ class UserConnector {
           }
           const get = hyperliquidExpirableMap.get(`${order.order.cloid}`)
           if (get) {
-            filledSize = get.reduce((a, c) => a + +c.sz, 0)
-            quote = get.reduce((a, c) => a + +c.sz * +c.px, 0)
-            price = `${(filledSize ? quote / filledSize : +order.order.limitPx).toFixed(pricePrecision)}`
-            if (order.status === 'filled') {
+            if (filledSize > 0) {
+              filledSize = get.reduce((a, c) => a + +c.sz, 0)
+              quote = get.reduce((a, c) => a + +c.sz * +c.px, 0)
+              price = `${(filledSize ? quote / filledSize : +order.order.limitPx).toFixed(pricePrecision)}`
+            }
+            if (isFilled) {
               hyperliquidExpirableMap.delete(`${order.order.cloid}`)
             }
           }
+          if (isFilled && filledSize < +order.order.origSz) {
+            filledSize = +order.order.origSz
+            quote = +price * filledSize
+          }
+
           return {
             creationTime: new Date(order.statusTimestamp).getTime(),
             eventTime: new Date(order.statusTimestamp).getTime(),
@@ -2231,12 +2239,13 @@ class UserConnector {
             newClientOrderId: order.order.cloid ?? '',
             orderId: order.order.oid,
             orderTime: new Date(order.statusTimestamp).getTime(),
-            orderStatus:
-              order.status === 'filled'
-                ? 'FILLED'
-                : order.status === 'open'
-                  ? 'NEW'
-                  : 'CANCELED',
+            orderStatus: isFilled
+              ? 'FILLED'
+              : order.status === 'open'
+                ? filledSize > 0
+                  ? 'PARTIALLY_FILLED'
+                  : 'NEW'
+                : 'CANCELED',
             orderType: 'LIMIT',
             originalClientOrderId: order.order.cloid ?? '',
             price,
