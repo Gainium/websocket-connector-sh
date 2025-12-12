@@ -2227,7 +2227,11 @@ class UserConnector {
               hyperliquidExpirableMap.delete(`${order.order.cloid}`)
             }
           }
-          if (isFilled && filledSize < +order.order.origSz) {
+          if (
+            isFilled &&
+            (filledSize < +order.order.origSz ||
+              filledSize > +order.order.origSz)
+          ) {
             filledSize = +order.order.origSz
             quote = +price * filledSize
           }
