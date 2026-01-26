@@ -1,5 +1,5 @@
 import { convert, convertFutures } from './utils/binance'
-import { WebsocketClient } from 'binance'
+import { WebsocketAPIClient, WSAPIWsKey } from 'binance'
 import * as hl from '@nktkas/hyperliquid'
 import KucoinApi from '@gainium/kucoin-api'
 import Coinbase, {
@@ -675,9 +675,9 @@ class UserConnector {
         ].includes(api.provider)
       ) {
         /** New exchange instance */
-        let client: WebsocketClient
+        let client: WebsocketAPIClient
         if (api.provider === ExchangeEnum.binanceUS) {
-          client = new WebsocketClient(
+          client = new WebsocketAPIClient(
             {
               api_key: api.key,
               api_secret: api.secret,
@@ -685,20 +685,34 @@ class UserConnector {
                 baseUrl: 'https://api.binance.us',
               },
               wsUrl: 'wss://stream.binance.us:9443/ws',
+              beautify: false,
+              beautifyWarnIfMissing: true,
             },
             wsLoggerOptions,
           )
         } else {
-          client = new WebsocketClient(
+          client = new WebsocketAPIClient(
             {
               api_key: api.key,
               api_secret: api.secret,
+              beautify: false,
+              beautifyWarnIfMissing: true,
             },
             wsLoggerOptions,
           )
         }
+        const key: WSAPIWsKey =
+          api.provider === ExchangeEnum.binance ||
+          api.provider === ExchangeEnum.binanceUS
+            ? 'mainWSAPI'
+            : api.provider === ExchangeEnum.binanceUsdm
+              ? 'usdmWSAPI'
+              : 'coinmWSAPI'
+        await client.subscribeUserDataStream(key)
 
-        client.on('message', (data: any) => {
+        const wsClient = client.getWSClient()
+
+        wsClient.on('message', (data: any) => {
           if (
             [ExchangeEnum.binance, ExchangeEnum.binanceUS].includes(
               api.provider,
@@ -712,7 +726,7 @@ class UserConnector {
             )
           }
         }) // notification when a connection is opened
-        client.on('open', (data) => {
+        wsClient.on('open', (data) => {
           this.logger(
             //@ts-ignore
             `${id} connection opened open: ${data.wsKey} ${data.wsUrl} ${api.provider}`,
@@ -720,29 +734,29 @@ class UserConnector {
         })
 
         // receive notification when a ws connection is reconnecting automatically
-        client.on('reconnecting', (data) => {
+        wsClient.on('reconnecting', (data) => {
           this.logger(
             `${id} ws automatically reconnecting ${data.wsKey} ${api.provider}`,
           )
         }) // receive notification that a reconnection completed successfully (e.g use REST to check for missing data)
-        client.on('reconnected', (data) => {
+        wsClient.on('reconnected', (data) => {
           this.logger(`${id} ws has reconnected ${data.wsKey}  ${api.provider}`)
         })
-        client.on('close', (data) => {
+        wsClient.on('close', (data) => {
           this.logger(`${id} ws has closed ${data.wsKey} ${api.provider}`)
         })
 
         // Recommended: receive error events (e.g. first reconnection failed)
-        client.on('exception', async (data) => {
+        wsClient.on('exception', async (data) => {
           this.logger(
             `${id} ${userId} ws saw error ${data.wsKey} ${data?.error?.message} ${api.provider}`,
             true,
           )
           this.binanceErrors.set(id, (this.binanceErrors.get(id) ?? 0) + 1)
           if ((this.binanceErrors.get(id) ?? 0) >= 2) {
-            client.closeAll(false)
+            client.unsubscribeUserDataStream(key)
             //@ts-ignore
-            client.respawnUserDataStream = (...args: unknown[]) =>
+            wsClient.respawnUserDataStream = (...args: unknown[]) =>
               new Promise((resolve) => resolve)
             this.users = this.users.filter((u) => u.id !== id)
             await sleep(5000)
@@ -781,9 +795,9 @@ class UserConnector {
             throw new Error('Connection not created')
           }
           const close = () => {
-            client.closeAll(false)
+            client.unsubscribeUserDataStream(key)
             //@ts-ignore
-            client.respawnUserDataStream = (...args: unknown[]) =>
+            wsClient.respawnUserDataStream = (...args: unknown[]) =>
               new Promise((resolve) => resolve)
           }
           /** Save user id and close function in users array */
