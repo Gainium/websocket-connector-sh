@@ -523,6 +523,7 @@ class UserConnector {
     >(
       rabbitUsersStreamKey,
       (msg) => {
+        console.log(`Received rabbit message: ${JSON.stringify(msg)}`)
         if (msg.event === 'open stream') {
           this.openStreamCallback(msg.data, msg.uuid)
         }
@@ -612,6 +613,7 @@ class UserConnector {
       }`,
   )
   private async openStreamCallback(msg: OpenStreamInput, uuid?: string) {
+    console.log('openStreamCallback called with msg:', msg, 'and uuid:', uuid)
     if (!msg || !msg.userId || !msg.api) {
       return this.logger('Not enough data', true)
     }
@@ -676,6 +678,12 @@ class UserConnector {
       ) {
         /** New exchange instance */
         let client: WebsocketAPIClient
+        api.secret = (api.secret ?? '')
+          .replace(
+            /-----BEGIN PRIVATE KEY----- /g,
+            '-----BEGIN PRIVATE KEY-----\n',
+          )
+          .replace(/ -----END PRIVATE KEY-----/g, '\n-----END PRIVATE KEY-----')
         if (api.provider === ExchangeEnum.binanceUS) {
           client = new WebsocketAPIClient(
             {
@@ -684,9 +692,7 @@ class UserConnector {
               restOptions: {
                 baseUrl: 'https://api.binance.us',
               },
-              wsUrl: 'wss://stream.binance.us:9443/ws',
-              beautify: false,
-              beautifyWarnIfMissing: true,
+              wsUrl: 'wss://ws-api.binance.us:443/ws-api/v3',
             },
             wsLoggerOptions,
           )
@@ -695,10 +701,18 @@ class UserConnector {
             {
               api_key: api.key,
               api_secret: api.secret,
-              beautify: false,
-              beautifyWarnIfMissing: true,
             },
-            wsLoggerOptions,
+            {
+              trace(..._params) {
+                logger.info(`BINANCE TRACE|${JSON.stringify(_params)}`)
+              },
+              info(...params) {
+                logger.info(`BINANCE INFO|${JSON.stringify(params)}`)
+              },
+              error(...params) {
+                logger.error(`BINANCE ERROR|${JSON.stringify(params)}`)
+              },
+            },
           )
         }
         const key: WSAPIWsKey =
@@ -708,11 +722,21 @@ class UserConnector {
             : api.provider === ExchangeEnum.binanceUsdm
               ? 'usdmWSAPI'
               : 'coinmWSAPI'
-        await client.subscribeUserDataStream(key)
 
         const wsClient = client.getWSClient()
-
+        wsClient.removeAllListeners('open')
+        wsClient.removeAllListeners('reconnecting')
+        wsClient.removeAllListeners('reconnected')
+        wsClient.removeAllListeners('authenticated')
+        wsClient.removeAllListeners('exception')
+        wsClient.on('formattedMessage', (data: any) => {
+          console.log('Formatted data:', data)
+        })
+        wsClient.on('formattedUserDataMessage', (data: any) => {
+          console.log('Formatted user data:', data)
+        })
         wsClient.on('message', (data: any) => {
+          console.log('Received data:', data)
           if (
             [ExchangeEnum.binance, ExchangeEnum.binanceUS].includes(
               api.provider,
@@ -732,7 +756,6 @@ class UserConnector {
             `${id} connection opened open: ${data.wsKey} ${data.wsUrl} ${api.provider}`,
           )
         })
-
         // receive notification when a ws connection is reconnecting automatically
         wsClient.on('reconnecting', (data) => {
           this.logger(
@@ -748,8 +771,9 @@ class UserConnector {
 
         // Recommended: receive error events (e.g. first reconnection failed)
         wsClient.on('exception', async (data) => {
+          const errorMsg = JSON.stringify(data)
           this.logger(
-            `${id} ${userId} ws saw error ${data.wsKey} ${data?.error?.message} ${api.provider}`,
+            `${id} ${userId} ws saw error ${data?.wsKey} ${errorMsg} ${api.provider}`,
             true,
           )
           this.binanceErrors.set(id, (this.binanceErrors.get(id) ?? 0) + 1)
@@ -773,27 +797,13 @@ class UserConnector {
         })
         /** Open stream and set callback  */
         try {
-          let result: WebSocket | undefined
-          if (
-            [ExchangeEnum.binance, ExchangeEnum.binanceUS].includes(
-              api.provider,
-            )
-          ) {
-            //@ts-ignore
-            result = await client.subscribeSpotUserDataStream()
-          }
-          if (api.provider === ExchangeEnum.binanceUsdm) {
-            //@ts-ignore
-            result = await client.subscribeUsdFuturesUserDataStream()
-          }
-          if (api.provider === ExchangeEnum.binanceCoinm) {
-            //@ts-ignore
-            result = await client.subscribeCoinFuturesUserDataStream()
-          }
-          if (!result) {
-            await sleep(1000)
-            throw new Error('Connection not created')
-          }
+          // Subscribe to user data stream using signature method
+          this.logger(
+            `${id} subscribing to user data stream ${key} ${api.provider}`,
+          )
+
+          await client.subscribeUserDataStream(key)
+
           const close = () => {
             client.unsubscribeUserDataStream(key)
             //@ts-ignore
@@ -818,7 +828,7 @@ class UserConnector {
           findUser = { ...findUser, pending: false }
           this.saveUser(findUser)
           return this.logger(
-            `${id} ${userId} ${(err as Error).message} ${api.provider}`,
+            `${id} ${userId} ${(err as Error).message || JSON.stringify(err)} ${api.provider}`,
             true,
           )
         }
