@@ -798,7 +798,12 @@ class UserConnector {
 
         // Recommended: receive error events (e.g. first reconnection failed)
         client.on('exception', async (data) => {
-          const errorMsg = JSON.stringify(data)
+          let errorMsg = ''
+          try {
+            errorMsg = JSON.stringify(data)
+          } catch {
+            errorMsg = `error stringifying errorMsg ${data}`
+          }
           this.logger(
             `${id} ${userId} ws saw error ${data?.wsKey} ${errorMsg} ${api.provider}`,
             true,
