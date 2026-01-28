@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.2.0] - 2026-01-28
+
+### Added
+- Support Binance ED25519 keys. 
+- Websocket API for Spot user data streams. 
+
 ## [1.1.7] - 2025-12-12
 
 ### Fixed

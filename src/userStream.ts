@@ -1,5 +1,5 @@
 import { convert, convertFutures } from './utils/binance'
-import { WebsocketClient } from 'binance'
+import { WebsocketAPIClient, WebsocketClient } from 'binance'
 import * as hl from '@nktkas/hyperliquid'
 import KucoinApi from '@gainium/kucoin-api'
 import Coinbase, {
@@ -674,91 +674,13 @@ class UserConnector {
           ExchangeEnum.binanceUsdm,
         ].includes(api.provider)
       ) {
+        const useWebsocketAPI =
+          api.provider === ExchangeEnum.binance &&
+          api.secret.includes('PRIVATE KEY') &&
+          !api.secret.includes('RSA PRIVATE KEY')
         /** New exchange instance */
         let client: WebsocketClient
-        if (api.provider === ExchangeEnum.binanceUS) {
-          client = new WebsocketClient(
-            {
-              api_key: api.key,
-              api_secret: api.secret,
-              restOptions: {
-                baseUrl: 'https://api.binance.us',
-              },
-              wsUrl: 'wss://stream.binance.us:9443/ws',
-            },
-            wsLoggerOptions,
-          )
-        } else {
-          client = new WebsocketClient(
-            {
-              api_key: api.key,
-              api_secret: api.secret,
-            },
-            wsLoggerOptions,
-          )
-        }
-
-        client.on('message', (data: any) => {
-          if (
-            [ExchangeEnum.binance, ExchangeEnum.binanceUS].includes(
-              api.provider,
-            )
-          ) {
-            this.userStreamEvent(id, convert(data) as UserDataStreamEvent)
-          } else {
-            this.userStreamEvent(
-              id,
-              convertFutures(data) as UserDataStreamEvent,
-            )
-          }
-        }) // notification when a connection is opened
-        client.on('open', (data) => {
-          this.logger(
-            //@ts-ignore
-            `${id} connection opened open: ${data.wsKey} ${data.wsUrl} ${api.provider}`,
-          )
-        })
-
-        // receive notification when a ws connection is reconnecting automatically
-        client.on('reconnecting', (data) => {
-          this.logger(
-            `${id} ws automatically reconnecting ${data.wsKey} ${api.provider}`,
-          )
-        }) // receive notification that a reconnection completed successfully (e.g use REST to check for missing data)
-        client.on('reconnected', (data) => {
-          this.logger(`${id} ws has reconnected ${data.wsKey}  ${api.provider}`)
-        })
-        client.on('close', (data) => {
-          this.logger(`${id} ws has closed ${data.wsKey} ${api.provider}`)
-        })
-
-        // Recommended: receive error events (e.g. first reconnection failed)
-        client.on('exception', async (data) => {
-          this.logger(
-            `${id} ${userId} ws saw error ${data.wsKey} ${data?.error?.message} ${api.provider}`,
-            true,
-          )
-          this.binanceErrors.set(id, (this.binanceErrors.get(id) ?? 0) + 1)
-          if ((this.binanceErrors.get(id) ?? 0) >= 2) {
-            client.closeAll(false)
-            //@ts-ignore
-            client.respawnUserDataStream = (...args: unknown[]) =>
-              new Promise((resolve) => resolve)
-            this.users = this.users.filter((u) => u.id !== id)
-            await sleep(5000)
-
-            const get = this.subscribersMap.get(id)
-            this.subscribersMap.delete(id)
-            if (get) {
-              ;[...Array(get)].forEach(() => this.openStreamCallback(msg, uuid))
-            }
-
-            this.binanceErrors.delete(id)
-            this.logger(`restart connection ${data.wsKey} ${api.provider}`)
-          }
-        })
-        /** Open stream and set callback  */
-        try {
+        let startMethod: () => Promise<void> = async () => {
           let result: WebSocket | undefined
           if (
             [ExchangeEnum.binance, ExchangeEnum.binanceUS].includes(
@@ -780,14 +702,129 @@ class UserConnector {
             await sleep(1000)
             throw new Error('Connection not created')
           }
-          const close = () => {
-            client.closeAll(false)
-            //@ts-ignore
-            client.respawnUserDataStream = (...args: unknown[]) =>
-              new Promise((resolve) => resolve)
+        }
+        let stopMethod: () => Promise<void> = async () => {
+          client.closeAll(false)
+          //@ts-ignore
+          client.respawnUserDataStream = (...args: unknown[]) =>
+            new Promise((resolve) => resolve)
+        }
+        api.secret = (api.secret ?? '')
+          .replace(
+            /-----BEGIN PRIVATE KEY----- /g,
+            '-----BEGIN PRIVATE KEY-----\n',
+          )
+          .replace(/ -----END PRIVATE KEY-----/g, '\n-----END PRIVATE KEY-----')
+        if (api.provider === ExchangeEnum.binanceUS) {
+          client = new WebsocketClient(
+            {
+              api_key: api.key,
+              api_secret: api.secret,
+              restOptions: {
+                baseUrl: 'https://api.binance.us',
+              },
+              wsUrl: 'wss://stream.binance.us:9443/ws',
+            },
+            wsLoggerOptions,
+          )
+        } else {
+          if (useWebsocketAPI) {
+            const wsAPI = new WebsocketAPIClient(
+              {
+                api_key: api.key,
+                api_secret: api.secret,
+              },
+              wsLoggerOptions,
+            )
+
+            client = wsAPI.getWSClient()
+            startMethod = async () => {
+              await wsAPI.subscribeUserDataStream('mainWSAPI')
+            }
+            stopMethod = async () => {
+              wsAPI.unsubscribeUserDataStream('mainWSAPI')
+              //@ts-ignore
+              client.respawnUserDataStream = (...args: unknown[]) =>
+                new Promise((resolve) => resolve)
+            }
+          } else {
+            client = new WebsocketClient(
+              {
+                api_key: api.key,
+                api_secret: api.secret,
+              },
+              wsLoggerOptions,
+            )
           }
+        }
+
+        client.removeAllListeners('open')
+        client.removeAllListeners('reconnecting')
+        client.removeAllListeners('reconnected')
+        client.removeAllListeners('authenticated')
+        client.removeAllListeners('exception')
+        client.on('message', (data: any) => {
+          if (
+            [ExchangeEnum.binance, ExchangeEnum.binanceUS].includes(
+              api.provider,
+            )
+          ) {
+            this.userStreamEvent(id, convert(data) as UserDataStreamEvent)
+          } else {
+            this.userStreamEvent(
+              id,
+              convertFutures(data) as UserDataStreamEvent,
+            )
+          }
+        }) // notification when a connection is opened
+        client.on('open', (data) => {
+          this.logger(
+            //@ts-ignore
+            `${id} connection opened open: ${data.wsKey} ${data.wsUrl} ${api.provider}`,
+          )
+        })
+        // receive notification when a ws connection is reconnecting automatically
+        client.on('reconnecting', (data) => {
+          this.logger(
+            `${id} ws automatically reconnecting ${data.wsKey} ${api.provider}`,
+          )
+        }) // receive notification that a reconnection completed successfully (e.g use REST to check for missing data)
+        client.on('reconnected', (data) => {
+          this.logger(`${id} ws has reconnected ${data.wsKey}  ${api.provider}`)
+        })
+        client.on('close', (data) => {
+          this.logger(`${id} ws has closed ${data.wsKey} ${api.provider}`)
+        })
+
+        // Recommended: receive error events (e.g. first reconnection failed)
+        client.on('exception', async (data) => {
+          const errorMsg = JSON.stringify(data)
+          this.logger(
+            `${id} ${userId} ws saw error ${data?.wsKey} ${errorMsg} ${api.provider}`,
+            true,
+          )
+          this.binanceErrors.set(id, (this.binanceErrors.get(id) ?? 0) + 1)
+          if ((this.binanceErrors.get(id) ?? 0) >= 2) {
+            await stopMethod()
+            this.users = this.users.filter((u) => u.id !== id)
+            await sleep(5000)
+
+            const get = this.subscribersMap.get(id)
+            this.subscribersMap.delete(id)
+            if (get) {
+              ;[...Array(get)].forEach(() => this.openStreamCallback(msg, uuid))
+            }
+
+            this.binanceErrors.delete(id)
+            this.logger(`restart connection ${data.wsKey} ${api.provider}`)
+          }
+        })
+        /** Open stream and set callback  */
+        try {
+          await startMethod()
+
           /** Save user id and close function in users array */
-          findUser = { ...findUser, close }
+          findUser = { ...findUser, close: stopMethod }
 
           this.subscribersMap.set(id, (this.subscribersMap.get(id) ?? 0) + 1)
 
@@ -804,7 +841,7 @@ class UserConnector {
           findUser = { ...findUser, pending: false }
           this.saveUser(findUser)
           return this.logger(
-            `${id} ${userId} ${(err as Error).message} ${api.provider}`,
+            `${id} ${userId} ${(err as Error).message || JSON.stringify(err)} ${api.provider}`,
             true,
           )
         }
