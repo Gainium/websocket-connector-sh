@@ -642,6 +642,11 @@ class UserConnector {
       )
     }
     const { userId, api } = msg
+    api.key = (api.key ?? '').trim()
+    api.secret = (api.secret ?? '').trim()
+    if (api.passphrase) {
+      api.passphrase = (api.passphrase ?? '').trim()
+    }
     const id =
       uuid ??
       crypto
