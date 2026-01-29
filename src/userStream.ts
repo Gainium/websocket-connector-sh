@@ -1048,6 +1048,9 @@ class UserConnector {
       ) {
         /** Open stream and set callback  */
         try {
+          const wsUrl =
+            bybitHostMap[api.bybitHost || BybitHost.com] ||
+            bybitHostMap[BybitHost.com]
           /** New exchange instance */
           const client = new BybitClient(
             {
@@ -1059,9 +1062,7 @@ class UserConnector {
               pongTimeout: 20000,
               pingInterval: 20000,
               reconnectTimeout: 2000,
-              wsUrl:
-                bybitHostMap[api.bybitHost || BybitHost.com] ||
-                bybitHostMap[BybitHost.com],
+              wsUrl,
             },
             {
               trace: () => null,
@@ -1136,13 +1137,13 @@ class UserConnector {
             try {
               m = message ?? JSON.stringify(error)
               this.logger(
-                `${id} ${userId} bybit error ${m} ${api.provider}`,
+                `${id} ${userId} bybit error ${m} ${api.provider} ${api.bybitHost} ${wsUrl}`,
                 true,
               )
             } catch {
               m = message ?? error
               this.logger(
-                `${id} ${userId} bybit error ${m} ${api.provider}`,
+                `${id} ${userId} bybit error ${m} ${api.provider} ${api.bybitHost} ${wsUrl}`,
                 true,
               )
             }
