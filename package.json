@@ -1,6 +1,6 @@
 {
   "name": "@gainium/websocket-connector",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Websocket connector",
   "author": "Maksym Shamko",
   "private": true,
@@ -10,6 +10,7 @@
     "build": "(rm -rf dist || true) && tsc --project tsconfig.json",
     "main": "node -r dotenv/config dist/index.js",
     "price": "node -r dotenv/config dist/index.price.js",
+    "test:connection": "ts-node -r dotenv/config src/testConnection.ts",
     "lint": "tsc --noEmit --project tsconfig.json && eslint . --cache",
     "lint:fix": "eslint . --fix",
     "fullInit": "export GAINIUM_KUCOIN=@gainium/kucoin-api && (npm uninstall $GAINIUM_KUCOIN || true) && npm cache clean --force && npm install $GAINIUM_KUCOIN@git+https://github.com/Gainium/kucoin-api.git && unset GAINIUM_KUCOIN",

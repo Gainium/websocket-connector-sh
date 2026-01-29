@@ -93,6 +93,15 @@ export const bybitHostMap: Record<BybitHost, string> = {
   [BybitHost.ge]: 'wss://stream.bybitgeorgia.ge/v5/private',
 }
 
+export const bybitHostAPIMap: Record<BybitHost, string> = {
+  [BybitHost.eu]: 'https://api.bybit.eu',
+  [BybitHost.com]: 'https://api.bybit.com',
+  [BybitHost.nl]: 'https://api.bybit.eu',
+  [BybitHost.tr]: 'https://api.bybit-tr.com',
+  [BybitHost.kz]: 'https://api.bybit.kz',
+  [BybitHost.ge]: 'https://api.bybitgeorgia.ge',
+}
+
 export interface AssetBalance {
   asset: string
   free: string
@@ -475,6 +484,7 @@ class UserConnector {
   private redisSet = RedisClient.getInstance()
   private redis = RedisClient.getInstance()
   private rabbit = new Rabbit()
+  private testMode: boolean
   /** Array of users for whom binance stream are opened */
   private users: User[]
   private subscribersMap: Map<string, number> = new Map()
@@ -503,17 +513,20 @@ class UserConnector {
    * @returns {UserConnector} self
    * @public
    */
-  constructor() {
+  constructor(testMode = false) {
     /** Determine class varibales */
+    this.testMode = testMode
     this.users = []
     this.openStreamCallback = this.openStreamCallback.bind(this)
     this.closeStreamCallback = this.closeStreamCallback.bind(this)
 
-    this.setupRabbit()
-    this.redis?.publish(
-      serviceLogRedis,
-      JSON.stringify({ restart: 'userStream' }),
-    )
+    if (!testMode) {
+      this.setupRabbit()
+      this.redis?.publish(
+        serviceLogRedis,
+        JSON.stringify({ restart: 'userStream' }),
+      )
+    }
   }
 
   private setupRabbit() {
@@ -1051,6 +1064,9 @@ class UserConnector {
           const wsUrl =
             bybitHostMap[api.bybitHost || BybitHost.com] ||
             bybitHostMap[BybitHost.com]
+          const baseUrl =
+            bybitHostAPIMap[api.bybitHost || BybitHost.com] ||
+            bybitHostAPIMap[BybitHost.com]
           /** New exchange instance */
           const client = new BybitClient(
             {
@@ -1090,12 +1106,62 @@ class UserConnector {
           const type = await new RestClientV5({
             key: api.key,
             secret: api.secret,
+            baseUrl,
           })
             .getAccountInfo()
-            .then((r) => r?.result?.unifiedMarginStatus)
-            .catch(
-              (e) => (this.logger(`Error gettings account type ${e}`, true), 0),
-            )
+            .then((r) => {
+              const account = r?.result?.unifiedMarginStatus
+              if (typeof account === 'undefined') {
+                try {
+                  console.error(
+                    'Bybit getAccountInfo undefined',
+                    JSON.stringify(r),
+                    api.provider,
+                    baseUrl,
+                    wsUrl,
+                    userId,
+                    id,
+                  )
+                } catch {
+                  try {
+                    console.error(
+                      'Bybit getAccountInfo undefined, and error stringifying response',
+                      r,
+                      api.provider,
+                      baseUrl,
+                      wsUrl,
+                      userId,
+                      id,
+                    )
+                  } catch {
+                    console.error(
+                      'Bybit getAccountInfo undefined, and error stringifying response',
+                      api.provider,
+                      baseUrl,
+                      wsUrl,
+                      userId,
+                      id,
+                    )
+                  }
+                }
+              }
+              if (
+                r.retMsg === 'API key is invalid.' ||
+                r.retMsg === 'Your api key has expired.' ||
+                r.retMsg.includes('Error sign')
+              ) {
+                throw new Error(
+                  `Request not authorized ${api.key} ${api.secret} ${api.provider} ${baseUrl} ${wsUrl}`,
+                )
+              }
+              return account
+            })
+            .catch((e) => {
+              if (e?.message?.includes('Request not authorized')) {
+                throw e
+              }
+              return (this.logger(`Error gettings account type ${e}`, true), 0)
+            })
           this.logger(
             `${id} ${userId} bybit getting account type ${type} ${api.provider}`,
           )
@@ -1193,7 +1259,7 @@ class UserConnector {
             })
             client.once('error', () => {
               clearTimeout(timer)
-              reject()
+              reject(`Bybit connection timeout ${id} ${api.provider}`)
             })
           })
 
@@ -1877,10 +1943,78 @@ class UserConnector {
     })
     logger.info(usersMap)
 
-    return this.redis?.publish(
-      `userStreamInfo${id}`,
-      `Subscribed to user ${id}`,
-    )
+    if (!this.testMode) {
+      return this.redis?.publish(
+        `userStreamInfo${id}`,
+        `Subscribed to user ${id}`,
+      )
+    } else {
+      console.log(`Successfully subscribed to user stream: ${id}`)
+    }
+  }
+
+  /** Test connection method for CLI usage
+   * @param {Object} options - Connection options
+   * @param {string} options.provider - Exchange provider
+   * @param {string} options.key - API key
+   * @param {string} options.secret - API secret
+   * @param {string} [options.passphrase] - API passphrase (for exchanges that require it)
+   * @param {string} [options.environment] - Environment (live/sandbox)
+   * @param {string} [options.bybitHost] - Bybit host
+   * @param {string} [options.keysType] - Coinbase keys type
+   * @param {string} [options.okxSource] - OKX source
+   * @returns {Promise<void>}
+   * @public
+   */
+  public async testConnection(options: {
+    provider: string
+    key: string
+    secret: string
+    passphrase?: string
+    environment?: 'live' | 'sandbox'
+    bybitHost?: string
+    keysType?: string
+    okxSource?: string
+  }): Promise<void> {
+    if (!this.testMode) {
+      throw new Error('testConnection can only be used in test mode')
+    }
+
+    console.log(`Testing connection to ${options.provider}...`)
+
+    const testInput: OpenStreamInput = {
+      userId: 'test-user',
+      api: {
+        key: options.key,
+        secret: options.secret,
+        provider: options.provider as ExchangeEnum,
+        ...(options.passphrase && { passphrase: options.passphrase }),
+        ...(options.environment && { environment: options.environment }),
+        ...(options.bybitHost && { bybitHost: options.bybitHost as BybitHost }),
+        ...(options.keysType && {
+          keysType: options.keysType as CoinbaseKeysType,
+        }),
+        ...(options.okxSource && { okxSource: options.okxSource as OKXSource }),
+      },
+    }
+
+    try {
+      await this.openStreamCallback(testInput, 'test-connection-id')
+      console.log(
+        '✅ Connection test successful! Stream is active and receiving data.',
+      )
+      console.log('Press Ctrl+C to stop the test.')
+
+      // Keep the process running to observe stream events
+      process.on('SIGINT', () => {
+        console.log('\n🛑 Stopping connection test...')
+        this.closeStreamCallback('test-connection-id')
+        process.exit(0)
+      })
+    } catch (error) {
+      console.error('❌ Connection test failed:', error)
+      throw error
+    }
   }
 
   @IdMute(mutex, () => 'restartStreams')
@@ -1969,8 +2103,12 @@ class UserConnector {
     }
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
 
-    this.redis.publish(id, JSON.stringify(streamMsg))
-    if (this.redisSet) {
+    if (!this.testMode) {
+      this.redis.publish(id, JSON.stringify(streamMsg))
+    } else {
+      console.log('Stream Event:', JSON.stringify(streamMsg, null, 2))
+    }
+    if (this.redisSet && !this.testMode) {
       const msg = streamMsg as any
       if (
         msg?.eventType === 'executionReport' ||
@@ -2437,3 +2575,4 @@ class UserConnector {
 }
 
 export default UserConnector
+export { UserConnector }
