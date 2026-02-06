@@ -176,6 +176,7 @@ export enum CoinbaseKeysType {
 
 export enum OKXSource {
   my = 'my',
+  app = 'app',
   com = 'com',
 }
 
@@ -1316,7 +1317,9 @@ class UserConnector {
               wsUrl:
                 api.okxSource === OKXSource.my
                   ? 'wss://wseea.okx.com:8443/ws/v5/private'
-                  : undefined,
+                  : api.okxSource === OKXSource.app
+                    ? 'wss://wsus.okx.com:8443/ws/v5/private'
+                    : undefined,
             },
             {
               silly: () => null,
