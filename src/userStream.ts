@@ -2447,7 +2447,7 @@ class UserConnector {
             symbol: order.order.coin,
             totalQuoteTradeQuantity: `${quote}`,
             totalTradeQuantity: `${filledSize}`,
-            uniqueMessageId: `executionReport${JSON.stringify(order)}`,
+            uniqueMessageId: `executionReport${JSON.stringify(order)},fills:${JSON.stringify(get || [])}`,
             liquidation: false,
           }
         }),

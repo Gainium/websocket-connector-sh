@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.3.3] - 2026-02-20
+
+### Changed
+- Debug hyperliquid fills
+
 ## [1.3.2] - 2026-02-06
 
 ### Changed
