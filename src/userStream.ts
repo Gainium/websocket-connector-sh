@@ -776,6 +776,13 @@ class UserConnector {
             )
           }
         }
+        if (!useWebsocketAPI && api.provider === ExchangeEnum.binance) {
+          startMethod = async () => {
+            throw new Error(
+              `Support of legacy subscribed is dropped for binance, please use websocket API key to avoid connection issues`,
+            )
+          }
+        }
 
         client.removeAllListeners('open')
         client.removeAllListeners('reconnecting')
