@@ -14,6 +14,7 @@ import { CategoryV5 } from 'bybit-api'
 import { WebsocketClient as BybitClient } from '../bybit-custom/websocket-client'
 import { WebsocketClient as OKXClient, WsChannelArgInstType } from 'okx-api'
 import { WebsocketClientV2 as BitgetClient, BitgetInstTypeV2 } from 'bitget-api'
+import { WebsocketClient as KrakenWsClient } from '@siebly/kraken-api'
 import { connectPaper } from './utils/paperTradingWS'
 import logger from './utils/logger'
 import { IdMute, IdMutex } from './utils/mutex'
@@ -51,6 +52,8 @@ export type PaperExchangeType =
   | ExchangeEnum.paperMexc
   | ExchangeEnum.paperHyperliquid
   | ExchangeEnum.paperHyperliquidLinear
+  | ExchangeEnum.paperKraken
+  | ExchangeEnum.paperKrakenUsdm
 
 export const paperExchanges = [
   ExchangeEnum.paperFtx,
@@ -73,6 +76,8 @@ export const paperExchanges = [
   ExchangeEnum.paperMexc,
   ExchangeEnum.paperHyperliquid,
   ExchangeEnum.paperHyperliquidLinear,
+  ExchangeEnum.paperKraken,
+  ExchangeEnum.paperKrakenUsdm,
 ]
 
 export enum BybitHost {
@@ -505,6 +510,11 @@ class UserConnector {
     coinm: [],
     usdm: [],
   }
+  /** Kraken last balance quantities to filter price-only updates */
+  private krakenLastBalances: Map<
+    string,
+    Map<string, { free: string; locked: string }>
+  > = new Map()
   private subscribeMsgsMap: Map<string, OpenStreamInput> = new Map()
   /** Constructor method
    * Determine class variables
@@ -1894,6 +1904,167 @@ class UserConnector {
           )
         }
       }
+      if (
+        [ExchangeEnum.kraken, ExchangeEnum.krakenUsdm].includes(api.provider)
+      ) {
+        /** Open stream and set callback  */
+        try {
+          const isDemo = process.env.KRAKEN_ENV === 'demo'
+          const isFutures = api.provider === ExchangeEnum.krakenUsdm
+
+          /** New exchange instance */
+          const client = new KrakenWsClient(
+            {
+              apiKey: api.key,
+              apiSecret: api.secret,
+              ...(isFutures && isDemo && { testnet: true }),
+            },
+            {
+              trace: () => null,
+              info: (...args) =>
+                this.logger(
+                  `${id} Kraken info: ${JSON.stringify(args)} ${api.provider}`,
+                ),
+              error: (...args) =>
+                this.logger(
+                  `${id} Kraken error: ${JSON.stringify(args)} ${api.provider}`,
+                  true,
+                ),
+            },
+          )
+
+          // Subscribe to appropriate topics based on market type
+          const wsKey = isFutures ? 'derivativesPrivateV1' : 'spotPrivateV2'
+
+          this.logger(
+            `${id} Kraken subscribing to topics: ${JSON.stringify(isFutures ? ['open_orders', 'balances'] : ['executions', 'balances'])} on ${wsKey}`,
+          )
+
+          client.subscribe(
+            isFutures
+              ? ['open_orders', 'balances']
+              : ['executions', 'balances'],
+            wsKey,
+          )
+
+          client.on('message', (msg: any) => {
+            // Handle order updates
+            if (msg.channel === 'executions' || msg.channel === 'open_orders') {
+              const orders = this.prepareKrakenOrderMsg(msg.data, msg.channel)
+              orders.forEach((order) => this.userStreamEvent(id, order))
+            }
+
+            // Handle balance updates
+            if (msg.channel === 'balances') {
+              const balance = this.prepareKrakenBalanceMsg(
+                msg.data,
+                Date.now(),
+                id,
+              )
+              if (balance) {
+                // Filter out updates where only values changed (due to price movements)
+                // Only emit if actual quantities changed
+                const lastBalances =
+                  this.krakenLastBalances.get(id) || new Map()
+                let hasChanges = false
+
+                for (const b of balance.balances) {
+                  const last = lastBalances.get(b.asset)
+                  if (
+                    !last ||
+                    last.free !== b.free ||
+                    last.locked !== b.locked
+                  ) {
+                    hasChanges = true
+                    break
+                  }
+                }
+
+                // Check if new assets appeared
+                if (
+                  !hasChanges &&
+                  balance.balances.length !== lastBalances.size
+                ) {
+                  hasChanges = true
+                }
+
+                if (hasChanges) {
+                  this.logger(`${id} Kraken balance changed, emitting update`)
+                  // Update stored balances
+                  const newBalances = new Map<
+                    string,
+                    { free: string; locked: string }
+                  >()
+                  balance.balances.forEach((b) => {
+                    newBalances.set(b.asset, { free: b.free, locked: b.locked })
+                  })
+                  this.krakenLastBalances.set(id, newBalances)
+
+                  this.userStreamEvent(id, balance)
+                } else {
+                  this.logger(
+                    `${id} Kraken balance update filtered (price-only change)`,
+                  )
+                }
+              }
+            }
+          })
+
+          client.on('open', () => {
+            this.logger(`${id} Kraken ws connection opened ${api.provider}`)
+          })
+
+          client.on('authenticated', () => {
+            this.logger(`${id} Kraken ws authenticated ${api.provider}`)
+          })
+
+          client.on('reconnected', () => {
+            this.logger(`${id} Kraken ws has reconnected ${api.provider}`)
+          })
+
+          const close = () => {
+            client.closeAll(true)
+            client.removeAllListeners('message')
+            client.removeAllListeners('open')
+            client.removeAllListeners('authenticated')
+            client.removeAllListeners('reconnected')
+            client.removeAllListeners('exception')
+            // Clean up stored balances
+            this.krakenLastBalances.delete(id)
+          }
+
+          client.on('exception', async (error: Error | string) => {
+            const errorMsg =
+              typeof error === 'string' ? error : error.message || ''
+            this.logger(
+              `${id} ${userId} Kraken exception ${errorMsg} ${api.provider}`,
+              true,
+            )
+          })
+
+          /** Save user id and close function in users array */
+          findUser = { ...findUser, close }
+
+          this.subscribersMap.set(id, (this.subscribersMap.get(id) ?? 0) + 1)
+
+          /** Log stream created for user */
+          this.logger(
+            `Stream for ${userId} room ${id} was successfully created ${api.provider}`,
+          )
+          /** Log bot subscribed to the user */
+          this.logger(
+            `Was subscribed to the user ${userId} room ${id} ${api.provider}`,
+          )
+          await sleep(2000)
+        } catch (err) {
+          findUser = { ...findUser, pending: false }
+          this.saveUser(findUser)
+          return this.logger(
+            `${(err as Error)?.message ?? err} ${api.provider}`,
+            true,
+          )
+        }
+      }
       if (paperExchanges.includes(api.provider)) {
         const exchange = mapPaperToReal(api.provider as PaperExchangeType)
         if (!exchange) {
@@ -2585,6 +2756,167 @@ class UserConnector {
       eventType: 'outboundAccountPosition',
       lastAccountUpdate: 0,
       uniqueMessageId: `outboundAccountPosition${msg.balance[0]?.asset}${msg.balance[0]?.free}${msg.balance[0]?.locked}`,
+    }
+  }
+
+  private prepareKrakenOrderMsg(data: any, channel: string): ExecutionReport[] {
+    if (!data || !Array.isArray(data)) {
+      return []
+    }
+
+    return data.map((order: any) => {
+      // Kraken spot executions format
+      if (channel === 'executions') {
+        return {
+          creationTime: Date.parse(order.timestamp) || Date.now(),
+          eventTime: Date.parse(order.timestamp) || Date.now(),
+          eventType: 'executionReport',
+          newClientOrderId: order.cl_ord_id || order.order_id || '',
+          orderId: order.order_id || '',
+          orderTime: Date.parse(order.timestamp) || Date.now(),
+          orderStatus: this.mapKrakenOrderStatus(order.status),
+          orderType: order.order_type === 'limit' ? 'LIMIT' : 'MARKET',
+          originalClientOrderId: order.cl_ord_id || order.order_id || '',
+          price: order.avg_price || order.limit_price || order.price || '0',
+          quantity: order.order_qty || order.vol || '0',
+          side: order.side === 'buy' ? 'BUY' : 'SELL',
+          symbol: order.symbol || order.pair || '',
+          totalQuoteTradeQuantity: order.cum_cost || order.cost || '0',
+          totalTradeQuantity: order.cum_qty || order.vol_exec || '0',
+          uniqueMessageId: `kraken${channel}${JSON.stringify(order)}`,
+          liquidation: false,
+        }
+      }
+
+      // Kraken futures open_orders format
+      if (channel === 'open_orders') {
+        return {
+          creationTime: order.timestamp
+            ? Date.parse(order.timestamp)
+            : Date.now(),
+          eventTime: order.last_update_timestamp
+            ? Date.parse(order.last_update_timestamp)
+            : Date.now(),
+          eventType: 'executionReport',
+          newClientOrderId: order.cli_ord_id || order.order_id || '',
+          orderId: order.order_id || '',
+          orderTime: order.last_update_timestamp
+            ? Date.parse(order.last_update_timestamp)
+            : Date.now(),
+          orderStatus: this.mapKrakenOrderStatus(order.status),
+          orderType: order.order_type === 'lmt' ? 'LIMIT' : 'MARKET',
+          originalClientOrderId: order.cli_ord_id || order.order_id || '',
+          price: order.limit_price || order.price || '0',
+          quantity: `${order.quantity || order.filled_quantity || 0}`,
+          side: order.direction === 'buy' ? 'BUY' : 'SELL',
+          symbol: order.instrument || order.symbol || '',
+          totalQuoteTradeQuantity: '0',
+          totalTradeQuantity: `${order.filled_quantity || 0}`,
+          uniqueMessageId: `kraken${channel}${JSON.stringify(order)}`,
+          liquidation: false,
+        }
+      }
+
+      // Default fallback (should not reach here)
+      return {
+        creationTime: Date.now(),
+        eventTime: Date.now(),
+        eventType: 'executionReport',
+        newClientOrderId:
+          order.cl_ord_id || order.cli_ord_id || order.order_id || '',
+        orderId: order.order_id || '',
+        orderTime: Date.now(),
+        orderStatus: 'NEW',
+        orderType: 'LIMIT',
+        originalClientOrderId:
+          order.cl_ord_id || order.cli_ord_id || order.order_id || '',
+        price: '0',
+        quantity: '0',
+        side: 'BUY',
+        symbol: order.symbol || order.pair || order.instrument || '',
+        totalQuoteTradeQuantity: '0',
+        totalTradeQuantity: '0',
+        uniqueMessageId: `kraken${channel}${JSON.stringify(order)}`,
+        liquidation: false,
+      }
+    })
+  }
+
+  private mapKrakenOrderStatus(status: string): OrderStatus_LT {
+    if (!status) return 'NEW'
+
+    const statusLower = status.toLowerCase()
+
+    // Spot statuses: pending, open, closed, canceled, expired
+    // Futures statuses: placed, untriggered, cancelled, filled, partially_filled
+    if (
+      statusLower === 'open' ||
+      statusLower === 'pending' ||
+      statusLower === 'placed' ||
+      statusLower === 'untriggered'
+    ) {
+      return 'NEW'
+    }
+
+    if (statusLower === 'partially_filled') {
+      return 'PARTIALLY_FILLED'
+    }
+
+    if (statusLower === 'filled' || statusLower === 'closed') {
+      return 'FILLED'
+    }
+
+    if (
+      statusLower === 'canceled' ||
+      statusLower === 'cancelled' ||
+      statusLower === 'expired'
+    ) {
+      return 'CANCELED'
+    }
+
+    return 'NEW'
+  }
+
+  private prepareKrakenBalanceMsg(
+    data: any,
+    time: number,
+    userId: string,
+  ): OutboundAccountPosition | undefined {
+    if (!data) {
+      return undefined
+    }
+
+    // Kraken balances can come as an object with currency keys
+    // or as an array of balance objects
+    let balances: { asset: string; free: string; locked: string }[] = []
+
+    if (Array.isArray(data)) {
+      balances = data.map((b: any) => ({
+        asset: b.currency || b.asset || '',
+        free: b.balance || b.available || '0',
+        locked: b.hold_balance || b.locked || '0',
+      }))
+    } else if (typeof data === 'object') {
+      // Handle object format: { BTC: { balance: '1.0', hold_balance: '0.1' }, ... }
+      balances = Object.entries(data).map(
+        ([currency, info]: [string, any]) => ({
+          asset: currency,
+          free: info.balance || info.available || '0',
+          locked: info.hold_balance || info.locked || '0',
+        }),
+      )
+    }
+
+    if (!balances.length) {
+      return undefined
+    }
+
+    return {
+      balances,
+      eventTime: time,
+      eventType: 'outboundAccountPosition',
+      lastAccountUpdate: 0,
+      uniqueMessageId: `outboundAccountPosition${userId}${JSON.stringify(balances)}kraken`,
     }
   }
 }
