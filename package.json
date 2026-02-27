@@ -37,6 +37,7 @@
   "dependencies": {
     "@gainium/kucoin-api": "github:Gainium/kucoin-api",
     "@nktkas/hyperliquid": "^0.24.3",
+    "@siebly/kraken-api": "^1.0.4",
     "amqplib": "^0.10.8",
     "axios": "^1.11.0",
     "binance": "^3.1.9",

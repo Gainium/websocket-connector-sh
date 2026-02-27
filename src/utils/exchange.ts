@@ -17,6 +17,10 @@ import KucoinApi from '@gainium/kucoin-api'
 import { convertSymbol } from './kucoin'
 import Coinbase from 'coinbase-advanced-node'
 import { RestClientV2 as BitgetClient } from 'bitget-api'
+import {
+  SpotClient as KrakenSpotClient,
+  DerivativesClient as KrakenDerivativesClient,
+} from '@siebly/kraken-api'
 
 export type ExchangeInfo = {
   baseAsset: {
@@ -116,7 +120,11 @@ const getAllExchangeInfo = async (
   exchange: ExchangeEnum,
 ): Promise<string[]> => {
   const url = exchangeUrl()
-  if (url) {
+  if (
+    url &&
+    exchange !== ExchangeEnum.kraken &&
+    exchange !== ExchangeEnum.krakenUsdm
+  ) {
     const data = await axios
       .get<BaseReturn<(ExchangeInfo & { pair: string })[]>>(
         `${url}/exchange/all?exchange=${exchange}`,
@@ -292,7 +300,121 @@ const getAllExchangeInfo = async (
         .map((s) => convertSymbol(s.symbol))
     }
   }
+  if (exchange === ExchangeEnum.kraken) {
+    const krakenClient = new KrakenSpotClient({})
+    try {
+      const result = await krakenClient.getAssetPairs()
+      if (result.result) {
+        return Object.entries(result.result)
+          .filter(([_symbol, pair]) => {
+            // Filter out dark pool pairs, halted pairs, and pairs without wsname
+            if (
+              !pair.wsname ||
+              pair.status !== 'online' ||
+              _symbol.endsWith('.d')
+            ) {
+              return false
+            }
+            // Filter out XBT pairs (not supported on WebSocket)
+            if (pair.wsname.includes('/XBT')) {
+              return false
+            }
+            return true
+          })
+          .map(([_symbol, pair]) => {
+            // Normalize: BTC/USD -> BTCUSD
+            return pair.wsname!.replace('/', '')
+          })
+      }
+    } catch (e) {
+      logger.error('Failed to get kraken spot markets', e)
+      return []
+    }
+  }
+  if (exchange === ExchangeEnum.krakenUsdm) {
+    const isDemo = process.env.KRAKEN_ENV === 'demo'
+    const krakenClient = new KrakenDerivativesClient(
+      isDemo ? { testnet: true } : {},
+    )
+    try {
+      const result = await krakenClient.getInstruments()
+      if (result.result === 'success' && result.instruments) {
+        return result.instruments
+          .filter((instrument) => instrument.tradeable)
+          .map((instrument) => instrument.symbol)
+      }
+    } catch (e) {
+      logger.error('Failed to get kraken futures markets', e)
+      return []
+    }
+  }
   return []
+}
+
+export type KrakenSymbolMap = {
+  wsnameToNormalized: Map<string, string>
+  normalizedToWsname: Map<string, string>
+}
+
+export const getKrakenSymbolMaps = async (
+  exchange: ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
+): Promise<KrakenSymbolMap> => {
+  const maps: KrakenSymbolMap = {
+    wsnameToNormalized: new Map(),
+    normalizedToWsname: new Map(),
+  }
+
+  if (exchange === ExchangeEnum.kraken) {
+    const krakenClient = new KrakenSpotClient({})
+    try {
+      const result = await krakenClient.getAssetPairs()
+      if (result.result) {
+        Object.entries(result.result).forEach(([_symbol, pair]) => {
+          // Filter out dark pool pairs, halted pairs, and pairs without wsname
+          if (
+            !pair.wsname ||
+            pair.status !== 'online' ||
+            _symbol.endsWith('.d')
+          ) {
+            return
+          }
+          // Filter out XBT pairs (not supported on WebSocket)
+          if (pair.wsname.includes('/XBT')) {
+            return
+          }
+
+          const wsname = pair.wsname
+          const normalized = wsname.replace('/', '') // BTC/USD -> BTCUSD
+          maps.wsnameToNormalized.set(wsname, normalized)
+          maps.normalizedToWsname.set(normalized, wsname)
+        })
+      }
+    } catch (e) {
+      logger.error('Failed to get kraken spot symbol maps', e)
+    }
+  } else if (exchange === ExchangeEnum.krakenUsdm) {
+    const isDemo = process.env.KRAKEN_ENV === 'demo'
+    const krakenClient = new KrakenDerivativesClient(
+      isDemo ? { testnet: true } : {},
+    )
+    try {
+      const result = await krakenClient.getInstruments()
+      if (result.result === 'success' && result.instruments) {
+        result.instruments
+          .filter((instrument) => instrument.tradeable)
+          .forEach((instrument) => {
+            const wsname = instrument.symbol
+            const normalized = wsname // Futures symbols don't have /
+            maps.wsnameToNormalized.set(wsname, normalized)
+            maps.normalizedToWsname.set(normalized, wsname)
+          })
+      }
+    } catch (e) {
+      logger.error('Failed to get kraken futures symbol maps', e)
+    }
+  }
+
+  return maps
 }
 
 export type KucoinSymbol = { symbol: string; asset: string }
