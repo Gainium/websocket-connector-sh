@@ -403,7 +403,7 @@ export const getKrakenSymbolMaps = async (
         result.instruments
           .filter((instrument) => instrument.tradeable)
           .forEach((instrument) => {
-            const wsname = instrument.symbol
+            const wsname = `${instrument.base}-${instrument.quote}` // e.g. BTC-USD
             const normalized = wsname // Futures symbols don't have /
             maps.wsnameToNormalized.set(wsname, normalized)
             maps.normalizedToWsname.set(normalized, wsname)
