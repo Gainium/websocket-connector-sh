@@ -75,6 +75,7 @@ class Connector {
   private isHyperliquid = exchanges.length
     ? exchanges.includes('hyperliquid')
     : true
+  private isKraken = exchanges.length ? exchanges.includes('kraken') : true
   constructor() {
     this.initWorker = this.initWorker.bind(this)
     if (isCandle || isAll) {
@@ -116,6 +117,7 @@ class Connector {
       const bitgetWorker = this.workers.get(ExchangeEnum.bitget)
       const coinbaseWorker = this.workers.get(ExchangeEnum.coinbase)
       const hyperliquidWorker = this.workers.get(ExchangeEnum.hyperliquid)
+      const krakenWorker = this.workers.get(ExchangeEnum.kraken)
       if (
         [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidLinear].includes(
           exchange,
@@ -199,6 +201,15 @@ class Connector {
           data: { symbol, interval, exchange },
         })
       }
+      if (
+        [ExchangeEnum.kraken, ExchangeEnum.krakenUsdm].includes(exchange) &&
+        krakenWorker
+      ) {
+        krakenWorker.postMessage({
+          do: 'subscribeCandle',
+          data: { symbol, interval, exchange },
+        })
+      }
     }
   }
 
@@ -266,6 +277,9 @@ class Connector {
     if (this.isHyperliquid) {
       this.initWorker(ExchangeEnum.hyperliquid)
     }
+    if (this.isKraken) {
+      this.initWorker(ExchangeEnum.kraken)
+    }
   }
 
   stop() {
@@ -278,6 +292,7 @@ class Connector {
     const coinbaseWorker = this.workers.get(ExchangeEnum.coinbase)
     const bitgetWorker = this.workers.get(ExchangeEnum.bitget)
     const hyperliquidWorker = this.workers.get(ExchangeEnum.hyperliquid)
+    const krakenWorker = this.workers.get(ExchangeEnum.kraken)
     bybitWorker?.on('exit', () => null)
     bybitWorker?.terminate()
     binanceWorker?.on('exit', () => null)
@@ -292,6 +307,8 @@ class Connector {
     bitgetWorker?.terminate()
     hyperliquidWorker?.on('exit', () => null)
     hyperliquidWorker?.terminate()
+    krakenWorker?.on('exit', () => null)
+    krakenWorker?.terminate()
   }
 }
 

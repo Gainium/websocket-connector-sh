@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.4.0] - 2026-03-04
+
+### Added
+- Kraken
+
 ## [1.3.4] - 2026-02-27
 
 ### Changed

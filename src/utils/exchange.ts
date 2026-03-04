@@ -17,6 +17,10 @@ import KucoinApi from '@gainium/kucoin-api'
 import { convertSymbol } from './kucoin'
 import Coinbase from 'coinbase-advanced-node'
 import { RestClientV2 as BitgetClient } from 'bitget-api'
+import {
+  SpotClient as KrakenSpotClient,
+  DerivativesClient as KrakenDerivativesClient,
+} from '@siebly/kraken-api'
 
 export type ExchangeInfo = {
   baseAsset: {
@@ -116,7 +120,12 @@ const getAllExchangeInfo = async (
   exchange: ExchangeEnum,
 ): Promise<string[]> => {
   const url = exchangeUrl()
-  if (url) {
+  if (
+    url &&
+    exchange !== ExchangeEnum.kraken &&
+    exchange !== ExchangeEnum.krakenUsdm &&
+    exchange !== ExchangeEnum.krakenCoinm
+  ) {
     const data = await axios
       .get<BaseReturn<(ExchangeInfo & { pair: string })[]>>(
         `${url}/exchange/all?exchange=${exchange}`,
@@ -292,7 +301,151 @@ const getAllExchangeInfo = async (
         .map((s) => convertSymbol(s.symbol))
     }
   }
+  if (
+    exchange === ExchangeEnum.kraken ||
+    exchange === ExchangeEnum.krakenUsdm ||
+    exchange === ExchangeEnum.krakenCoinm
+  ) {
+    const maps = await getKrakenSymbolMaps(exchange)
+    return [...maps.normalizedToWsname.keys()]
+  }
   return []
+}
+
+export type KrakenSymbolMap = {
+  wsnameToNormalized: Map<string, string>
+  normalizedToWsname: Map<string, string>
+  assetNameMap: Map<string, string>
+}
+const krakenMaps: {
+  spot?: KrakenSymbolMap
+  usdm?: KrakenSymbolMap
+  coinm?: KrakenSymbolMap
+} = {}
+
+export const resetKrakenMaps = () => {
+  krakenMaps.spot = undefined
+  krakenMaps.usdm = undefined
+  krakenMaps.coinm = undefined
+}
+
+export const getKrakenSymbolMaps = async (
+  exchange:
+    | ExchangeEnum.kraken
+    | ExchangeEnum.krakenUsdm
+    | ExchangeEnum.krakenCoinm,
+): Promise<KrakenSymbolMap> => {
+  if (exchange === ExchangeEnum.kraken && krakenMaps.spot) {
+    return krakenMaps.spot
+  }
+  if (exchange === ExchangeEnum.krakenUsdm && krakenMaps.usdm) {
+    return krakenMaps.usdm
+  }
+  if (exchange === ExchangeEnum.krakenCoinm && krakenMaps.coinm) {
+    return krakenMaps.coinm
+  }
+  const maps: KrakenSymbolMap = {
+    wsnameToNormalized: new Map(),
+    normalizedToWsname: new Map(),
+    assetNameMap: new Map(),
+  }
+  const krakenClient = new KrakenSpotClient({})
+  const realAssets = await krakenClient.getAssetInfo()
+  ;(realAssets.result ? Object.entries(realAssets.result) : []).forEach(
+    ([name, info]) => {
+      maps.assetNameMap.set(name, info.altname)
+      if (info.altname === 'XBT') {
+        maps.assetNameMap.set(name, 'BTC')
+        maps.assetNameMap.set('XBT', 'BTC')
+      }
+      if (info.altname === 'XDG') {
+        maps.assetNameMap.set(name, 'DOGE')
+        maps.assetNameMap.set('XDG', 'DOGE')
+      }
+    },
+  )
+  maps.assetNameMap.set('XBT', 'BTC')
+  maps.assetNameMap.set('XDG', 'DOGE')
+  if (exchange === ExchangeEnum.kraken) {
+    try {
+      const result = await krakenClient.getAssetPairs()
+      if (result.result) {
+        Object.entries(result.result).forEach(([_symbol, pair]) => {
+          const base = pair.base
+          const quote = pair.quote
+          let normalizedBase = realAssets.result[base]?.altname || base
+          let normalizedQuote = realAssets.result[quote]?.altname || quote
+          if (normalizedBase === 'XBT') {
+            normalizedBase = 'BTC'
+          }
+          if (normalizedQuote === 'XBT') {
+            normalizedQuote = 'BTC'
+          }
+          if (normalizedQuote === 'XDG') {
+            normalizedQuote = 'DOGE'
+          }
+          if (normalizedBase === 'XDG') {
+            normalizedBase = 'DOGE'
+          }
+          const pairName = `${normalizedBase}-${normalizedQuote}` // e.g. BTC/USD
+
+          const wsname = (pair.wsname || pairName)
+            ?.replace('/XBT', '/BTC')
+            .replace(new RegExp('^XBT\/'), 'BTC/')
+            .replace('/XDG', '/DOGE')
+            .replace(new RegExp('^XDG\/'), 'DOGE/')
+          const normalized = pairName
+          maps.wsnameToNormalized.set(wsname, normalized)
+          maps.normalizedToWsname.set(normalized, wsname)
+        })
+      }
+    } catch (e) {
+      logger.error('Failed to get kraken spot symbol maps', e)
+    }
+  } else if (
+    exchange === ExchangeEnum.krakenUsdm ||
+    exchange === ExchangeEnum.krakenCoinm
+  ) {
+    const isDemo = process.env.KRAKEN_ENV === 'demo'
+    const krakenClient = new KrakenDerivativesClient(
+      isDemo ? { testnet: true } : {},
+    )
+    try {
+      const result = await krakenClient.getInstruments()
+      if (result.result === 'success' && result.instruments) {
+        // Filter by symbol prefix: PF_ for usdm, PI_ for coinm
+        const symbolPrefix = exchange === ExchangeEnum.krakenUsdm ? 'PF' : 'PI'
+        result.instruments
+          .filter(
+            (instrument) =>
+              instrument.tradeable &&
+              instrument.symbol.startsWith(symbolPrefix),
+          )
+          .forEach((instrument) => {
+            const wsname = instrument.symbol // e.g. BTC-USD
+            const normalized = `${instrument.base}-${instrument.quote}` // Futures symbols don't have /
+            if (wsname) {
+              maps.wsnameToNormalized.set(wsname, normalized)
+              maps.normalizedToWsname.set(normalized, wsname)
+            }
+          })
+      }
+    } catch (e) {
+      logger.error(
+        `Failed to get kraken ${exchange === ExchangeEnum.krakenUsdm ? 'usdm' : 'coinm'} symbol maps`,
+        e,
+      )
+    }
+  }
+
+  if (exchange === ExchangeEnum.kraken) {
+    krakenMaps.spot = maps
+  } else if (exchange === ExchangeEnum.krakenUsdm) {
+    krakenMaps.usdm = maps
+  } else if (exchange === ExchangeEnum.krakenCoinm) {
+    krakenMaps.coinm = maps
+  }
+  return maps
 }
 
 export type KucoinSymbol = { symbol: string; asset: string }

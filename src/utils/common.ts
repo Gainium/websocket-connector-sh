@@ -41,6 +41,12 @@ export enum ExchangeEnum {
   hyperliquidLinear = 'hyperliquidLinear',
   paperHyperliquid = 'paperHyperliquid',
   paperHyperliquidLinear = 'paperHyperliquidLinear',
+  kraken = 'kraken',
+  krakenUsdm = 'krakenUsdm',
+  paperKraken = 'paperKraken',
+  paperKrakenUsdm = 'paperKrakenUsdm',
+  krakenCoinm = 'krakenCoinm',
+  paperKrakenCoinm = 'paperKrakenCoinm',
 }
 
 export const mapPaperToReal = (exchange: ExchangeEnum, warn = true) => {
@@ -85,6 +91,12 @@ export const mapPaperToReal = (exchange: ExchangeEnum, warn = true) => {
       return ExchangeEnum.hyperliquid
     case ExchangeEnum.paperHyperliquidLinear:
       return ExchangeEnum.hyperliquidLinear
+    case ExchangeEnum.paperKraken:
+      return ExchangeEnum.kraken
+    case ExchangeEnum.paperKrakenUsdm:
+      return ExchangeEnum.krakenUsdm
+    case ExchangeEnum.paperKrakenCoinm:
+      return ExchangeEnum.krakenCoinm
     default:
       if (warn) {
         console.warn(new Date(), ` | ${exchange} is not found as paper`)
