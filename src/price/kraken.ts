@@ -27,15 +27,25 @@ type KrakenClient = {
 
 class KrakenConnector extends CommonConnector {
   private krakenSpotClients: KrakenClient = []
-  private krakenFuturesClients: KrakenClient = []
+  private krakenUsdmClients: KrakenClient = []
+  private krakenCoinmClients: KrakenClient = []
   private krakenCandleClient: KrakenWsClient | null = null
+  private krakenUsdmCandleClient: KrakenWsClient | null = null
+  private krakenCoinmCandleClient: KrakenWsClient | null = null
   private spotSymbolMaps: KrakenSymbolMap = {
     wsnameToNormalized: new Map(),
     normalizedToWsname: new Map(),
+    assetNameMap: new Map(),
   }
-  private futuresSymbolMaps: KrakenSymbolMap = {
+  private usdmSymbolMaps: KrakenSymbolMap = {
     wsnameToNormalized: new Map(),
     normalizedToWsname: new Map(),
+    assetNameMap: new Map(),
+  }
+  private coinmSymbolMaps: KrakenSymbolMap = {
+    wsnameToNormalized: new Map(),
+    normalizedToWsname: new Map(),
+    assetNameMap: new Map(),
   }
 
   constructor(
@@ -45,6 +55,7 @@ class KrakenConnector extends CommonConnector {
     this.mainData = {
       [ExchangeEnum.kraken]: this.base,
       [ExchangeEnum.krakenUsdm]: this.base,
+      [ExchangeEnum.krakenCoinm]: this.base,
     }
     logger.info(`Kraken Worker | >🚀 Price <-> Backend stream`)
   }
@@ -104,7 +115,9 @@ class KrakenConnector extends CommonConnector {
     const symbolMaps =
       exchange === ExchangeEnum.kraken
         ? this.spotSymbolMaps
-        : this.futuresSymbolMaps
+        : exchange === ExchangeEnum.krakenUsdm
+          ? this.usdmSymbolMaps
+          : this.coinmSymbolMaps
 
     return tickers.map((ticker: any) => {
       const wsname = ticker.symbol || ticker.product_id || ''
@@ -139,18 +152,57 @@ class KrakenConnector extends CommonConnector {
         if (tickers.length) {
           this.cbWs(tickers, exchange)
         }
+      } else if (msg.feed === 'ticker') {
+        if (
+          !(msg?.product_id ?? '').startsWith('PI') &&
+          !(msg?.product_id ?? '').startsWith('PF')
+        ) {
+          return
+        }
+        const symbolMaps =
+          exchange === ExchangeEnum.kraken
+            ? this.spotSymbolMaps
+            : exchange === ExchangeEnum.krakenUsdm
+              ? this.usdmSymbolMaps
+              : this.coinmSymbolMaps
+        this.cbWs(
+          [
+            {
+              eventType: '24hrTicker',
+              eventTime: msg.time ? +new Date(msg.time) : Date.now(),
+              symbol:
+                symbolMaps.wsnameToNormalized.get(msg.product_id) ||
+                msg.product_id ||
+                '',
+              curDayClose: msg.last,
+              bestBid: msg.bid,
+              bestBidQnt: msg.bid_size,
+              bestAsk: msg.ask,
+              bestAskQnt: msg.ask_size,
+              open: msg.last,
+              high: msg.high,
+              low: msg.low,
+              volume: msg.volume,
+              volumeQuote: msg.volumeQuote,
+            },
+          ],
+          exchange,
+        )
       }
     }
   }
 
   private krakenCandleCb(exchange: ExchangeEnum) {
     return (msg: any) => {
-      if (msg.channel === 'ohlc' && msg.data) {
-        const symbolMaps =
-          exchange === ExchangeEnum.kraken
-            ? this.spotSymbolMaps
-            : this.futuresSymbolMaps
+      const symbolMaps =
+        exchange === ExchangeEnum.kraken
+          ? this.spotSymbolMaps
+          : exchange === ExchangeEnum.krakenUsdm
+            ? this.usdmSymbolMaps
+            : this.coinmSymbolMaps
 
+      // Spot OHLC format: { channel: 'ohlc', data: [...] }
+      if (msg.channel === 'ohlc' && msg.data) {
         for (const candle of msg.data) {
           const wsname = candle.symbol
           // Convert wsname to normalized symbol
@@ -175,6 +227,35 @@ class KrakenConnector extends CommonConnector {
           )
         }
       }
+      // Futures candles_trade format: { feed: 'candles_trade_1m', candle: {...} }
+      else if (msg.feed?.startsWith('candles_trade_') && msg.candle) {
+        const { time, open, high, low, close, volume } = msg.candle
+        const product_id = msg.product_id || ''
+        // Convert product_id to normalized symbol
+        const symbol =
+          symbolMaps.wsnameToNormalized.get(product_id) || product_id
+
+        // Extract interval from feed name (e.g., 'candles_trade_1m' -> '1m')
+        const interval = msg.feed.replace('candles_trade_', '')
+
+        this.cbWsTrade(
+          {
+            e: 'kline',
+            E: Date.now(),
+            s: symbol,
+            k: {
+              o: open || '0',
+              h: high || '0',
+              l: low || '0',
+              c: close || '0',
+              v: volume || '0',
+              i: interval,
+              t: time ? +new Date(time) : Date.now(),
+            },
+          },
+          exchange,
+        )
+      }
     }
   }
 
@@ -197,42 +278,96 @@ class KrakenConnector extends CommonConnector {
     }
     if (process) {
       if ([ExchangeEnum.kraken, ExchangeEnum.paperKraken].includes(exchange)) {
-        this.connectKrakenCandleStream(symbol, interval, false)
-      }
-      if (
+        // Spot: use OHLC WebSocket channel
+        this.connectKrakenCandleStream(symbol, interval)
+      } else if (
         [ExchangeEnum.krakenUsdm, ExchangeEnum.paperKrakenUsdm].includes(
           exchange,
         )
       ) {
-        this.connectKrakenCandleStream(symbol, interval, true)
+        // USDM Futures: use candles_trade WebSocket channel
+        this.connectKrakenFuturesCandleStream(
+          symbol,
+          interval,
+          ExchangeEnum.krakenUsdm,
+        )
+      } else if (
+        [ExchangeEnum.krakenCoinm, ExchangeEnum.paperKrakenCoinm].includes(
+          exchange,
+        )
+      ) {
+        // COINM Futures: use candles_trade WebSocket channel
+        this.connectKrakenFuturesCandleStream(
+          symbol,
+          interval,
+          ExchangeEnum.krakenCoinm,
+        )
       }
     }
   }
 
-  private connectKrakenCandleStream(
-    symbol: string,
-    interval: string,
-    isFutures: boolean,
-  ) {
+  private connectKrakenCandleStream(symbol: string, interval: string) {
     if (!this.krakenCandleClient) {
-      this.krakenCandleClient = this.getKrakenClient('candle', isFutures)
+      this.krakenCandleClient = this.getKrakenClient('candle', false)
       this.krakenCandleClient.on(
         'message',
-        this.krakenCandleCb(
-          isFutures ? ExchangeEnum.krakenUsdm : ExchangeEnum.kraken,
-        ),
+        this.krakenCandleCb(ExchangeEnum.kraken),
       )
     }
 
     // Convert normalized symbol to wsname format for subscription
-    const symbolMaps = isFutures ? this.futuresSymbolMaps : this.spotSymbolMaps
-    const wsnameSymbol = symbolMaps.normalizedToWsname.get(symbol) || symbol
+    const wsnameSymbol =
+      this.spotSymbolMaps.normalizedToWsname.get(symbol) || symbol
 
-    // Subscribe to ohlc for the symbol
-    const wsKey = isFutures ? 'derivativesPublicV1' : 'spotPublicV2'
+    // Subscribe to ohlc for the symbol (spot only)
     this.krakenCandleClient.subscribe(
       [{ topic: 'ohlc', payload: { symbol: wsnameSymbol, interval } }],
-      wsKey,
+      'spotPublicV2',
+    )
+  }
+
+  private connectKrakenFuturesCandleStream(
+    symbol: string,
+    interval: string,
+    exchange: ExchangeEnum.krakenUsdm | ExchangeEnum.krakenCoinm,
+  ) {
+    const isUsdm = exchange === ExchangeEnum.krakenUsdm
+    const symbolMaps = isUsdm ? this.usdmSymbolMaps : this.coinmSymbolMaps
+    const client = isUsdm
+      ? this.krakenUsdmCandleClient
+      : this.krakenCoinmCandleClient
+
+    if (!client) {
+      const newClient = this.getKrakenClient('candle', true)
+      newClient.on('message', this.krakenCandleCb(exchange))
+
+      if (isUsdm) {
+        this.krakenUsdmCandleClient = newClient
+      } else {
+        this.krakenCoinmCandleClient = newClient
+      }
+    }
+
+    // Convert normalized symbol to wsname format (e.g., BTCUSD -> PF_XBTUSD)
+    const wsnameSymbol = symbolMaps.normalizedToWsname.get(symbol) || symbol
+
+    // Subscribe to candles_trade feed
+    const feed = `candles_trade_${interval}`
+    const targetClient = isUsdm
+      ? this.krakenUsdmCandleClient!
+      : this.krakenCoinmCandleClient!
+
+    targetClient.subscribe(
+      [
+        {
+          // @ts-expect-error undocumented feed
+          topic: feed,
+          payload: {
+            product_ids: [wsnameSymbol],
+          },
+        },
+      ],
+      'derivativesPublicV1',
     )
   }
 
@@ -242,16 +377,16 @@ class KrakenConnector extends CommonConnector {
       // Load symbol maps before initializing websocket connections
       logger.info('Kraken Worker | Loading symbol maps...')
       this.spotSymbolMaps = await getKrakenSymbolMaps(ExchangeEnum.kraken)
-      this.futuresSymbolMaps = await getKrakenSymbolMaps(
-        ExchangeEnum.krakenUsdm,
-      )
+      this.usdmSymbolMaps = await getKrakenSymbolMaps(ExchangeEnum.krakenUsdm)
+      this.coinmSymbolMaps = await getKrakenSymbolMaps(ExchangeEnum.krakenCoinm)
       logger.info(
-        `Kraken Worker | Symbol maps loaded: ${this.spotSymbolMaps.wsnameToNormalized.size} spot, ${this.futuresSymbolMaps.wsnameToNormalized.size} futures`,
+        `Kraken Worker | Symbol maps loaded: ${this.spotSymbolMaps.wsnameToNormalized.size} spot, ${this.usdmSymbolMaps.wsnameToNormalized.size} usdm, ${this.coinmSymbolMaps.wsnameToNormalized.size} coinm`,
       )
 
       if (!this.isCandle || this.isAll) {
         await this.initKrakenSpotWS()
-        await this.initKrakenFuturesWS()
+        await this.initKrakenUsdmWS()
+        await this.initKrakenCoinmWS()
       }
       if (this.isCandle || this.isAll) {
         // Initialize candle streams for already subscribed symbols
@@ -261,17 +396,33 @@ class KrakenConnector extends CommonConnector {
           ) {
             for (const data of symbols) {
               const [symbol, interval] = this.splitCandleRoomName(data)
-              this.connectKrakenCandleStream(symbol, interval, false)
+              this.connectKrakenCandleStream(symbol, interval)
             }
-          }
-          if (
+          } else if (
             [ExchangeEnum.krakenUsdm, ExchangeEnum.paperKrakenUsdm].includes(
               exchange,
             )
           ) {
             for (const data of symbols) {
               const [symbol, interval] = this.splitCandleRoomName(data)
-              this.connectKrakenCandleStream(symbol, interval, true)
+              this.connectKrakenFuturesCandleStream(
+                symbol,
+                interval,
+                ExchangeEnum.krakenUsdm,
+              )
+            }
+          } else if (
+            [ExchangeEnum.krakenCoinm, ExchangeEnum.paperKrakenCoinm].includes(
+              exchange,
+            )
+          ) {
+            for (const data of symbols) {
+              const [symbol, interval] = this.splitCandleRoomName(data)
+              this.connectKrakenFuturesCandleStream(
+                symbol,
+                interval,
+                ExchangeEnum.krakenCoinm,
+              )
             }
           }
         }
@@ -289,7 +440,6 @@ class KrakenConnector extends CommonConnector {
       logger.warn('No Kraken spot symbols found, skipping subscription')
       return
     }
-
     // Convert normalized symbols to wsname format for subscription
     const wsnameSymbols = symbols
       .map(
@@ -355,19 +505,19 @@ class KrakenConnector extends CommonConnector {
     )
   }
 
-  private async initKrakenFuturesWS() {
+  private async initKrakenUsdmWS() {
     const symbols = await getAllExchangeInfo(ExchangeEnum.krakenUsdm)
 
     if (!symbols.length) {
-      logger.warn('No Kraken futures symbols found, skipping subscription')
+      logger.warn('No Kraken USDM symbols found, skipping subscription')
       return
     }
 
-    // Convert normalized symbols to wsname format for subscription (futures typically don't need conversion, but keeping consistent)
+    // Convert normalized symbols to wsname format for subscription
     const wsnameSymbols = symbols
       .map(
         (symbol) =>
-          this.futuresSymbolMaps.normalizedToWsname.get(symbol) || symbol,
+          this.usdmSymbolMaps.normalizedToWsname.get(symbol) || symbol,
       )
       .filter(Boolean)
 
@@ -384,7 +534,7 @@ class KrakenConnector extends CommonConnector {
     let i = 0
     for (const chunk of chunks) {
       // Find existing client with available capacity
-      const existingClient = this.krakenFuturesClients
+      const existingClient = this.krakenUsdmClients
         .filter((c) => c.subs < maxSubsPerClient)
         .sort((a, b) => b.subs - a.subs)[0]
 
@@ -394,7 +544,7 @@ class KrakenConnector extends CommonConnector {
           'derivativesPublicV1',
         )
         existingClient.subs += chunk.length
-        this.krakenFuturesClients = this.krakenFuturesClients.map((c) =>
+        this.krakenUsdmClients = this.krakenUsdmClients.map((c) =>
           c.id === existingClient.id ? { ...existingClient } : c,
         )
       } else {
@@ -408,8 +558,8 @@ class KrakenConnector extends CommonConnector {
         )
 
         const lastId =
-          this.krakenFuturesClients.sort((a, b) => b.id - a.id)[0]?.id ?? 0
-        this.krakenFuturesClients.push({
+          this.krakenUsdmClients.sort((a, b) => b.id - a.id)[0]?.id ?? 0
+        this.krakenUsdmClients.push({
           client: newClient,
           subs: chunk.length,
           id: lastId + 1,
@@ -418,13 +568,86 @@ class KrakenConnector extends CommonConnector {
 
       i++
       logger.info(
-        `Subscribed to chunk ${i} of ${chunks.length} Kraken futures markets`,
+        `Subscribed to chunk ${i} of ${chunks.length} Kraken USDM markets`,
       )
       await sleep(500)
     }
 
     logger.info(
-      `Subscribed to ${symbols.length} Kraken futures markets across ${this.krakenFuturesClients.length} connections`,
+      `Subscribed to ${symbols.length} Kraken USDM markets across ${this.krakenUsdmClients.length} connections`,
+    )
+  }
+
+  private async initKrakenCoinmWS() {
+    const symbols = await getAllExchangeInfo(ExchangeEnum.krakenCoinm)
+
+    if (!symbols.length) {
+      logger.warn('No Kraken COINM symbols found, skipping subscription')
+      return
+    }
+
+    // Convert normalized symbols to wsname format for subscription
+    const wsnameSymbols = symbols
+      .map(
+        (symbol) =>
+          this.coinmSymbolMaps.normalizedToWsname.get(symbol) || symbol,
+      )
+      .filter(Boolean)
+
+    // Split symbols into chunks
+    const chunks = wsnameSymbols.reduce((acc, symbol, index) => {
+      const chunkIndex = Math.floor(index / chunkSize)
+      if (!acc[chunkIndex]) {
+        acc[chunkIndex] = []
+      }
+      acc[chunkIndex].push(symbol)
+      return acc
+    }, [] as string[][])
+
+    let i = 0
+    for (const chunk of chunks) {
+      // Find existing client with available capacity
+      const existingClient = this.krakenCoinmClients
+        .filter((c) => c.subs < maxSubsPerClient)
+        .sort((a, b) => b.subs - a.subs)[0]
+
+      if (existingClient) {
+        existingClient.client.subscribe(
+          [{ topic: 'ticker', payload: { product_ids: chunk } }],
+          'derivativesPublicV1',
+        )
+        existingClient.subs += chunk.length
+        this.krakenCoinmClients = this.krakenCoinmClients.map((c) =>
+          c.id === existingClient.id ? { ...existingClient } : c,
+        )
+      } else {
+        // Create new client
+        const newClient = this.getKrakenClient('ticker', true)
+        newClient.on('message', this.krakenTickerCb(ExchangeEnum.krakenCoinm))
+
+        newClient.subscribe(
+          [{ topic: 'ticker', payload: { product_ids: chunk } }],
+          'derivativesPublicV1',
+        )
+
+        const lastId =
+          this.krakenCoinmClients.sort((a, b) => b.id - a.id)[0]?.id ?? 0
+        this.krakenCoinmClients.push({
+          client: newClient,
+          subs: chunk.length,
+          id: lastId + 1,
+        })
+      }
+
+      i++
+      logger.info(
+        `Subscribed to chunk ${i} of ${chunks.length} Kraken COINM markets`,
+      )
+      await sleep(500)
+    }
+
+    logger.info(
+      `Subscribed to ${symbols.length} Kraken COINM markets across ${this.krakenCoinmClients.length} connections`,
     )
   }
 
@@ -434,13 +657,25 @@ class KrakenConnector extends CommonConnector {
       k.client.closeAll(true)
       k.client.removeAllListeners()
     })
-    this.krakenFuturesClients.forEach((k) => {
+    this.krakenUsdmClients.forEach((k) => {
+      k.client.closeAll(true)
+      k.client.removeAllListeners()
+    })
+    this.krakenCoinmClients.forEach((k) => {
       k.client.closeAll(true)
       k.client.removeAllListeners()
     })
     if (this.krakenCandleClient) {
       this.krakenCandleClient.closeAll(true)
       this.krakenCandleClient.removeAllListeners()
+    }
+    if (this.krakenUsdmCandleClient) {
+      this.krakenUsdmCandleClient.closeAll(true)
+      this.krakenUsdmCandleClient.removeAllListeners()
+    }
+    if (this.krakenCoinmCandleClient) {
+      this.krakenCoinmCandleClient.closeAll(true)
+      this.krakenCoinmCandleClient.removeAllListeners()
     }
   }
 }
