@@ -59,7 +59,6 @@ export type PaperExchangeType =
   | ExchangeEnum.paperHyperliquidLinear
   | ExchangeEnum.paperKraken
   | ExchangeEnum.paperKrakenUsdm
-  | ExchangeEnum.paperKrakenCoinm
 
 export const paperExchanges = [
   ExchangeEnum.paperFtx,
@@ -84,7 +83,6 @@ export const paperExchanges = [
   ExchangeEnum.paperHyperliquidLinear,
   ExchangeEnum.paperKraken,
   ExchangeEnum.paperKrakenUsdm,
-  ExchangeEnum.paperKrakenCoinm,
 ]
 
 export enum BybitHost {
@@ -494,9 +492,8 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
 )
 
 class UserConnector {
-  private krakenLastUpdate: { spot: number; coinm: number; usdm: number } = {
+  private krakenLastUpdate: { spot: number; usdm: number } = {
     spot: 0,
-    coinm: 0,
     usdm: 0,
   }
   private redisSet = RedisClient.getInstance()
@@ -1916,19 +1913,12 @@ class UserConnector {
         }
       }
       if (
-        [
-          ExchangeEnum.kraken,
-          ExchangeEnum.krakenUsdm,
-          ExchangeEnum.krakenCoinm,
-        ].includes(api.provider)
+        [ExchangeEnum.kraken, ExchangeEnum.krakenUsdm].includes(api.provider)
       ) {
         /** Open stream and set callback  */
         try {
           const isDemo = process.env.KRAKEN_ENV === 'demo'
-          const isFutures =
-            api.provider === ExchangeEnum.krakenUsdm ||
-            api.provider === ExchangeEnum.krakenCoinm
-
+          const isFutures = api.provider === ExchangeEnum.krakenUsdm
           /** New exchange instance */
           const client = new KrakenWsClient(
             {
@@ -1979,10 +1969,7 @@ class UserConnector {
               const orders = await this.prepareKrakenOrderMsg(
                 msg,
                 ref,
-                api.provider as
-                  | ExchangeEnum.kraken
-                  | ExchangeEnum.krakenUsdm
-                  | ExchangeEnum.krakenCoinm,
+                api.provider as ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
               )
               orders.forEach((order) => this.userStreamEvent(id, order))
             }
@@ -1993,10 +1980,7 @@ class UserConnector {
                 msg,
                 Date.now(),
                 id,
-                api.provider as
-                  | ExchangeEnum.kraken
-                  | ExchangeEnum.krakenUsdm
-                  | ExchangeEnum.krakenCoinm,
+                api.provider as ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
               )
               if (balance) {
                 // Filter out updates where only values changed (due to price movements)
@@ -2775,25 +2759,19 @@ class UserConnector {
   }
 
   private async getKrakenMaps(
-    exchange:
-      | ExchangeEnum.kraken
-      | ExchangeEnum.krakenUsdm
-      | ExchangeEnum.krakenCoinm,
+    exchange: ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
   ) {
     const ref =
       exchange === ExchangeEnum.kraken
         ? this.krakenLastUpdate.spot
-        : exchange === ExchangeEnum.krakenUsdm
-          ? this.krakenLastUpdate.usdm
-          : this.krakenLastUpdate.coinm
+        : this.krakenLastUpdate.usdm
+
     if (Date.now() - ref > 15 * 60 * 1000) {
       resetKrakenMaps()
       if (exchange === ExchangeEnum.kraken) {
         this.krakenLastUpdate.spot = Date.now()
       } else if (exchange === ExchangeEnum.krakenUsdm) {
         this.krakenLastUpdate.usdm = Date.now()
-      } else {
-        this.krakenLastUpdate.coinm = Date.now()
       }
     }
     return await getKrakenSymbolMaps(exchange)
@@ -2802,10 +2780,7 @@ class UserConnector {
   private async prepareKrakenOrderMsg(
     msg: any,
     channel: string,
-    exchange:
-      | ExchangeEnum.kraken
-      | ExchangeEnum.krakenUsdm
-      | ExchangeEnum.krakenCoinm,
+    exchange: ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
   ): Promise<ExecutionReport[]> {
     if (!msg) {
       return []
@@ -2974,10 +2949,7 @@ class UserConnector {
     data: any,
     time: number,
     userId: string,
-    exchange:
-      | ExchangeEnum.kraken
-      | ExchangeEnum.krakenUsdm
-      | ExchangeEnum.krakenCoinm,
+    exchange: ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
   ): Promise<OutboundAccountPosition | undefined> {
     if (!data) {
       return undefined

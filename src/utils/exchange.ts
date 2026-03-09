@@ -123,8 +123,7 @@ const getAllExchangeInfo = async (
   if (
     url &&
     exchange !== ExchangeEnum.kraken &&
-    exchange !== ExchangeEnum.krakenUsdm &&
-    exchange !== ExchangeEnum.krakenCoinm
+    exchange !== ExchangeEnum.krakenUsdm
   ) {
     const data = await axios
       .get<BaseReturn<(ExchangeInfo & { pair: string })[]>>(
@@ -303,8 +302,7 @@ const getAllExchangeInfo = async (
   }
   if (
     exchange === ExchangeEnum.kraken ||
-    exchange === ExchangeEnum.krakenUsdm ||
-    exchange === ExchangeEnum.krakenCoinm
+    exchange === ExchangeEnum.krakenUsdm
   ) {
     const maps = await getKrakenSymbolMaps(exchange)
     return [...maps.normalizedToWsname.keys()]
@@ -330,19 +328,13 @@ export const resetKrakenMaps = () => {
 }
 
 export const getKrakenSymbolMaps = async (
-  exchange:
-    | ExchangeEnum.kraken
-    | ExchangeEnum.krakenUsdm
-    | ExchangeEnum.krakenCoinm,
+  exchange: ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
 ): Promise<KrakenSymbolMap> => {
   if (exchange === ExchangeEnum.kraken && krakenMaps.spot) {
     return krakenMaps.spot
   }
   if (exchange === ExchangeEnum.krakenUsdm && krakenMaps.usdm) {
     return krakenMaps.usdm
-  }
-  if (exchange === ExchangeEnum.krakenCoinm && krakenMaps.coinm) {
-    return krakenMaps.coinm
   }
   const maps: KrakenSymbolMap = {
     wsnameToNormalized: new Map(),
@@ -402,10 +394,7 @@ export const getKrakenSymbolMaps = async (
     } catch (e) {
       logger.error('Failed to get kraken spot symbol maps', e)
     }
-  } else if (
-    exchange === ExchangeEnum.krakenUsdm ||
-    exchange === ExchangeEnum.krakenCoinm
-  ) {
+  } else if (exchange === ExchangeEnum.krakenUsdm) {
     const isDemo = process.env.KRAKEN_ENV === 'demo'
     const krakenClient = new KrakenDerivativesClient(
       isDemo ? { testnet: true } : {},
@@ -442,8 +431,6 @@ export const getKrakenSymbolMaps = async (
     krakenMaps.spot = maps
   } else if (exchange === ExchangeEnum.krakenUsdm) {
     krakenMaps.usdm = maps
-  } else if (exchange === ExchangeEnum.krakenCoinm) {
-    krakenMaps.coinm = maps
   }
   return maps
 }

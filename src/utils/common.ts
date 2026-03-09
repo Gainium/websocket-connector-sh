@@ -45,8 +45,6 @@ export enum ExchangeEnum {
   krakenUsdm = 'krakenUsdm',
   paperKraken = 'paperKraken',
   paperKrakenUsdm = 'paperKrakenUsdm',
-  krakenCoinm = 'krakenCoinm',
-  paperKrakenCoinm = 'paperKrakenCoinm',
 }
 
 export const mapPaperToReal = (exchange: ExchangeEnum, warn = true) => {
@@ -95,8 +93,6 @@ export const mapPaperToReal = (exchange: ExchangeEnum, warn = true) => {
       return ExchangeEnum.kraken
     case ExchangeEnum.paperKrakenUsdm:
       return ExchangeEnum.krakenUsdm
-    case ExchangeEnum.paperKrakenCoinm:
-      return ExchangeEnum.krakenCoinm
     default:
       if (warn) {
         console.warn(new Date(), ` | ${exchange} is not found as paper`)
