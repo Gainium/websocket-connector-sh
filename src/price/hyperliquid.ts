@@ -18,7 +18,7 @@ class HyperliquidConnector extends CommonConnector {
     string,
     {
       coin: string
-      inteval: hl.WsCandleParameters['interval']
+      interval: hl.WsCandleParameters['interval']
     }
   > = new Map()
   private hyperliquidClient: hl.SubscriptionClient =
@@ -227,10 +227,6 @@ class HyperliquidConnector extends CommonConnector {
     _data: { symbol: string; interval: hl.WsCandleParameters['interval'] }[],
     timer = false,
   ) {
-    if (this.timer) {
-      clearTimeout(this.timer)
-      this.timer = null
-    }
     const data = _data.map(({ symbol, interval }) => {
       const topic = `${interval}@${symbol}`
       const e = ExchangeEnum.hyperliquid
@@ -243,19 +239,25 @@ class HyperliquidConnector extends CommonConnector {
       data.forEach((d) => {
         this.inQueueCandles.set(`${d.coin}-${d.interval}`, {
           coin: d.coin,
-          inteval: d.interval,
+          interval: d.interval,
         })
       })
-      const t = setTimeout(() => {
-        this.connectHyperliquidCandleStreams([], true)
-      }, 5000)
-      this.timer = t
+      // First-win debounce: set the timer once on the first queued item.
+      // Do NOT reset the timer on each new arrival — that would delay subscription
+      // indefinitely when indicators trickle in continuously.
+      if (!this.timer) {
+        const t = setTimeout(() => {
+          this.timer = null
+          this.connectHyperliquidCandleStreams([], true)
+        }, 5000)
+        this.timer = t
+      }
       return
     }
     const subscribeChannels = [...(this.inQueueCandles?.values() ?? [])].map(
       (d) => ({
         coin: d.coin,
-        interval: d.inteval,
+        interval: d.interval,
       }),
     )
     const keys = [...(this.inQueueCandles?.keys() ?? [])]
@@ -276,36 +278,53 @@ class HyperliquidConnector extends CommonConnector {
         interval: hl.WsCandleParameters['interval']
       }[][],
     )
+    const failedItems: {
+      coin: string
+      interval: hl.WsCandleParameters['interval']
+    }[] = []
     let i = 0
     for (const chunk of chunks) {
       i++
       const client = await this.getCandleClient(chunk.length)
       if (client) {
-        await Promise.all(
-          chunk.map(async (c) => {
-            await new Promise(async (res, rej) => {
-              const t = setTimeout(() => rej(new Error('Timeout')), 5 * 1000)
-              try {
-                const unsubscribe = await client.candle(
-                  { coin: c.coin, interval: c.interval },
-                  this.hyperliquidCandleCb,
+        // Send subscribe messages in small concurrent bursts with a pause
+        // between bursts. Larger bursts (20+) cause Hyperliquid to stop
+        // sending ACKs after a few minutes (rate-limiting).
+        const subBatchSize = 5
+        const subBatchDelayMs = 2000
+        for (let bi = 0; bi < chunk.length; bi += subBatchSize) {
+          const subBatch = chunk.slice(bi, bi + subBatchSize)
+          await Promise.all(
+            subBatch.map(async (c) => {
+              await new Promise<void>(async (res, rej) => {
+                const t = setTimeout(() => rej(new Error('Timeout')), 10 * 1000)
+                try {
+                  const unsubscribe = await client.candle(
+                    { coin: c.coin, interval: c.interval },
+                    this.hyperliquidCandleCb,
+                  )
+                  const get = this.unsubscribeMap.get('candle') ?? []
+                  get.push(unsubscribe)
+                  this.unsubscribeMap.set('candle', get)
+                  res()
+                } catch (e) {
+                  rej(e)
+                } finally {
+                  clearTimeout(t)
+                }
+              }).catch((e) => {
+                logger.error(
+                  `Error subscribing Hyperliquid candle ${c.coin} ${c.interval}: ${e}`,
                 )
-                const get = this.unsubscribeMap.get('candle') ?? []
-                get.push(unsubscribe)
-                this.unsubscribeMap.set('candle', get)
-                res([])
-              } catch (e) {
-                rej(e)
-              } finally {
-                clearTimeout(t)
-              }
-            }).catch((e) => {
-              logger.error(
-                `Error subscribing Hyperliquid candle ${c.coin} ${c.interval}: ${e}`,
-              )
-            })
-          }),
-        )
+                // Re-queue for retry — will be picked up after retryDelayMs
+                failedItems.push(c)
+              })
+            }),
+          )
+          if (bi + subBatchSize < chunk.length) {
+            await new Promise((r) => setTimeout(r, subBatchDelayMs))
+          }
+        }
         if (i < chunks.length) {
           const secondsToSleep = (chunk.length / 2000) * 60 * 1000
           logger.info(
@@ -314,6 +333,28 @@ class HyperliquidConnector extends CommonConnector {
           await new Promise((r) => setTimeout(r, secondsToSleep))
         }
       }
+    }
+
+    // Schedule a retry pass for any subscriptions that timed out or were
+    // rejected. After a 60-second cooldown the items are added back to
+    // inQueueCandles and the normal debounce cycle picks them up.
+    if (failedItems.length > 0) {
+      logger.info(
+        `Scheduling retry for ${failedItems.length} failed Hyperliquid candle subscriptions in 60s`,
+      )
+      const retryDelayMs = 60_000
+      setTimeout(() => {
+        for (const item of failedItems) {
+          this.inQueueCandles.set(`${item.coin}-${item.interval}`, item)
+        }
+        if (!this.timer) {
+          const t = setTimeout(() => {
+            this.timer = null
+            this.connectHyperliquidCandleStreams([], true)
+          }, 0)
+          this.timer = t
+        }
+      }, retryDelayMs)
     }
   }
 
