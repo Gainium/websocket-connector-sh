@@ -15,6 +15,7 @@
  *   HYPERLIQUIDENV=demo  -  uses testnet
  */
 
+import * as hl from '@nktkas/hyperliquid'
 import HyperliquidConnector from './price/hyperliquid'
 import { ExchangeEnum } from './utils/common'
 import { createClient } from 'redis'
@@ -22,6 +23,10 @@ import { createClient } from 'redis'
 const DURATION_S = Number(process.argv[2] ?? 60)
 // Default: 2 linear coins x 14 intervals = 28 subscriptions
 const MAX_SUBS = Number(process.argv[3] ?? 28)
+// Pass --reconnect as 4th arg to run the reconnect resilience test.
+// Fixed set of 28 subs (BTC+ETH × 14 intervals), waits for data, force-closes
+// the WS, then verifies data resumes after the connector re-subscribes.
+const RECONNECT_TEST = process.argv[4] === '--reconnect'
 
 const INTERVALS: string[] = [
   '1m',
@@ -68,6 +73,83 @@ async function fetchSymbols(): Promise<{ linear: string[]; spot: string[] }> {
   return {
     linear: meta.universe.map((a) => a.name),
     spot: spotMeta.universe.map((_, i) => `@${i}`),
+  }
+}
+
+// --- reconnect resilience test ----------------------------------------------
+// Subscribes to BTC+ETH x all intervals, waits for data, then force-closes
+// the WebSocket and checks that data resumes — proving our rate-limited
+// reconnect handler works instead of the library's burst autoResubscribe.
+async function runReconnectTest(
+  connector: HyperliquidConnector,
+  channelHits: Record<string, number>,
+  getMsgCount: () => number,
+) {
+  const SETTLE_S = 30 // seconds to wait for initial data before forcing close
+  const RESUME_S = 90 // seconds to wait post-reconnect for data to resume
+
+  // Subscribe the fixed small set (already done by main)
+  console.log(`\n[reconnect-test] Waiting ${SETTLE_S}s for initial data...`)
+  await new Promise((r) => setTimeout(r, SETTLE_S * 1000))
+
+  const msgsBefore = getMsgCount()
+  const channelsBefore = Object.keys(channelHits).length
+  console.log(
+    `[reconnect-test] Before disconnect: ${msgsBefore} msgs, ${channelsBefore} unique channels`,
+  )
+
+  if (msgsBefore === 0) {
+    console.error('[reconnect-test] FAIL — no data received before disconnect')
+    return
+  }
+
+  // Force-close the first candle WS transport (simulates network drop)
+  const clients = (
+    connector as unknown as {
+      hyperliquidClientCandle: {
+        id: number
+        items: Map<string, unknown>
+        client: hl.SubscriptionClient<hl.WebSocketTransport>
+      }[]
+    }
+  ).hyperliquidClientCandle
+
+  const target = clients[0]
+  console.log(
+    `[reconnect-test] Force-closing candle client 0 (${target.items.size} active subs)...`,
+  )
+  // Pass permanently=false so ReconnectingWebSocket reconnects after this close.
+  // This simulates a network drop (server-side close) rather than a graceful shutdown.
+  target.client.transport.socket.close(1000, '', false)
+
+  console.log(
+    `[reconnect-test] Waiting ${RESUME_S}s for reconnect + resubscribe + data...`,
+  )
+  const t0 = Date.now()
+  let resumed = false
+  while (Date.now() - t0 < RESUME_S * 1000) {
+    await new Promise((r) => setTimeout(r, 2000))
+    if (getMsgCount() > msgsBefore) {
+      resumed = true
+      break
+    }
+  }
+
+  const msgsAfter = getMsgCount()
+  const channelsAfter = Object.keys(channelHits).length
+  const elapsed = Math.round((Date.now() - t0) / 1000)
+
+  console.log(`\n${'-'.repeat(60)}`)
+  if (resumed) {
+    console.log(
+      `[reconnect-test] PASS — data resumed after ${elapsed}s | ` +
+        `msgs after reconnect: ${msgsAfter - msgsBefore} | ` +
+        `unique channels: ${channelsAfter}`,
+    )
+  } else {
+    console.error(
+      `[reconnect-test] FAIL — no data received in ${RESUME_S}s after disconnect`,
+    )
   }
 }
 
@@ -148,6 +230,13 @@ async function main() {
     `\nAll ${testSubs.length} subs enqueued - connector will send them over` +
       ` ~${batchSecs}s, listening for ${DURATION_S}s total.\n`,
   )
+
+  // -- Reconnect resilience test -------------------------------------------
+  if (RECONNECT_TEST) {
+    await runReconnectTest(connector, channelHits, () => totalMessages)
+    await redisSub.quit()
+    process.exit(0)
+  }
 
   // -- Wait for the full test duration ---------------------------------------
   await new Promise((r) => setTimeout(r, DURATION_S * 1000))

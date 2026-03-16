@@ -1,4 +1,5 @@
 import * as hl from '@nktkas/hyperliquid'
+import { setMaxListeners } from 'events'
 
 import { ExchangeEnum, mapPaperToReal } from '../utils/common'
 import logger from '../utils/logger'
@@ -24,13 +25,19 @@ class HyperliquidConnector extends CommonConnector {
   private hyperliquidClient: hl.SubscriptionClient =
     this.getHyperliquidClient('ticker')
   private hyperliquidClientCandle: {
-    client: hl.SubscriptionClient
+    client: hl.SubscriptionClient<hl.WebSocketTransport>
     id: number
     count: number
+    /** Candle subscriptions currently active on this connection. Used to re-queue on reconnect. */
+    items: Map<
+      string,
+      { coin: string; interval: hl.WsCandleParameters['interval'] }
+    >
   }[] = [
     {
       id: 0,
       count: 0,
+      items: new Map(),
       client: this.getHyperliquidClient('candle'),
     },
   ]
@@ -45,6 +52,8 @@ class HyperliquidConnector extends CommonConnector {
       [ExchangeEnum.hyperliquidLinear]: this.base,
     }
     logger.info(`Hyperliquid Worker | >🚀 Price <-> Backend stream`)
+    // Set up rate-limited reconnect for the initial candle client
+    this.setupCandleReconnectHooks(this.hyperliquidClientCandle[0])
   }
 
   private async hyperliquidTickerCb(msg: hl.WsAllMids) {
@@ -73,6 +82,79 @@ class HyperliquidConnector extends CommonConnector {
         ? ExchangeEnum.hyperliquid
         : ExchangeEnum.hyperliquidLinear,
     )
+  }
+
+  /**
+   * Sets up rate-limited re-subscription for a candle client on reconnect.
+   * The library's default autoResubscribe fires all subscriptions simultaneously
+   * which immediately triggers an "Inactive" close → infinite reconnect loop.
+   * Instead we disable it and replay items through our existing 5/2s batching.
+   */
+  private setupCandleReconnectHooks(
+    entry: (typeof this.hyperliquidClientCandle)[number],
+  ) {
+    const transport = entry.client.transport as hl.WebSocketTransport
+    transport.autoResubscribe = false
+    // Raise the EventTarget listener limit for the internal HyperliquidEventTarget.
+    // Every client.candle() call registers a listener on the same "candle" event;
+    // without this Node warns at >10 listeners per EventTarget.
+    const hlEvents = (transport as unknown as { _hlEvents: EventTarget })
+      ._hlEvents
+    if (hlEvents) setMaxListeners(maxCandlesPerConnection + 10, hlEvents)
+
+    // On close: clean up the transport's internal subscription/listener state so
+    // the next client.candle() call will actually send a new subscribe message.
+    // (With autoResubscribe=false the library keeps stale _subscriptions entries
+    // whose promises are already resolved — future candle() calls would no-op.)
+    const origOnclose = transport.socket.onclose
+    transport.socket.onclose = (event) => {
+      origOnclose?.call(transport.socket, event)
+      // Snapshot all unsubscribe callbacks then fire them synchronously.
+      // Since the socket is now closed, each unsub() only removes the EventTarget
+      // listener and deletes from _subscriptions — no network messages are sent.
+      const subs = (
+        transport as unknown as {
+          _subscriptions: Map<
+            string,
+            { listeners: Map<unknown, () => Promise<void>> }
+          >
+        }
+      )._subscriptions
+      const allUnsubs: (() => Promise<void>)[] = []
+      for (const sub of subs.values()) {
+        for (const unsub of sub.listeners.values()) {
+          allUnsubs.push(unsub)
+        }
+      }
+      allUnsubs.forEach((f) => f().catch(() => {}))
+      // _subscriptions is now empty — client.candle() will re-send on reconnect
+    }
+
+    // On open: if this is a reconnect (not initial connect) re-queue this
+    // client's items through the rate-limited batching debounce.
+    let connectedOnce = false
+    const origOnopen = transport.socket.onopen
+    transport.socket.onopen = (event) => {
+      origOnopen?.call(transport.socket, event)
+      if (connectedOnce) {
+        logger.info(
+          `Hyperliquid candle client ${entry.id} reconnected — requeueing ${entry.items.size} subscriptions`,
+        )
+        entry.count = 0
+        for (const [k, v] of entry.items) {
+          this.inQueueCandles.set(k, v)
+        }
+        entry.items.clear()
+        if (!this.timer) {
+          const t = setTimeout(() => {
+            this.timer = null
+            this.connectHyperliquidCandleStreams([], true)
+          }, 5000)
+          this.timer = t
+        }
+      }
+      connectedOnce = true
+    }
   }
 
   private getHyperliquidClient(
@@ -161,8 +243,16 @@ class HyperliquidConnector extends CommonConnector {
     this.hyperliquidClientCandle = this.hyperliquidClientCandle.map((c) => ({
       id: c.id,
       count: 0,
-      client: this.getHyperliquidClient('candle', c.client),
+      items:
+        new Map() as (typeof this.hyperliquidClientCandle)[number]['items'],
+      client: this.getHyperliquidClient(
+        'candle',
+        c.client,
+      ) as hl.SubscriptionClient<hl.WebSocketTransport>,
     }))
+    this.hyperliquidClientCandle.forEach((e) =>
+      this.setupCandleReconnectHooks(e),
+    )
   }
 
   private hyperliquidRestartCb() {
@@ -213,12 +303,18 @@ class HyperliquidConnector extends CommonConnector {
       return find.client
     }
     logger.info('Creating new Hyperliquid candle client')
-    const client = this.getHyperliquidClient('candle')
-    this.hyperliquidClientCandle.push({
+    const client = this.getHyperliquidClient(
+      'candle',
+    ) as hl.SubscriptionClient<hl.WebSocketTransport>
+    const newEntry = {
       count,
       client,
       id: this.hyperliquidClientCandle.length,
-    })
+      items:
+        new Map() as (typeof this.hyperliquidClientCandle)[number]['items'],
+    }
+    this.hyperliquidClientCandle.push(newEntry)
+    this.setupCandleReconnectHooks(newEntry)
     return client
   }
 
@@ -306,6 +402,15 @@ class HyperliquidConnector extends CommonConnector {
                   const get = this.unsubscribeMap.get('candle') ?? []
                   get.push(unsubscribe)
                   this.unsubscribeMap.set('candle', get)
+                  // Track this subscription on its owning client entry so we
+                  // can re-queue exactly these items on reconnect.
+                  const ownerEntry = this.hyperliquidClientCandle.find(
+                    (e) => e.client === client,
+                  )
+                  ownerEntry?.items.set(`${c.coin}-${c.interval}`, {
+                    coin: c.coin,
+                    interval: c.interval,
+                  })
                   res()
                 } catch (e) {
                   rej(e)
