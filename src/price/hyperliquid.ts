@@ -392,6 +392,19 @@ class HyperliquidConnector extends CommonConnector {
           const subBatch = chunk.slice(bi, bi + subBatchSize)
           await Promise.all(
             subBatch.map(async (c) => {
+              // Look up owning entry once — needed in both success and error paths.
+              const ownerEntry = this.hyperliquidClientCandle.find(
+                (e) => e.client === client,
+              )
+              // Optimistically track BEFORE the subscribe attempt.
+              // If the connection closes mid-subscribe this item stays in
+              // entry.items, so the onopen reconnect hook will re-queue it
+              // immediately instead of leaving the client idle (and Hyperliquid
+              // closing the idle connection every ~60 s).
+              ownerEntry?.items.set(`${c.coin}-${c.interval}`, {
+                coin: c.coin,
+                interval: c.interval,
+              })
               await new Promise<void>(async (res, rej) => {
                 const t = setTimeout(() => rej(new Error('Timeout')), 10 * 1000)
                 try {
@@ -402,15 +415,6 @@ class HyperliquidConnector extends CommonConnector {
                   const get = this.unsubscribeMap.get('candle') ?? []
                   get.push(unsubscribe)
                   this.unsubscribeMap.set('candle', get)
-                  // Track this subscription on its owning client entry so we
-                  // can re-queue exactly these items on reconnect.
-                  const ownerEntry = this.hyperliquidClientCandle.find(
-                    (e) => e.client === client,
-                  )
-                  ownerEntry?.items.set(`${c.coin}-${c.interval}`, {
-                    coin: c.coin,
-                    interval: c.interval,
-                  })
                   res()
                 } catch (e) {
                   rej(e)
@@ -421,8 +425,19 @@ class HyperliquidConnector extends CommonConnector {
                 logger.error(
                   `Error subscribing Hyperliquid candle ${c.coin} ${c.interval}: ${e}`,
                 )
-                // Re-queue for retry — will be picked up after retryDelayMs
-                failedItems.push(c)
+                if (String(e).includes('connection closed')) {
+                  // Keep in ownerEntry.items — the socket is reconnecting and
+                  // onopen will re-queue this item through the rate-limited
+                  // batching.  No timed retry needed.
+                  logger.info(
+                    `Hyperliquid candle ${c.coin} ${c.interval} will retry on reconnect`,
+                  )
+                } else {
+                  // Non-connection error (e.g. ACK timeout): remove optimistic
+                  // entry and fall back to the 60 s timed retry.
+                  ownerEntry?.items.delete(`${c.coin}-${c.interval}`)
+                  failedItems.push(c)
+                }
               })
             }),
           )
