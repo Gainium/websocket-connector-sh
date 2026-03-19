@@ -11,6 +11,9 @@ import type { Ticker, StreamType, SubscribeCandlePayload } from './types'
 const mutex = new IdMutex()
 
 const maxCandlesPerConnection = 1000
+// Hyperliquid enforces a per-IP limit of 10 simultaneous WS connections.
+// Reserve 1 for the ticker client and 1 as a safety buffer.
+const maxCandleClients = 8
 
 class HyperliquidConnector extends CommonConnector {
   private unsubscribeMap: Map<StreamType, hl.Subscription[]> = new Map()
@@ -162,6 +165,14 @@ class HyperliquidConnector extends CommonConnector {
     current?: hl.SubscriptionClient,
   ) {
     if (current) {
+      // Permanently close the old transport so its ReconnectingWebSocket loop
+      // stops immediately. Without this the loop keeps running forever,
+      // accumulating open connections across every stopHyperliquid call.
+      try {
+        ;(
+          current as hl.SubscriptionClient<hl.WebSocketTransport>
+        ).transport.socket.close()
+      } catch {}
       const get = this.unsubscribeMap.get(type)
       if (get) {
         get.forEach((g) => g.unsubscribe())
@@ -240,6 +251,14 @@ class HyperliquidConnector extends CommonConnector {
       'ticker',
       this.hyperliquidClient,
     )
+    // Close any excess clients beyond the cap before recreating — these are
+    // leftovers from previous reconnect storms and waste connection slots.
+    const excess = this.hyperliquidClientCandle.splice(maxCandleClients)
+    for (const e of excess) {
+      try {
+        e.client.transport.socket.close()
+      } catch {}
+    }
     this.hyperliquidClientCandle = this.hyperliquidClientCandle.map((c) => ({
       id: c.id,
       count: 0,
@@ -301,6 +320,22 @@ class HyperliquidConnector extends CommonConnector {
         c.id === find.id ? { ...c, count: find.count } : c,
       )
       return find.client
+    }
+    // Hard cap: do not open more than maxCandleClients connections.
+    // Hyperliquid allows ≤10 simultaneous WS connections per IP; we reserve
+    // capacity for the ticker and a safety margin.
+    if (this.hyperliquidClientCandle.length >= maxCandleClients) {
+      logger.warn(
+        `Hyperliquid candle client cap (${maxCandleClients}) reached — reusing least-busy client`,
+      )
+      const leastBusy = [...this.hyperliquidClientCandle].sort(
+        (a, b) => a.count - b.count,
+      )[0]
+      leastBusy.count += count
+      this.hyperliquidClientCandle = this.hyperliquidClientCandle.map((c) =>
+        c.id === leastBusy.id ? { ...c, count: leastBusy.count } : c,
+      )
+      return leastBusy.client
     }
     logger.info('Creating new Hyperliquid candle client')
     const client = this.getHyperliquidClient(
