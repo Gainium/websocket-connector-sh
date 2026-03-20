@@ -140,23 +140,94 @@ class HyperliquidConnector extends CommonConnector {
     transport.socket.onopen = (event) => {
       origOnopen?.call(transport.socket, event)
       if (connectedOnce) {
-        logger.info(
-          `Hyperliquid candle client ${entry.id} reconnected — requeueing ${entry.items.size} subscriptions`,
-        )
+        const reconnectItems = [...entry.items.values()]
         entry.count = 0
-        for (const [k, v] of entry.items) {
-          this.inQueueCandles.set(k, v)
-        }
         entry.items.clear()
+        logger.info(
+          `Hyperliquid candle client ${entry.id} reconnected — resubscribing ${reconnectItems.length} subscriptions directly`,
+        )
+        // Resubscribe directly on THIS entry's client without going through
+        // the shared inQueueCandles/timer. When multiple clients reconnect
+        // simultaneously the shared timer is cancelled and restarted by each
+        // arriving onopen, meaning only the LAST reconnecting client's items
+        // end up subscribed — every other client stays idle and Hyperliquid
+        // closes the idle connection again in ~5 s.
+        setTimeout(() => {
+          this.resubscribeEntry(entry, reconnectItems)
+        }, 200)
+      }
+      connectedOnce = true
+    }
+  }
+
+  /**
+   * Resubscribes a specific candle client's items directly on its own connection.
+   * Used after reconnect to avoid item-theft caused by the shared inQueueCandles
+   * when multiple clients reconnect simultaneously.
+   */
+  private async resubscribeEntry(
+    entry: (typeof this.hyperliquidClientCandle)[number],
+    items: { coin: string; interval: hl.WsCandleParameters['interval'] }[],
+  ) {
+    if (items.length === 0) return
+    const subBatchSize = 5
+    const subBatchDelayMs = 2000
+    const failedItems: typeof items = []
+    for (let bi = 0; bi < items.length; bi += subBatchSize) {
+      const batch = items.slice(bi, bi + subBatchSize)
+      await Promise.all(
+        batch.map(async (c) => {
+          entry.items.set(`${c.coin}-${c.interval}`, c)
+          await new Promise<void>(async (res, rej) => {
+            const t = setTimeout(() => rej(new Error('Timeout')), 10_000)
+            try {
+              const unsubscribe = await entry.client.candle(
+                { coin: c.coin, interval: c.interval },
+                this.hyperliquidCandleCb,
+              )
+              const get = this.unsubscribeMap.get('candle') ?? []
+              get.push(unsubscribe)
+              this.unsubscribeMap.set('candle', get)
+              entry.count++
+              res()
+            } catch (e) {
+              rej(e)
+            } finally {
+              clearTimeout(t)
+            }
+          }).catch((e) => {
+            logger.error(
+              `Error resubscribing Hyperliquid candle ${c.coin} ${c.interval}: ${e}`,
+            )
+            if (String(e).includes('connection closed')) {
+              // Item stays in entry.items; onopen will retry on next reconnect
+            } else {
+              entry.items.delete(`${c.coin}-${c.interval}`)
+              failedItems.push(c)
+            }
+          })
+        }),
+      )
+      if (bi + subBatchSize < items.length) {
+        await new Promise((r) => setTimeout(r, subBatchDelayMs))
+      }
+    }
+    if (failedItems.length > 0) {
+      logger.info(
+        `Scheduling retry for ${failedItems.length} failed resubscriptions in 60s`,
+      )
+      setTimeout(() => {
+        for (const item of failedItems) {
+          this.inQueueCandles.set(`${item.coin}-${item.interval}`, item)
+        }
         if (!this.timer) {
           const t = setTimeout(() => {
             this.timer = null
             this.connectHyperliquidCandleStreams([], true)
-          }, 5000)
+          }, 0)
           this.timer = t
         }
-      }
-      connectedOnce = true
+      }, 60_000)
     }
   }
 
