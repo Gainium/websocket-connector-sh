@@ -154,7 +154,7 @@ class HyperliquidConnector extends CommonConnector {
         // closes the idle connection again in ~5 s.
         setTimeout(() => {
           this.resubscribeEntry(entry, reconnectItems)
-        }, 200)
+        }, 1500)
       }
       connectedOnce = true
     }
@@ -170,46 +170,52 @@ class HyperliquidConnector extends CommonConnector {
     items: { coin: string; interval: hl.WsCandleParameters['interval'] }[],
   ) {
     if (items.length === 0) return
-    const subBatchSize = 5
-    const subBatchDelayMs = 2000
+    // Serialize subscriptions: send one at a time with a pause between each.
+    // Sending multiple simultaneously triggers an "Inactive" close from
+    // Hyperliquid, causing the reconnect loop.
+    const subDelayMs = 500
     const failedItems: typeof items = []
-    for (let bi = 0; bi < items.length; bi += subBatchSize) {
-      const batch = items.slice(bi, bi + subBatchSize)
-      await Promise.all(
-        batch.map(async (c) => {
-          entry.items.set(`${c.coin}-${c.interval}`, c)
-          await new Promise<void>(async (res, rej) => {
-            const t = setTimeout(() => rej(new Error('Timeout')), 10_000)
-            try {
-              const unsubscribe = await entry.client.candle(
-                { coin: c.coin, interval: c.interval },
-                this.hyperliquidCandleCb,
-              )
-              const get = this.unsubscribeMap.get('candle') ?? []
-              get.push(unsubscribe)
-              this.unsubscribeMap.set('candle', get)
-              entry.count++
-              res()
-            } catch (e) {
-              rej(e)
-            } finally {
-              clearTimeout(t)
-            }
-          }).catch((e) => {
-            logger.error(
-              `Error resubscribing Hyperliquid candle ${c.coin} ${c.interval}: ${e}`,
-            )
-            if (String(e).includes('connection closed')) {
-              // Item stays in entry.items; onopen will retry on next reconnect
-            } else {
-              entry.items.delete(`${c.coin}-${c.interval}`)
-              failedItems.push(c)
-            }
-          })
-        }),
-      )
-      if (bi + subBatchSize < items.length) {
-        await new Promise((r) => setTimeout(r, subBatchDelayMs))
+    let connectionClosed = false
+    for (const c of items) {
+      if (connectionClosed) {
+        // Connection dropped mid-resubscription — remaining items will be
+        // picked up by the next onopen handler automatically.
+        entry.items.set(`${c.coin}-${c.interval}`, c)
+        continue
+      }
+      entry.items.set(`${c.coin}-${c.interval}`, c)
+      await new Promise<void>(async (res, rej) => {
+        const t = setTimeout(() => rej(new Error('Timeout')), 10_000)
+        try {
+          const unsubscribe = await entry.client.candle(
+            { coin: c.coin, interval: c.interval },
+            this.hyperliquidCandleCb,
+          )
+          const get = this.unsubscribeMap.get('candle') ?? []
+          get.push(unsubscribe)
+          this.unsubscribeMap.set('candle', get)
+          entry.count++
+          res()
+        } catch (e) {
+          rej(e)
+        } finally {
+          clearTimeout(t)
+        }
+      }).catch((e) => {
+        logger.error(
+          `Error resubscribing Hyperliquid candle ${c.coin} ${c.interval}: ${e}`,
+        )
+        if (String(e).includes('connection closed')) {
+          // Item stays in entry.items; onopen will retry on next reconnect.
+          // Skip remaining items — they'll be retried too.
+          connectionClosed = true
+        } else {
+          entry.items.delete(`${c.coin}-${c.interval}`)
+          failedItems.push(c)
+        }
+      })
+      if (!connectionClosed) {
+        await new Promise((r) => setTimeout(r, subDelayMs))
       }
     }
     if (failedItems.length > 0) {
@@ -249,6 +255,16 @@ class HyperliquidConnector extends CommonConnector {
         get.forEach((g) => g.unsubscribe())
       }
     }
+
+    // Track rapid close/open cycles so the circuit breaker below can fire.
+    // A "rapid close" is a connection that opened but was closed by the server
+    // in under 10 s — a sign we are hitting Hyperliquid's 30 new connections/min
+    // per-IP limit. Once the death spiral starts (attempt counter resets on
+    // every brief open, so delay stays at ~300 ms → ~75 reconnects/min) we need
+    // to impose a much longer backoff until the server stops rate-limiting us.
+    let lastOpenMs = 0
+    let rapidCloseCount = 0
+
     const transport = new hl.WebSocketTransport({
       url:
         process.env.HYPERLIQUIDENV === 'demo'
@@ -256,17 +272,42 @@ class HyperliquidConnector extends CommonConnector {
           : 'wss://api.hyperliquid.xyz/ws',
       reconnect: {
         maxRetries: 100,
-        connectionDelay: (attempt) => Math.min((1 << attempt) * 150, 10000),
+        // Base delay: 3 s minimum (attempt=1 after any brief open resets _attempt
+        // to 0 and close increments to 1 → 3 s × 2 = 6 s minimum).
+        // That keeps new connections well under 30/min under normal conditions.
+        // Circuit breaker: if connections keep closing within 10 s of opening,
+        // add 30 s per rapid-close count (capped at 2 min) to let the server
+        // stop rate-limiting before we try again.
+        connectionDelay: (attempt) => {
+          const base = Math.min((1 << attempt) * 3_000, 120_000)
+          if (rapidCloseCount >= 3) {
+            const extra = Math.min(rapidCloseCount * 30_000, 120_000)
+            logger.warn(
+              `Hyperliquid rapid-close circuit breaker active (${rapidCloseCount}x), delaying ${(base + extra) / 1000}s`,
+            )
+            return base + extra
+          }
+          return base
+        },
       },
     })
+    transport.socket.onopen = () => {
+      lastOpenMs = Date.now()
+      logger.info(`Hyperliquid connected`)
+    }
     transport.socket.onclose = (event) => {
-      logger.info(`Hyperliquid closed: ${event.reason}`)
+      const openDuration = lastOpenMs > 0 ? Date.now() - lastOpenMs : Infinity
+      if (openDuration < 10_000) {
+        rapidCloseCount++
+      } else {
+        rapidCloseCount = 0
+      }
+      logger.info(
+        `Hyperliquid closed: code=${(event as CloseEvent).code} reason=${event.reason} openFor=${openDuration === Infinity ? '?' : `${(openDuration / 1000).toFixed(1)}s`} rapidCloses=${rapidCloseCount}`,
+      )
     }
     transport.socket.onerror = (event) => {
       logger.error(`Hyperliquid error: ${JSON.stringify(event)}`)
-    }
-    transport.socket.onopen = () => {
-      logger.info(`Hyperliquid connected`)
     }
     const client = new hl.SubscriptionClient({
       transport,
@@ -489,66 +530,63 @@ class HyperliquidConnector extends CommonConnector {
       i++
       const client = await this.getCandleClient(chunk.length)
       if (client) {
-        // Send subscribe messages in small concurrent bursts with a pause
-        // between bursts. Larger bursts (20+) cause Hyperliquid to stop
-        // sending ACKs after a few minutes (rate-limiting).
-        const subBatchSize = 5
-        const subBatchDelayMs = 2000
-        for (let bi = 0; bi < chunk.length; bi += subBatchSize) {
-          const subBatch = chunk.slice(bi, bi + subBatchSize)
-          await Promise.all(
-            subBatch.map(async (c) => {
-              // Look up owning entry once — needed in both success and error paths.
-              const ownerEntry = this.hyperliquidClientCandle.find(
-                (e) => e.client === client,
-              )
-              // Optimistically track BEFORE the subscribe attempt.
-              // If the connection closes mid-subscribe this item stays in
-              // entry.items, so the onopen reconnect hook will re-queue it
-              // immediately instead of leaving the client idle (and Hyperliquid
-              // closing the idle connection every ~60 s).
-              ownerEntry?.items.set(`${c.coin}-${c.interval}`, {
-                coin: c.coin,
-                interval: c.interval,
-              })
-              await new Promise<void>(async (res, rej) => {
-                const t = setTimeout(() => rej(new Error('Timeout')), 10 * 1000)
-                try {
-                  const unsubscribe = await client.candle(
-                    { coin: c.coin, interval: c.interval },
-                    this.hyperliquidCandleCb,
-                  )
-                  const get = this.unsubscribeMap.get('candle') ?? []
-                  get.push(unsubscribe)
-                  this.unsubscribeMap.set('candle', get)
-                  res()
-                } catch (e) {
-                  rej(e)
-                } finally {
-                  clearTimeout(t)
-                }
-              }).catch((e) => {
-                logger.error(
-                  `Error subscribing Hyperliquid candle ${c.coin} ${c.interval}: ${e}`,
-                )
-                if (String(e).includes('connection closed')) {
-                  // Keep in ownerEntry.items — the socket is reconnecting and
-                  // onopen will re-queue this item through the rate-limited
-                  // batching.  No timed retry needed.
-                  logger.info(
-                    `Hyperliquid candle ${c.coin} ${c.interval} will retry on reconnect`,
-                  )
-                } else {
-                  // Non-connection error (e.g. ACK timeout): remove optimistic
-                  // entry and fall back to the 60 s timed retry.
-                  ownerEntry?.items.delete(`${c.coin}-${c.interval}`)
-                  failedItems.push(c)
-                }
-              })
-            }),
+        // Serialize subscribe messages: send one at a time with a pause
+        // between each. Sending multiple simultaneously triggers an
+        // "Inactive" close from Hyperliquid → reconnect loop.
+        const subDelayMs = 500
+        let connectionClosed = false
+        for (const c of chunk) {
+          if (connectionClosed) break
+          // Look up owning entry once — needed in both success and error paths.
+          const ownerEntry = this.hyperliquidClientCandle.find(
+            (e) => e.client === client,
           )
-          if (bi + subBatchSize < chunk.length) {
-            await new Promise((r) => setTimeout(r, subBatchDelayMs))
+          // Optimistically track BEFORE the subscribe attempt.
+          // If the connection closes mid-subscribe this item stays in
+          // entry.items, so the onopen reconnect hook will re-queue it
+          // immediately instead of leaving the client idle (and Hyperliquid
+          // closing the idle connection every ~60 s).
+          ownerEntry?.items.set(`${c.coin}-${c.interval}`, {
+            coin: c.coin,
+            interval: c.interval,
+          })
+          await new Promise<void>(async (res, rej) => {
+            const t = setTimeout(() => rej(new Error('Timeout')), 10 * 1000)
+            try {
+              const unsubscribe = await client.candle(
+                { coin: c.coin, interval: c.interval },
+                this.hyperliquidCandleCb,
+              )
+              const get = this.unsubscribeMap.get('candle') ?? []
+              get.push(unsubscribe)
+              this.unsubscribeMap.set('candle', get)
+              res()
+            } catch (e) {
+              rej(e)
+            } finally {
+              clearTimeout(t)
+            }
+          }).catch((e) => {
+            logger.error(
+              `Error subscribing Hyperliquid candle ${c.coin} ${c.interval}: ${e}`,
+            )
+            if (String(e).includes('connection closed')) {
+              // Keep in ownerEntry.items — the socket is reconnecting and
+              // onopen will re-queue this item through the rate-limited
+              // batching.  No timed retry needed.
+              logger.info(
+                `Hyperliquid candle ${c.coin} ${c.interval} will retry on reconnect`,
+              )
+              connectionClosed = true
+            } else {
+              // Non-connection error (e.g. ACK timeout): remove optimistic
+              // entry and fall back to the 60 s timed retry.
+              ownerEntry?.items.delete(`${c.coin}-${c.interval}`)
+              failedItems.push(c)
+            }
+          })
+          if (!connectionClosed) {
+            await new Promise((r) => setTimeout(r, subDelayMs))
           }
         }
         if (i < chunks.length) {
