@@ -27,6 +27,10 @@ const MAX_SUBS = Number(process.argv[3] ?? 28)
 // Fixed set of 28 subs (BTC+ETH × 14 intervals), waits for data, force-closes
 // the WS, then verifies data resumes after the connector re-subscribes.
 const RECONNECT_TEST = process.argv[4] === '--reconnect'
+// Pass --spot-name as 4th arg to test spot coin name formats.
+// Subscribes to PUMP-USDC (display name) and @20 (API format) to confirm
+// which one works and which one kills the connection.
+const SPOT_NAME_TEST = process.argv[4] === '--spot-name'
 
 const INTERVALS: string[] = [
   '1m',
@@ -230,6 +234,62 @@ async function main() {
     `\nAll ${testSubs.length} subs enqueued - connector will send them over` +
       ` ~${batchSecs}s, listening for ${DURATION_S}s total.\n`,
   )
+
+  // -- Spot name format test ------------------------------------------------
+  // Tests whether Hyperliquid accepts display names (PUMP-USDC) vs API
+  // symbols (@20) for candle subscriptions.
+  if (SPOT_NAME_TEST) {
+    console.log('\n[spot-name-test] Testing spot coin name formats...')
+    console.log('[spot-name-test] Subscribing BTC 1h (perp, should work)...')
+    connector.subscribeCandleCb({
+      symbol: 'BTC',
+      exchange: ExchangeEnum.hyperliquidLinear,
+      interval: '1h',
+    })
+    await new Promise((r) => setTimeout(r, 8000))
+    const msgsAfterPerp = totalMessages
+    console.log(
+      `[spot-name-test] After perp sub: ${msgsAfterPerp} msgs (expect >0)`,
+    )
+
+    console.log('[spot-name-test] Subscribing @20 1h (spot API format)...')
+    connector.subscribeCandleCb({
+      symbol: '@20',
+      exchange: ExchangeEnum.hyperliquid,
+      interval: '1h',
+    })
+    await new Promise((r) => setTimeout(r, 8000))
+    const msgsAfterSpotCode = totalMessages
+    console.log(
+      `[spot-name-test] After @20 sub: ${msgsAfterSpotCode - msgsAfterPerp} new msgs`,
+    )
+
+    console.log(
+      '[spot-name-test] Subscribing PUMP-USDC 1h (display name — may kill connection)...',
+    )
+    connector.subscribeCandleCb({
+      symbol: 'PUMP-USDC',
+      exchange: ExchangeEnum.hyperliquid,
+      interval: '1h',
+    })
+    await new Promise((r) => setTimeout(r, 15000))
+    const msgsAfterDisplayName = totalMessages
+    console.log(
+      `[spot-name-test] After PUMP-USDC sub: ${msgsAfterDisplayName - msgsAfterSpotCode} new msgs`,
+    )
+
+    console.log(`\n${'-'.repeat(60)}`)
+    console.log('[spot-name-test] Summary:')
+    console.log(`  BTC (perp):       ${msgsAfterPerp > 0 ? 'OK' : 'FAIL'}`)
+    console.log(
+      `  @20 (spot code):  ${msgsAfterSpotCode > msgsAfterPerp ? 'OK' : 'FAIL — no data'}`,
+    )
+    console.log(
+      `  PUMP-USDC (name): ${msgsAfterDisplayName > msgsAfterSpotCode ? 'OK' : 'FAIL — no data (likely killed connection)'}`,
+    )
+    await redisSub.quit()
+    process.exit(0)
+  }
 
   // -- Reconnect resilience test -------------------------------------------
   if (RECONNECT_TEST) {

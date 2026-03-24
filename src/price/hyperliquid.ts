@@ -25,6 +25,10 @@ class HyperliquidConnector extends CommonConnector {
       interval: hl.WsCandleParameters['interval']
     }
   > = new Map()
+  /** Display name → API code, e.g. "PUMP-USDC" → "@20" */
+  private nameToCode: Map<string, string> = new Map()
+  /** API code → display name, e.g. "@20" → "PUMP-USDC" */
+  private codeToName: Map<string, string> = new Map()
   private hyperliquidClient: hl.SubscriptionClient =
     this.getHyperliquidClient('ticker')
   private hyperliquidClientCandle: {
@@ -66,11 +70,18 @@ class HyperliquidConnector extends CommonConnector {
   }
 
   private async hyperliquidCandleCb(msg: hl.Candle) {
+    // WS returns @N codes for spot — translate back to display name so the
+    // Redis channel matches what consumers requested (e.g. "PUMP-USDC").
+    const exchange =
+      msg.s.startsWith('@') || msg.s.includes('/')
+        ? ExchangeEnum.hyperliquid
+        : ExchangeEnum.hyperliquidLinear
+    const symbol = this.codeToName.get(msg.s) ?? msg.s
     this.cbWsTrade(
       {
         e: 'kline',
         E: +new Date(),
-        s: msg.s,
+        s: symbol,
         k: {
           o: msg.o,
           h: msg.h,
@@ -81,9 +92,7 @@ class HyperliquidConnector extends CommonConnector {
           t: msg.t,
         },
       },
-      msg.s.startsWith('@')
-        ? ExchangeEnum.hyperliquid
-        : ExchangeEnum.hyperliquidLinear,
+      exchange,
     )
   }
 
@@ -184,11 +193,19 @@ class HyperliquidConnector extends CommonConnector {
         continue
       }
       entry.items.set(`${c.coin}-${c.interval}`, c)
+      const wsCoin = this.toWsCoin(c.coin)
+      if (!wsCoin) {
+        logger.error(
+          `Failed to translate symbol ${c.coin} for Hyperliquid candle resubscription — skipping`,
+        )
+        entry.items.delete(`${c.coin}-${c.interval}`)
+        continue
+      }
       await new Promise<void>(async (res, rej) => {
         const t = setTimeout(() => rej(new Error('Timeout')), 10_000)
         try {
           const unsubscribe = await entry.client.candle(
-            { coin: c.coin, interval: c.interval },
+            { coin: wsCoin, interval: c.interval },
             this.hyperliquidCandleCb,
           )
           const get = this.unsubscribeMap.get('candle') ?? []
@@ -349,13 +366,85 @@ class HyperliquidConnector extends CommonConnector {
     }
   }
 
+  private metaRefreshTimer: NodeJS.Timeout | null = null
+
   async init() {
+    await this.fetchMeta()
+    this.metaRefreshTimer = setInterval(
+      () => {
+        this.fetchMeta()
+      },
+      30 * 60 * 1000,
+    )
     if (!this.isCandle || this.isAll) {
       this.initHyperliquidWS()
     }
     if (this.isCandle || this.isAll) {
       this.reconnectHyperliquidCandleStream()
     }
+  }
+
+  /**
+   * Fetches spotMeta from the Hyperliquid REST API and builds the
+   * display-name ↔ @N mapping needed for candle subscriptions.
+   * Spot coins are referenced as @0, @1, … in the WS API but callers
+   * send display names like "PUMP-USDC".
+   */
+  private async fetchMeta() {
+    try {
+      const infoClient = new hl.InfoClient({
+        transport: new hl.HttpTransport({
+          isTestnet: process.env.HYPERLIQUID === 'demo',
+        }),
+      })
+      const newNameToCode = new Map<string, string>()
+      const newCodeToName = new Map<string, string>()
+      await infoClient
+        .spotMeta()
+        .then((result) => {
+          const pairs = result.universe
+          const tokens = result.tokens
+          pairs.map((d) => {
+            const base = tokens.find((t) => t.index === d.tokens[0])
+            const baseName = base?.name === 'UBTC' ? 'BTC' : base?.name
+            const quote = tokens.find((t) => t.index === d.tokens[1])
+            const displayName = `${baseName}-${quote?.name}`
+            newNameToCode.set(displayName, d.name)
+            newCodeToName.set(d.name, displayName)
+          })
+        })
+        .catch((e) => {
+          logger.error(`Failed to fetch Hyperliquid spotMeta: ${e}`)
+        })
+      await infoClient.meta().then((result) => {
+        const tokens = result.universe
+        tokens.map((t) => {
+          const displayName = `${t.name}-USDC`
+          newNameToCode.set(displayName, t.name)
+          newCodeToName.set(t.name, displayName)
+        })
+      })
+      // Only replace maps if we got data — on failure keep previous values.
+      if (newNameToCode.size > 0) {
+        this.nameToCode = newNameToCode
+        this.codeToName = newCodeToName
+        logger.info(
+          `Loaded ${this.nameToCode.size} symbol mappings from Hyperliquid`,
+        )
+      }
+    } catch (e) {
+      logger.error(
+        `Failed to fetch Hyperliquid meta (keeping ${this.nameToCode.size} existing mappings): ${e}`,
+      )
+    }
+  }
+
+  /**
+   * Translates a coin name to the format Hyperliquid's WS API expects.
+   * Spot display names (e.g. "PUMP-USDC") → "@20"; perps pass through.
+   */
+  private toWsCoin(coin: string): string | undefined {
+    return this.nameToCode.get(coin)
   }
 
   private stopHyperliquid() {
@@ -403,12 +492,16 @@ class HyperliquidConnector extends CommonConnector {
   }
 
   private async reconnectHyperliquidCandleStream() {
-    const all =
-      this.subscribedCandlesMap.get(ExchangeEnum.hyperliquid) ?? new Set()
     const store: string[][] = []
-    all.forEach((s) => {
-      store.push(this.splitCandleRoomName(s))
-    })
+    for (const ex of [
+      ExchangeEnum.hyperliquid,
+      ExchangeEnum.hyperliquidLinear,
+    ] as const) {
+      const set = this.subscribedCandlesMap.get(ex) ?? new Set()
+      set.forEach((s) => {
+        store.push(this.splitCandleRoomName(s))
+      })
+    }
     this.connectHyperliquidCandleStreams(
       store.map(([symbol, interval]) => ({
         symbol,
@@ -471,11 +564,6 @@ class HyperliquidConnector extends CommonConnector {
     timer = false,
   ) {
     const data = _data.map(({ symbol, interval }) => {
-      const topic = `${interval}@${symbol}`
-      const e = ExchangeEnum.hyperliquid
-      const set = this.subscribedCandlesMap.get(e) ?? new Set()
-      set.add(topic)
-      this.subscribedCandlesMap.set(e, set)
       return { coin: symbol, interval }
     })
     if (!timer) {
@@ -550,11 +638,22 @@ class HyperliquidConnector extends CommonConnector {
             coin: c.coin,
             interval: c.interval,
           })
+          const wsCoin = this.toWsCoin(c.coin)
+          if (!wsCoin) {
+            logger.error(
+              `Failed to translate symbol ${c.coin} for Hyperliquid candle subscription — skipping`,
+            )
+            ownerEntry?.items.delete(`${c.coin}-${c.interval}`)
+            continue
+          }
+          if (wsCoin !== c.coin) {
+            logger.info(`Translated symbol ${c.coin} → ${wsCoin}`)
+          }
           await new Promise<void>(async (res, rej) => {
             const t = setTimeout(() => rej(new Error('Timeout')), 10 * 1000)
             try {
               const unsubscribe = await client.candle(
-                { coin: c.coin, interval: c.interval },
+                { coin: wsCoin, interval: c.interval },
                 this.hyperliquidCandleCb,
               )
               const get = this.unsubscribeMap.get('candle') ?? []
@@ -624,6 +723,10 @@ class HyperliquidConnector extends CommonConnector {
 
   stop() {
     super.stop()
+    if (this.metaRefreshTimer) {
+      clearInterval(this.metaRefreshTimer)
+      this.metaRefreshTimer = null
+    }
     this.stopHyperliquid()
   }
 
@@ -634,7 +737,12 @@ class HyperliquidConnector extends CommonConnector {
     const linear: Ticker[] = []
     await Promise.all(
       Object.entries(data).map(async ([coin, price]) => {
-        const v = {
+        const exchange =
+          coin.startsWith('@') || coin.includes('/')
+            ? ExchangeEnum.hyperliquid
+            : ExchangeEnum.hyperliquidLinear
+        const symbol = this.codeToName.get(coin) ?? coin
+        const v: Ticker = {
           eventType: '24hrMiniTicker',
           eventTime: +new Date(),
           curDayClose: price,
@@ -643,13 +751,13 @@ class HyperliquidConnector extends CommonConnector {
           low: price,
           volume: '10000000',
           volumeQuote: '10000000',
-          symbol: coin,
+          symbol,
           bestBid: price,
           bestAsk: price,
           bestAskQnt: price,
           bestBidQnt: price,
         }
-        if (coin.startsWith('@') || coin.includes('/')) {
+        if (exchange === ExchangeEnum.hyperliquid) {
           spot.push(v)
         } else {
           linear.push(v)

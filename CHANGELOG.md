@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.4.8] - 2026-03-24
+
+### Changed
+- Hyperliquid pairs mapping
+
 ## [1.4.7] - 2026-03-23
 
 ### Changed
