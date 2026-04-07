@@ -15,6 +15,58 @@ import { WebsocketClient as BybitClient } from '../bybit-custom/websocket-client
 import { WebsocketClient as OKXClient, WsChannelArgInstType } from 'okx-api'
 import { WebsocketClientV2 as BitgetClient, BitgetInstTypeV2 } from 'bitget-api'
 import { WebsocketClient as KrakenWsClient } from '@siebly/kraken-api'
+
+/**
+ * Monkeypatch @siebly/kraken-api BaseWSClient to prevent unhandled rejections
+ * from `requestSubscribeTopics`.
+ *
+ * Bug: BaseWSClient.onWsOpen() calls `this.requestSubscribeTopics(wsKey, privateReqs)`
+ * WITHOUT await and WITHOUT .catch(). The wrapping try/catch is useless on an
+ * unawaited async call. When Kraken's REST GetWebSocketsToken fails (e.g. 401
+ * "Permission denied" for a revoked/edited API key), the rejection escapes the
+ * library entirely and lands in process.on('unhandledRejection'), which would
+ * trigger our global self-restart logic.
+ *
+ * Fix: wrap requestSubscribeTopics on the prototype so any rejection is
+ * re-emitted as an 'exception' event on the client instance, which our
+ * per-account listener below picks up and logs with userId context.
+ */
+{
+  // KrakenWsClient extends BaseWSClient — patch the parent prototype so the
+  // wrapper applies to every instance and is shared across spot/futures.
+  const baseProto = Object.getPrototypeOf(KrakenWsClient.prototype) as any
+  if (baseProto && !baseProto.__gainiumRequestSubscribePatched) {
+    const original = baseProto.requestSubscribeTopics
+    if (typeof original === 'function') {
+      baseProto.requestSubscribeTopics = async function (
+        this: any,
+        wsKey: any,
+        reqs: any,
+      ) {
+        try {
+          return await original.call(this, wsKey, reqs)
+        } catch (err: any) {
+          try {
+            this.emit('exception', {
+              ...(typeof err === 'object' && err !== null ? err : {}),
+              message:
+                err?.body?.error?.join?.(',') ||
+                err?.message ||
+                'requestSubscribeTopics failed',
+              wsKey,
+              source: 'requestSubscribeTopics',
+              originalError: err,
+            })
+          } catch {
+            /* swallow — never let the patch itself throw */
+          }
+          return undefined
+        }
+      }
+      baseProto.__gainiumRequestSubscribePatched = true
+    }
+  }
+}
 import { connectPaper } from './utils/paperTradingWS'
 import logger from './utils/logger'
 import { IdMute, IdMutex } from './utils/mutex'
@@ -2032,9 +2084,13 @@ class UserConnector {
             this.krakenLastBalances.delete(id)
           }
 
-          client.on('exception', async (error: Error | string) => {
+          client.on('exception', async (error: Error | string | any) => {
             const errorMsg =
-              typeof error === 'string' ? error : error.message || ''
+              typeof error === 'string'
+                ? error
+                : error?.message ||
+                  error?.body?.error?.join?.(',') ||
+                  JSON.stringify(error)
             this.logger(
               `${id} ${userId} Kraken exception ${errorMsg} ${api.provider}`,
               true,

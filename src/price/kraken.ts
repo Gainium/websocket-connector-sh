@@ -297,7 +297,7 @@ class KrakenConnector extends CommonConnector {
 
     // Subscribe to ohlc for the symbol (spot only)
     this.krakenCandleClient.subscribe(
-      [{ topic: 'ohlc', payload: { symbol: wsnameSymbol, interval } }],
+      [{ topic: 'ohlc', payload: { symbol: [wsnameSymbol], interval } }],
       'spotPublicV2',
     )
   }
