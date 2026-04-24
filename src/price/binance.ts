@@ -7,6 +7,7 @@ import {
   WS_KEY_MAP,
   WsMessage24hrTickerRaw,
   WsRawMessage,
+  WsMessage24hrMiniTickerRaw,
 } from 'binance'
 import CommonConnector from './common'
 
@@ -109,25 +110,30 @@ class BinanceConnector extends CommonConnector {
 
   private binanceTickerCb(e: ExchangeEnum) {
     return (d: WsRawMessage) => {
-      if (Array.isArray(d) && d[0]?.e === '24hrTicker') {
+      if (
+        Array.isArray(d) &&
+        (d[0]?.e === '24hrTicker' || d[0]?.e === '24hrMiniTicker')
+      ) {
         //@ts-ignore
         delete d.wsKey
         this.cbWs(
-          (d as WsMessage24hrTickerRaw[]).map((d) => ({
-            eventType: d.e,
-            eventTime: d.E,
-            symbol: d.s,
-            curDayClose: `${d.c}`,
-            bestBid: `${d.b}`,
-            bestBidQnt: `${d.B}`,
-            bestAsk: `${d.a}`,
-            bestAskQnt: `${d.A}`,
-            open: `${d.o}`,
-            high: `${d.h}`,
-            low: `${d.l}`,
-            volume: `${d.v}`,
-            volumeQuote: `${d.q}`,
-          })),
+          (d as (WsMessage24hrTickerRaw | WsMessage24hrMiniTickerRaw)[]).map(
+            (d) => ({
+              eventType: d.e,
+              eventTime: d.E,
+              symbol: d.s,
+              curDayClose: `${d.c}`,
+              bestBid: `${d.c}`,
+              bestBidQnt: `${d.q}`,
+              bestAsk: `${d.c}`,
+              bestAskQnt: `${d.q}`,
+              open: `${d.o}`,
+              high: `${d.h}`,
+              low: `${d.l}`,
+              volume: `${d.v}`,
+              volumeQuote: `${d.q}`,
+            }),
+          ),
           e,
         )
       }
@@ -291,12 +297,12 @@ class BinanceConnector extends CommonConnector {
 
   private async initBinanceWS() {
     if (this.isIntl) {
-      this.binanceClient.subscribeAll24hrTickers('spot')
+      this.binanceClient.subscribeSpotAllMini24hrTickers()
       this.binanceClientCoinm.subscribeAll24hrTickers('coinm')
       this.binanceClientUsdm.subscribeAll24hrTickers('usdm')
     }
     if (this.isUs) {
-      this.binanceClientUs.subscribeAll24hrTickers('spot')
+      this.binanceClientUs.subscribeSpotAllMini24hrTickers()
     }
   }
 
