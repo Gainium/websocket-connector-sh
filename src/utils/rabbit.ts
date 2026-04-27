@@ -19,12 +19,147 @@ const mutex = new IdMutex()
 
 const retryTimeout = 30 * 1000
 
+const sendMutex = new IdMutex(1000)
+
+class ChannelPool {
+  private channels: Channel[] = []
+  private dedicatedChannels: Channel[] = []
+  private currentIndex = 0
+  private dedicatedIndex = 0
+  private connection: Connection | null = null
+  private poolSize = 5
+
+  constructor(connection: Connection) {
+    this.connection = connection
+  }
+
+  async initialize(): Promise<void> {
+    logger.info(
+      `${prefix} Initializing channel pool with size ${this.poolSize}`,
+    )
+    for (let i = 0; i < this.poolSize; i++) {
+      await this.addChannel()
+    }
+
+    for (let i = 0; i < this.poolSize; i++) {
+      await this.addDedicatedChannel()
+    }
+
+    logger.info(
+      `${prefix} Channel pool initialized with ${this.channels.length} regular and ${this.dedicatedChannels.length} dedicated channels`,
+    )
+  }
+
+  private async addChannel(): Promise<void> {
+    if (!this.connection) {
+      throw new Error('No connection available for channel creation')
+    }
+
+    await new Promise<void>((resolve) => {
+      this.connection?.createChannel(async (err, channel) => {
+        if (err || !channel) {
+          logger.error(`${prefix} Failed to create channel: ${err}`)
+          resolve()
+          return
+        }
+
+        channel.assertExchange(rabbitExchange, 'direct', {
+          durable: true,
+        })
+
+        this.channels.push(channel)
+        resolve()
+      })
+    })
+  }
+
+  private async addDedicatedChannel(): Promise<void> {
+    if (!this.connection) {
+      throw new Error('No connection available for channel creation')
+    }
+
+    await new Promise<void>((resolve) => {
+      this.connection?.createChannel((err, channel) => {
+        if (err || !channel) {
+          logger.error(`${prefix} Failed to create dedicated channel: ${err}`)
+          resolve()
+          return
+        }
+
+        channel.prefetch(1)
+
+        this.dedicatedChannels.push(channel)
+        resolve()
+      })
+    })
+  }
+
+  getChannel(): Channel | null {
+    if (this.channels.length === 0) {
+      return null
+    }
+
+    const channel = this.channels[this.currentIndex]
+    this.currentIndex = (this.currentIndex + 1) % this.channels.length
+    return channel
+  }
+
+  getDedicatedChannel(): Channel | null {
+    if (this.dedicatedChannels.length === 0) {
+      if (this.connection) {
+        let channel: Channel | null = null
+        this.connection.createChannel((err, ch) => {
+          if (!err && ch) {
+            channel = ch
+          }
+        })
+        if (channel) {
+          if (this.dedicatedChannels.length < this.poolSize) {
+            this.dedicatedChannels.push(channel)
+          }
+          return channel
+        }
+      }
+      return null
+    }
+
+    const channel = this.dedicatedChannels[this.dedicatedIndex]
+    this.dedicatedIndex =
+      (this.dedicatedIndex + 1) % this.dedicatedChannels.length
+    return channel
+  }
+
+  close(): void {
+    this.channels.forEach((channel) => {
+      try {
+        channel.close(() => null)
+      } catch (err) {
+        logger.error(`${prefix} Error closing channel: ${err}`)
+      }
+    })
+    this.dedicatedChannels.forEach((channel) => {
+      try {
+        channel.close(() => null)
+      } catch (err) {
+        logger.error(`${prefix} Error closing dedicated channel: ${err}`)
+      }
+    })
+    this.channels = []
+    this.dedicatedChannels = []
+  }
+}
+
 class Client {
   static client: Connection | null = null
-  static channel: Channel | null = null
+  static channelPool: ChannelPool | null = null
+  static channel: Channel | null = null // Keep for backward compatibility
 
   static async reconnect() {
     logger.info(`${prefix} Reconnect RabbitMQ`)
+    if (Client.channelPool) {
+      Client.channelPool.close()
+      Client.channelPool = null
+    }
     Client.client = null
     Client.channel = null
     Client.connect()
@@ -60,16 +195,14 @@ class Client {
             resolve([])
           }
           Client.client = Client.client ?? conn ?? null
-          if (!Client.channel) {
-            await new Promise((resolve2) => {
-              Client.client?.createChannel(async (_, channel) => {
-                channel?.assertExchange(rabbitExchange, 'direct', {
-                  durable: true,
-                })
-                Client.channel = Client.channel ?? channel ?? null
-                resolve2([])
-              })
-            })
+
+          if (Client.client && !Client.channelPool) {
+            Client.channelPool = new ChannelPool(Client.client)
+            await Client.channelPool.initialize()
+
+            if (!Client.channel && Client.channelPool) {
+              Client.channel = Client.channelPool.getChannel()
+            }
           }
 
           resolve([])
@@ -82,11 +215,16 @@ class Client {
   static async getClient(): Promise<{
     client: Connection | null
     channel: Channel | null
+    channelPool: ChannelPool | null
   }> {
-    if (!Client.client || !Client.channel) {
+    if (!Client.client || !Client.channelPool) {
       await Client.connect()
     }
-    return { client: Client.client, channel: Client.channel }
+    return {
+      client: Client.client,
+      channel: Client.channel,
+      channelPool: Client.channelPool,
+    }
   }
 }
 
@@ -164,6 +302,37 @@ class Rabbit {
         return this.listenWithCallback(queue, callback, maxSize, count + 1)
       }
       return null
+    }
+  }
+
+  @IdMute(sendMutex, (queue: string) => `rabbit-send-${queue}`)
+  async send<P>(queue: string, payload: P): Promise<void> {
+    try {
+      const { client, channelPool } = await this.getClient()
+      if (!client || !channelPool) {
+        logger.error(`${prefix} No client or channelPool in send in ${queue}`)
+        return
+      }
+
+      const channel = channelPool.getChannel()
+      if (!channel) {
+        logger.error(`${prefix} Failed to get channel for send to ${queue}`)
+        return
+      }
+      const result = channel.publish(
+        rabbitExchange,
+        queue,
+        Buffer.from(JSON.stringify({ payload })),
+      )
+      if (!result) {
+        logger.error(
+          `${prefix} Failed to send message to queue ${queue} in send`,
+        )
+        return
+      }
+    } catch (e) {
+      logger.error(`${prefix} Error in send in ${queue}: ${e}, ${payload}`)
+      return
     }
   }
 }
