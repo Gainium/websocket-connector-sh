@@ -406,22 +406,22 @@ class BinanceConnector extends CommonConnector {
       } else {
         if (futures) {
           if (futures === 'coinm') {
-            //@ts-ignore
+            //@ts-expect-error connect to wsUrl is private
             this.binanceClientCandleCoinm.connectToWsUrl(
-              `${await this.binanceClientCandleCoinm.getWsUrl(WS_KEY_MAP.coinm)}?streams=${wsKey}`,
+              `wss://dstream.binance.com/stream?streams=${wsKey}`,
               WS_KEY_MAP.coinm,
             )
           } else if (futures === 'usdm') {
-            //@ts-ignore
+            //@ts-expect-error connect to wsUrl is private
             this.binanceClientCandleUsdm.connectToWsUrl(
-              `${await this.binanceClientCandleUsdm.getWsUrl(WS_KEY_MAP.usdm)}?streams=${wsKey}`,
+              `wss://fstream.binance.com/market/stream?streams=${wsKey}`,
               WS_KEY_MAP.usdm,
             )
           }
         } else {
-          //@ts-ignore
+          //@ts-expect-error connect to wsUrl is private
           this.binanceClientCandle.connectToWsUrl(
-            `${await this.binanceClientCandle.getWsUrl(WS_KEY_MAP.main)}?streams=${wsKey}`,
+            `wss://stream.binance.com:9443/stream?streams=${wsKey}`,
             WS_KEY_MAP.main,
           )
         }
