@@ -100,6 +100,9 @@ class OkxConnector extends CommonConnector {
   private okxCandleCb(e: ExchangeEnum) {
     return (msg: any) => {
       if (msg.arg.channel.includes('candle')) {
+        if (msg.data[0][8] !== '1') {
+          return
+        }
         this.cbWsTrade(
           {
             e: 'kline',

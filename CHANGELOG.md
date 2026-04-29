@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.5.4] - 2026-04-29
+
+### Changed
+- Send only closed candles in Binance, OKX and Bybit
+
 ## [1.5.3] - 2026-04-27
 
 ### Fixed

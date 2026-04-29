@@ -88,6 +88,9 @@ class BinanceConnector extends CommonConnector {
   private binanceCandleCb(e: ExchangeEnum) {
     return (d: WsRawMessage) => {
       if (!Array.isArray(d) && d.e === 'kline') {
+        if (!d.k.x) {
+          return
+        }
         //@ts-ignore
         delete d.wsKey
         this.cbWsTrade(

@@ -24,7 +24,7 @@ class CommonConnector {
   } = {}
   watchdog: NodeJS.Timeout | null = null
   timeout = 50000
-  tradeTimeout = 50000
+  tradeTimeout = priceRole === 'candle' ? 75000 : 50000
   connectTime = 50000
   wsReconnect = 3500
   isCandle = priceRole === 'candle'

@@ -94,6 +94,9 @@ class BybitConnector extends CommonConnector {
   private bybitCandleCb(e: ExchangeEnum) {
     return (msg: any) => {
       if (msg.topic.includes('kline')) {
+        if (!msg?.data[0]?.confirm) {
+          return
+        }
         const [_, int, symbol] = msg.topic.split('.')
         if (int && symbol) {
           this.cbWsTrade(
