@@ -2,6 +2,7 @@ import * as hl from '@nktkas/hyperliquid'
 import { setMaxListeners } from 'events'
 
 import { ExchangeEnum, mapPaperToReal } from '../utils/common'
+import HyperliquidSymbolMap from '../utils/hyperliquidSymbols'
 import logger from '../utils/logger'
 import { IdMute, IdMutex } from '../utils/mutex'
 import CommonConnector from './common'
@@ -25,10 +26,7 @@ class HyperliquidConnector extends CommonConnector {
       interval: hl.WsCandleParameters['interval']
     }
   > = new Map()
-  /** Display name → API code, e.g. "PUMP-USDC" → "@20" */
-  private nameToCode: Map<string, string> = new Map()
-  /** API code → display name, e.g. "@20" → "PUMP-USDC" */
-  private codeToName: Map<string, string> = new Map()
+  private symbols = HyperliquidSymbolMap.getInstance()
   private hyperliquidClient: hl.SubscriptionClient =
     this.getHyperliquidClient('ticker')
   private hyperliquidClientCandle: {
@@ -76,7 +74,7 @@ class HyperliquidConnector extends CommonConnector {
       msg.s.startsWith('@') || msg.s.includes('/')
         ? ExchangeEnum.hyperliquid
         : ExchangeEnum.hyperliquidLinear
-    const symbol = this.codeToName.get(msg.s) ?? msg.s
+    const symbol = this.symbols.codeToPair(msg.s) ?? msg.s
     this.cbWsTrade(
       {
         e: 'kline',
@@ -369,10 +367,10 @@ class HyperliquidConnector extends CommonConnector {
   private metaRefreshTimer: NodeJS.Timeout | null = null
 
   async init() {
-    await this.fetchMeta()
+    await this.symbols.refresh()
     this.metaRefreshTimer = setInterval(
       () => {
-        this.fetchMeta()
+        this.symbols.refresh(true)
       },
       30 * 60 * 1000,
     )
@@ -385,66 +383,13 @@ class HyperliquidConnector extends CommonConnector {
   }
 
   /**
-   * Fetches spotMeta from the Hyperliquid REST API and builds the
-   * display-name ↔ @N mapping needed for candle subscriptions.
-   * Spot coins are referenced as @0, @1, … in the WS API but callers
-   * send display names like "PUMP-USDC".
-   */
-  private async fetchMeta() {
-    try {
-      const infoClient = new hl.InfoClient({
-        transport: new hl.HttpTransport({
-          isTestnet: process.env.HYPERLIQUID === 'demo',
-        }),
-      })
-      const newNameToCode = new Map<string, string>()
-      const newCodeToName = new Map<string, string>()
-      await infoClient
-        .spotMeta()
-        .then((result) => {
-          const pairs = result.universe
-          const tokens = result.tokens
-          pairs.map((d) => {
-            const base = tokens.find((t) => t.index === d.tokens[0])
-            const baseName = base?.name === 'UBTC' ? 'BTC' : base?.name
-            const quote = tokens.find((t) => t.index === d.tokens[1])
-            const displayName = `${baseName}-${quote?.name}`
-            newNameToCode.set(displayName, d.name)
-            newCodeToName.set(d.name, displayName)
-          })
-        })
-        .catch((e) => {
-          logger.error(`Failed to fetch Hyperliquid spotMeta: ${e}`)
-        })
-      await infoClient.meta().then((result) => {
-        const tokens = result.universe
-        tokens.map((t) => {
-          const displayName = `${t.name}-USDC`
-          newNameToCode.set(displayName, t.name)
-          newCodeToName.set(t.name, displayName)
-        })
-      })
-      // Only replace maps if we got data — on failure keep previous values.
-      if (newNameToCode.size > 0) {
-        this.nameToCode = newNameToCode
-        this.codeToName = newCodeToName
-        logger.info(
-          `Loaded ${this.nameToCode.size} symbol mappings from Hyperliquid`,
-        )
-      }
-    } catch (e) {
-      logger.error(
-        `Failed to fetch Hyperliquid meta (keeping ${this.nameToCode.size} existing mappings): ${e}`,
-      )
-    }
-  }
-
-  /**
-   * Translates a coin name to the format Hyperliquid's WS API expects.
-   * Spot display names (e.g. "PUMP-USDC") → "@20"; perps pass through.
+   * Translates a display pair to the wire coin format Hyperliquid's WS
+   * expects. Spot display names (e.g. "PUMP-USDC") → "@20"; HL native perps
+   * (e.g. "BTC-USDC") → "BTC"; builder-dex pairs are always prefixed
+   * `provider:BASE-QUOTE` (e.g. "xyz:HYUNDAI-USDC") → "xyz:HYUNDAI".
    */
   private toWsCoin(coin: string): string | undefined {
-    return this.nameToCode.get(coin)
+    return this.symbols.pairToCode(coin)
   }
 
   private stopHyperliquid() {
@@ -484,8 +429,31 @@ class HyperliquidConnector extends CommonConnector {
   private async initHyperliquidWS() {
     try {
       const client = this.hyperliquidClient
-      const unsubscribe = await client.allMids(this.hyperliquidTickerCb)
-      this.unsubscribeMap.set(`ticker`, [unsubscribe])
+      // Default allMids covers HL native (perp + spot). Builder-dex prices
+      // require a per-dex subscription with { dex } — multiplexed on the
+      // same socket. Each subscription gets a per-dex callback so events
+      // are only emitted by the listener whose dex matches the coin name.
+      const dexNames = this.symbols.getDexNames()
+      // The @nktkas SubscriptionClient fans every allMids event out to every
+      // registered listener (no filter on the `dex` payload). One real
+      // callback handles all events; the per-dex subs only exist so the
+      // server keeps emitting those dexes' mids over the same socket.
+      const noop = () => {}
+      const subs = await Promise.all([
+        client.allMids(this.hyperliquidTickerCb),
+        ...dexNames.map((dex) =>
+          client.allMids({ dex }, noop).catch((e) => {
+            logger.error(
+              `Hyperliquid allMids subscription failed for dex ${dex}: ${e?.message ?? e}`,
+            )
+            return null
+          }),
+        ),
+      ])
+      this.unsubscribeMap.set(
+        `ticker`,
+        subs.filter((s): s is hl.Subscription => s !== null),
+      )
     } catch {
       this.hyperliquidRestartCb()
     }
@@ -741,7 +709,7 @@ class HyperliquidConnector extends CommonConnector {
           coin.startsWith('@') || coin.includes('/')
             ? ExchangeEnum.hyperliquid
             : ExchangeEnum.hyperliquidLinear
-        const symbol = this.codeToName.get(coin) ?? coin
+        const symbol = this.symbols.codeToPair(coin) ?? coin
         const v: Ticker = {
           eventType: '24hrMiniTicker',
           eventTime: +new Date(),

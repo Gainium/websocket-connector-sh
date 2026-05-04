@@ -1,6 +1,6 @@
 {
   "name": "@gainium/websocket-connector",
-  "version": "1.5.4",
+  "version": "1.6.0",
   "description": "Websocket connector",
   "author": "Maksym Shamko",
   "private": true,
