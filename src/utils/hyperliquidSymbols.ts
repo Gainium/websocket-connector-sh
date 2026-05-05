@@ -12,6 +12,18 @@ const TOKEN_ALIASES: Record<string, string> = {
 }
 const aliasToken = (name: string): string => TOKEN_ALIASES[name] ?? name
 
+/**
+ * HIP-3 builder dexes let third-party deployers register arbitrary
+ * asset names. Names propagate into pair strings (Redis keys, file
+ * paths, URLs); names with '/', '..', spaces, control chars or
+ * non-ASCII have been observed in the wild causing path-traversal-
+ * shaped pairs (e.g. 'tndex:A B:C/../../../../../中'). Strict
+ * allowlist + explicit '..' rejection.
+ */
+const SAFE_IDENT = /^[A-Za-z0-9_.]{1,32}$/
+const isSafeIdent = (s: string): boolean =>
+  SAFE_IDENT.test(s) && !s.includes('..')
+
 type RawPerpDex = {
   name: string
   fullName?: string
@@ -63,6 +75,9 @@ class HyperliquidSymbolMap {
   private dexNames: Set<string> = new Set()
   private lastFetch = 0
   private fetchInterval = 20 * 60 * 1000
+  /** Backoff before retrying when the cache is empty after an attempt —
+   *  prevents every consumer call from re-fetching when meta() fails. */
+  private failureRetryInterval = 60 * 1000
   private fetching: Promise<void> | null = null
   private client = new hl.InfoClient({
     transport: new hl.HttpTransport({
@@ -94,11 +109,15 @@ class HyperliquidSymbolMap {
    */
   async refresh(force = false): Promise<void> {
     if (this.fetching) return this.fetching
-    if (
-      !force &&
-      this.lastFetch + this.fetchInterval > Date.now() &&
-      this.nameToCode.size > 0
-    ) {
+    // Use the regular interval if the cache is populated, a much shorter
+    // one when it's empty so we can recover from a transient failure
+    // without burning rate-limit budget. We do NOT bypass the guard just
+    // because the cache is empty — bypassing causes every caller to
+    // re-fetch on every request.
+    const sinceLast = Date.now() - this.lastFetch
+    const interval =
+      this.nameToCode.size > 0 ? this.fetchInterval : this.failureRetryInterval
+    if (!force && this.lastFetch && sinceLast < interval) {
       return
     }
     this.fetching = this._refresh().finally(() => {
@@ -127,41 +146,77 @@ class HyperliquidSymbolMap {
 
       // Futures: HL native + builder dexes via perpDexs(). Builder-dex pairs
       // are always prefixed `provider:BASE-QUOTE`; HL native stays unprefixed.
-      const perpDexs = (await this.client.perpDexs()) as RawPerpDex[]
+      // Hyperliquid testnet exposes thousands of (mostly empty) builder
+      // dexes, so on demo we skip the perpDexs() fan-out and only fetch
+      // HL native meta — otherwise the refresh never completes.
+      const isDemo = process.env.HYPERLIQUIDENV === 'demo'
+      const perpDexs: RawPerpDex[] = isDemo
+        ? [null]
+        : ((await this.client.perpDexs()) as RawPerpDex[])
       const newDexNames = new Set<string>()
       for (let i = 0; i < perpDexs.length; i++) {
         const dex = perpDexs[i]
-        const meta = (await (dex
-          ? this.client.meta({ dex: dex.name })
-          : this.client.meta())) as unknown as RawPerpsMeta
-        if (!meta.universe || meta.universe.length === 0) continue
-        if (dex) newDexNames.add(dex.name)
-        const collateralIdx = meta.collateralToken ?? 0
-        const quoteToken = spotTokens.find((t) => t.index === collateralIdx)
-        const quoteAsset = quoteToken?.name
-          ? aliasToken(quoteToken.name)
-          : 'USDC'
-        meta.universe.forEach((u) => {
-          const code = u.name
-          const baseRaw = dex ? (u.name.split(':')[1] ?? u.name) : u.name
-          const baseName = aliasToken(baseRaw)
-          const basePair = `${baseName}-${quoteAsset}`
-          const pair = dex ? `${dex.name}:${basePair}` : basePair
-          // HL native spot (e.g. UBTC/USDC → 'BTC-USDC') and HL native perp
-          // ('BTC-USDC') share a display pair. We process spot first, then
-          // futures, so this overwrite makes the futures wire code win on
-          // pairToCode lookups. codeToName keeps both since wire codes are
-          // unique ('@142' vs 'BTC').
-          newName.set(pair, code)
-          newCode.set(code, pair)
-        })
+        if (dex && !isSafeIdent(dex.name)) {
+          logger.warn(
+            `Hyperliquid skipping dex with unsafe name: ${JSON.stringify(dex.name)}`,
+          )
+          continue
+        }
+        // Per-dex try/catch — one bad dex must not poison the entire
+        // futures map (and leave consumers iterating only HL native).
+        try {
+          const meta = (await (dex
+            ? this.client.meta({ dex: dex.name })
+            : this.client.meta())) as unknown as RawPerpsMeta
+          if (!meta.universe || meta.universe.length === 0) continue
+          const collateralIdx = meta.collateralToken ?? 0
+          const quoteToken = spotTokens.find((t) => t.index === collateralIdx)
+          const quoteAsset = quoteToken?.name
+            ? aliasToken(quoteToken.name)
+            : 'USDC'
+          if (!isSafeIdent(quoteAsset)) {
+            logger.warn(
+              `Hyperliquid skipping ${dex?.name ?? 'native'}: unsafe quote ${JSON.stringify(quoteAsset)}`,
+            )
+            continue
+          }
+          if (dex) newDexNames.add(dex.name)
+          meta.universe.forEach((u) => {
+            const code = u.name
+            // Use slice so an asset name with extra colons isn't truncated
+            // (and ends up colliding with another asset's prefix).
+            const baseRaw =
+              dex && u.name.startsWith(`${dex.name}:`)
+                ? u.name.slice(dex.name.length + 1)
+                : u.name
+            const baseName = aliasToken(baseRaw)
+            if (!isSafeIdent(baseName)) {
+              logger.warn(
+                `Hyperliquid skipping unsafe asset: ${JSON.stringify(u.name)} (dex=${dex?.name ?? 'native'})`,
+              )
+              return
+            }
+            const basePair = `${baseName}-${quoteAsset}`
+            const pair = dex ? `${dex.name}:${basePair}` : basePair
+            // HL native spot (e.g. UBTC/USDC → 'BTC-USDC') and HL native
+            // perp ('BTC-USDC') share a display pair. We process spot
+            // first, then futures, so this overwrite makes the futures
+            // wire code win on pairToCode lookups. codeToName keeps both
+            // since wire codes are unique ('@142' vs 'BTC').
+            newName.set(pair, code)
+            newCode.set(code, pair)
+          })
+        } catch (e) {
+          logger.error(
+            `Hyperliquid meta failed for ${dex?.name ?? 'native'}: ${(e as Error)?.message ?? e}`,
+          )
+        }
       }
 
       if (newName.size > 0) {
         this.nameToCode = newName
         this.codeToName = newCode
         this.dexNames = newDexNames
-        this.lastFetch = Date.now()
         logger.info(
           `Loaded ${this.nameToCode.size} Hyperliquid symbol mappings`,
         )
@@ -170,6 +225,10 @@ class HyperliquidSymbolMap {
       logger.error(
         `Failed to refresh Hyperliquid symbol map (keeping ${this.nameToCode.size} existing): ${e}`,
       )
+    } finally {
+      // Mark "attempted" so the next refresh waits the failureRetryInterval
+      // when the cache is still empty, rather than re-fetching immediately.
+      this.lastFetch = Date.now()
     }
   }
 }

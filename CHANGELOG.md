@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.6.2] - 2026-05-05
+
+### Fixed
+- Hyperliquid handle infinite loop
+
 ## [1.6.1] - 2026-05-05
 
 ### Changed
