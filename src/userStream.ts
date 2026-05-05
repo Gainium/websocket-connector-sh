@@ -2664,7 +2664,17 @@ class UserConnector {
   ): Promise<(UserDataStreamEvent & { uniqueMessageId?: string })[]> {
     return await Promise.all(
       data
-        .filter((o) => o.order.cloid)
+        .filter((o) => {
+          if (!o.order.cloid) {
+            return
+          }
+          const isFilled = o.status === 'filled'
+          const get = hyperliquidExpirableMap.get(`${o.order.cloid}`)
+          if (isFilled && !get) {
+            return false
+          }
+          return true
+        })
         .map(async (order) => {
           const isFilled = order.status === 'filled'
           let filledSize = +order.order.origSz - +order.order.sz

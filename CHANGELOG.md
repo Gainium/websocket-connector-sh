@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.6.3] - 2026-05-05
+
+### Fixed
+- Hyperliquid do not send filled order updates if no fills
+
 ## [1.6.2] - 2026-05-05
 
 ### Fixed
