@@ -1882,20 +1882,57 @@ class UserConnector {
           api.provider,
         )
       ) {
+        // Hyperliquid caps simultaneous WS connections per IP at 10. Each
+        // user opens its own socket, so refuse to open an 11th — otherwise
+        // every user past the cap enters a reconnect storm that also burns
+        // through the "30 new connections / minute" limit. Counting from
+        // this.users (which already includes self via the saveUser above)
+        // and excluding self.
+        const HYPERLIQUID_USER_CAP = 10
+        const otherHl = this.users.filter(
+          (u) =>
+            u.id !== id &&
+            (u.provider === ExchangeEnum.hyperliquid ||
+              u.provider === ExchangeEnum.hyperliquidLinear),
+        )
+        if (otherHl.length >= HYPERLIQUID_USER_CAP) {
+          this.users = this.users.filter((u) => u.id !== id)
+          this.logger(
+            `Hyperliquid WS connection cap reached (${HYPERLIQUID_USER_CAP} active users). Refusing ${userId}/${id}.`,
+            true,
+          )
+          return
+        }
         /** Open stream and set callback  */
         try {
+          // Track cap-rejection closes so we slow the next reconnect down.
+          // Hyperliquid limits to 30 new WS connections per minute per IP;
+          // when a close reason is "Cannot open more than 10 connections",
+          // hammering at the lib's default cadence guarantees we exhaust
+          // that 30/min budget and stay rejected indefinitely.
+          let lastCapRejectAt = 0
           const transport = new hl.WebSocketTransport({
             url:
               process.env.HYPERLIQUIDENV === 'demo'
                 ? 'wss://api.hyperliquid-testnet.xyz/ws'
                 : 'wss://api.hyperliquid.xyz/ws',
             reconnect: {
-              maxRetries: 100,
-              connectionDelay: (attempt) =>
-                Math.min((1 << attempt) * 150, 10000),
+              maxRetries: 10,
+              connectionDelay: (attempt) => {
+                const base = Math.min(2 ** attempt * 1000, 60_000)
+                // If the most recent close was cap-related, force the
+                // next attempt to wait ≥60s so HL has time to drain.
+                if (Date.now() - lastCapRejectAt < 60_000) {
+                  return Math.max(base, 60_000)
+                }
+                return base
+              },
             },
           })
           transport.socket.onclose = (event) => {
+            if (event.reason?.includes('Cannot open more than')) {
+              lastCapRejectAt = Date.now()
+            }
             this.logger(`Hyperliquid closed: ${event.reason} ${id}`)
           }
           transport.socket.onerror = (event) => {
