@@ -3084,7 +3084,7 @@ class UserConnector {
       balances = Object.entries(data.flex_futures.currencies).map(
         ([currency, info]) => ({
           asset: maps.assetNameMap.get(currency) || currency,
-          free: `${(info as any).quantity}`,
+          free: `${(info as any).available}`,
           locked: `${(info as any).quantity - (info as any).available}`,
         }),
       )
