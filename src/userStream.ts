@@ -85,6 +85,9 @@ import Rabbit from './utils/rabbit'
 import { rabbitUsersStreamKey, serviceLogRedis } from '../type'
 import { RestClientV5 } from 'bybit-api'
 import ExpirableMap from './utils/expirableMap'
+import HyperliquidBalancer, {
+  workerQueueName,
+} from './utils/hyperliquidBalancer'
 
 const mutex = new IdMutex()
 
@@ -574,6 +577,27 @@ class UserConnector {
   /** Kraken last balance quantities to filter price-only updates */
   private krakenLastBalances: Map<string, number> = new Map()
   private subscribeMsgsMap: Map<string, OpenStreamInput> = new Map()
+  /** Process role. Three states:
+   *    - `worker`   : HL-only listener bound to `usersStream:worker:<id>`
+   *                   plus a Redis heartbeat. Used on dedicated HL boxes.
+   *    - `balancer` : listens on the shared `usersStreamAction` queue
+   *                   AND forwards HL events to configured workers via
+   *                   `HyperliquidBalancer`. The single entry point.
+   *    - `null`     : default. Existing logic untouched — listens on
+   *                   the shared queue, handles every event locally,
+   *                   no forwarding, no heartbeat, no rebalance. This
+   *                   is the legacy single-server deployment shape.
+   */
+  private role: 'worker' | 'balancer' | null =
+    process.env.USER_STREAM_ROLE === 'worker'
+      ? 'worker'
+      : process.env.USER_STREAM_ROLE === 'balancer'
+        ? 'balancer'
+        : null
+  private workerId = process.env.USER_STREAM_WORKER_ID ?? ''
+  private heartbeatSec = +(process.env.USER_STREAM_HL_HEARTBEAT_SEC ?? '30')
+  private hlBalancer = HyperliquidBalancer.getInstance()
+  private workerHeartbeatTimer: NodeJS.Timeout | null = null
   /** Constructor method
    * Determine class variables
    * Start server
@@ -590,7 +614,17 @@ class UserConnector {
     this.closeStreamCallback = this.closeStreamCallback.bind(this)
 
     if (!testMode) {
+      if (this.role === 'worker' && !this.workerId) {
+        throw new Error(
+          'USER_STREAM_ROLE=worker requires USER_STREAM_WORKER_ID',
+        )
+      }
       this.setupRabbit()
+      if (this.role === 'worker') {
+        void this.startWorkerHeartbeat()
+      } else if (this.role === 'balancer') {
+        void this.hlBalancer.init()
+      }
       this.redis?.publish(
         serviceLogRedis,
         JSON.stringify({ restart: 'userStream' }),
@@ -598,13 +632,61 @@ class UserConnector {
     }
   }
 
+  /**
+   * Worker mode: announce a fresh boot epoch and refresh a TTL'd
+   * heartbeat key every `heartbeatSec`. The balancer reads these
+   * to detect death (TTL expiry) and restart (boot-epoch change).
+   * Uses `redisSet` because the shared `redis` instance is reserved
+   * for pub/sub and will throw on regular commands.
+   */
+  private async startWorkerHeartbeat() {
+    if (!this.workerId) return
+    const bootEpoch = `${Date.now()}`
+    const ttl = this.heartbeatSec * 3
+    try {
+      await this.redisSet?.set(
+        `userStream:worker:${this.workerId}:boot`,
+        bootEpoch,
+      )
+      await this.redisSet?.set(`userStream:worker:${this.workerId}:hb`, '1', {
+        EX: ttl,
+      })
+    } catch (e) {
+      this.logger(`Worker heartbeat init failed: ${e}`, true)
+    }
+    if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer)
+    this.workerHeartbeatTimer = setInterval(() => {
+      this.redisSet
+        ?.set(`userStream:worker:${this.workerId}:hb`, '1', { EX: ttl })
+        .catch((e) => this.logger(`Worker heartbeat tick failed: ${e}`, true))
+    }, this.heartbeatSec * 1000)
+    this.logger(
+      `User-stream worker ${this.workerId} bootEpoch=${bootEpoch} hbInterval=${this.heartbeatSec}s queue=${workerQueueName(this.workerId)}`,
+    )
+  }
+
   private setupRabbit() {
+    const queue =
+      this.role === 'worker'
+        ? workerQueueName(this.workerId)
+        : rabbitUsersStreamKey
     this.rabbit?.listenWithCallback<
       | { event: 'open stream'; data: OpenStreamInput; uuid: string }
       | { event: 'close stream'; uuid: string }
     >(
-      rabbitUsersStreamKey,
-      (msg) => {
+      queue,
+      async (msg) => {
+        // Balancer mode: forward HL events to a worker before any
+        // local processing. `route` returns true only when it claimed
+        // the message (HL open or known HL uuid close); everything
+        // else falls through to the existing per-process handlers.
+        if (this.role === 'balancer' && this.hlBalancer.enabled()) {
+          const handled = await this.hlBalancer.route(msg).catch((e) => {
+            this.logger(`HL balancer route error: ${e}`, true)
+            return false
+          })
+          if (handled) return
+        }
         if (msg.event === 'open stream') {
           this.openStreamCallback(msg.data, msg.uuid)
         }

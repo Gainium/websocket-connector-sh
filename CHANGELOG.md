@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.7.0] - 2026-05-07
+
+### Added
+- Hyperliquid balancer
+
 ## [1.6.4] - 2026-05-06
 
 ### Fixed
