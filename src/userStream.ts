@@ -651,6 +651,7 @@ class UserConnector {
       await this.redisSet?.set(`userStream:worker:${this.workerId}:hb`, '1', {
         EX: ttl,
       })
+      await this.publishWorkerUserList(ttl)
     } catch (e) {
       this.logger(`Worker heartbeat init failed: ${e}`, true)
     }
@@ -659,9 +660,38 @@ class UserConnector {
       this.redisSet
         ?.set(`userStream:worker:${this.workerId}:hb`, '1', { EX: ttl })
         .catch((e) => this.logger(`Worker heartbeat tick failed: ${e}`, true))
+      this.publishWorkerUserList(ttl).catch((e) =>
+        this.logger(`Worker user-list publish failed: ${e}`, true),
+      )
     }, this.heartbeatSec * 1000)
     this.logger(
       `User-stream worker ${this.workerId} bootEpoch=${bootEpoch} hbInterval=${this.heartbeatSec}s queue=${workerQueueName(this.workerId)}`,
+    )
+  }
+
+  /**
+   * Publish the worker's current HL user-id list to Redis so the
+   * balancer can reconcile its in-memory `assignments` map against
+   * reality. Each tick the balancer reads this list to detect drift:
+   * an assignment the worker no longer has (lost close event, partial
+   * crash, etc.) gets dropped from the balancer's load count. Without
+   * this, balancer-side load drifts upward over time and either
+   * over-routes to a worker that's actually full or refuses to route
+   * to a worker that's actually empty.
+   */
+  private async publishWorkerUserList(ttl: number) {
+    if (!this.workerId || !this.redisSet) return
+    const ids = this.users
+      .filter(
+        (u) =>
+          u.provider === ExchangeEnum.hyperliquid ||
+          u.provider === ExchangeEnum.hyperliquidLinear,
+      )
+      .map((u) => u.id)
+    await this.redisSet.set(
+      `userStream:worker:${this.workerId}:users`,
+      JSON.stringify(ids),
+      { EX: ttl },
     )
   }
 
