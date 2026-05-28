@@ -4,6 +4,12 @@ import logger from './utils/logger'
 import { IdMute, IdMutex } from './utils/mutex'
 import RedisClient from './utils/redis'
 import RabbitClient from './utils/rabbit'
+import {
+  getEnabledSnapshot,
+  isAdminConfigEnabled,
+  isExchangeEnabled,
+  onAdminConfigChange,
+} from './utils/adminConfig'
 
 const priceRole = process.env.PRICEROLE
 
@@ -57,25 +63,117 @@ const exchanges = (process.env.PRICE_CONNECTOR_EXCHANGES || '')
   .split(',')
   .filter(Boolean)
 
+/**
+ * Worker family → its constituent ExchangeEnum variants. One Worker per
+ * family handles all variants (spot + futures within the same exchange).
+ * Used by both the env-flag fallback (PRICE_CONNECTOR_EXCHANGES) and
+ * the admin-config diff-and-react logic: a family worker is needed iff
+ * ANY of its variants is enabled.
+ */
+const FAMILY_VARIANTS: Record<string, ExchangeEnum[]> = {
+  bybit: [ExchangeEnum.bybit, ExchangeEnum.bybitCoinm, ExchangeEnum.bybitUsdm],
+  binance: [
+    ExchangeEnum.binance,
+    ExchangeEnum.binanceCoinm,
+    ExchangeEnum.binanceUsdm,
+    ExchangeEnum.binanceUS,
+  ],
+  okx: [ExchangeEnum.okx, ExchangeEnum.okxInverse, ExchangeEnum.okxLinear],
+  kucoin: [
+    ExchangeEnum.kucoin,
+    ExchangeEnum.kucoinInverse,
+    ExchangeEnum.kucoinLinear,
+  ],
+  bitget: [
+    ExchangeEnum.bitget,
+    ExchangeEnum.bitgetCoinm,
+    ExchangeEnum.bitgetUsdm,
+  ],
+  hyperliquid: [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidLinear],
+  kraken: [ExchangeEnum.kraken, ExchangeEnum.krakenUsdm],
+  coinbase: [ExchangeEnum.coinbase],
+}
+
+/** ExchangeEnum → which Worker key in this.workers handles it. */
+const VARIANT_TO_WORKER_KEY: Record<string, ExchangeEnum> = (() => {
+  const out: Record<string, ExchangeEnum> = {}
+  for (const [family, variants] of Object.entries(FAMILY_VARIANTS)) {
+    const workerKey = variants[0] // e.g. ExchangeEnum.bybit
+    void family
+    for (const v of variants) out[v] = workerKey
+  }
+  return out
+})()
+
 /** Connector class connects to every pair websocket stream separataly. This is a option to controll every pair socket stream, and reload it if necessary */
 class Connector {
   private redis = RedisClient.getInstance()
   private rabbit = new RabbitClient()
   private workers: Map<ExchangeEnum, Worker> = new Map()
   private subscribedCandlesMap: Map<ExchangeEnum, Set<string>> = new Map()
-  private isBinance = exchanges.length ? exchanges.includes('binance') : true
-  private isBinanceUS = exchanges.length
-    ? exchanges.includes('binanceus')
-    : true
-  private isBybit = exchanges.length ? exchanges.includes('bybit') : true
-  private isKucoin = exchanges.length ? exchanges.includes('kucoin') : true
-  private isOkx = exchanges.length ? exchanges.includes('okx') : true
-  private isCoinbase = exchanges.length ? exchanges.includes('coinbase') : true
-  private isBitget = exchanges.length ? exchanges.includes('bitget') : true
-  private isHyperliquid = exchanges.length
-    ? exchanges.includes('hyperliquid')
-    : true
-  private isKraken = exchanges.length ? exchanges.includes('kraken') : true
+
+  /**
+   * Is at least one variant in this family enabled?
+   *
+   * When admin-config has loaded a set (sh deployment with the Redis
+   * key present) it is the SOLE source of truth — the legacy
+   * `PRICE_CONNECTOR_EXCHANGES` env is ignored. This matches the
+   * operator's expectation: once you toggle exchanges in the Admin →
+   * Exchanges tab, the docker-sh `.env` line stops being consulted.
+   *
+   * When admin-config has no set (cloud builds, or sh before the
+   * admin-sh first-boot seed runs), fall back to the env: if
+   * `PRICE_CONNECTOR_EXCHANGES` is set we treat it as a family-level
+   * allow-list; otherwise every family is needed.
+   */
+  private isFamilyNeeded(family: string): boolean {
+    const variants = FAMILY_VARIANTS[family]
+    if (!variants) return false
+
+    const adminEnabled = getEnabledSnapshot()
+    if (adminEnabled !== null) {
+      // Admin-config is authoritative.
+      return variants.some((v) => adminEnabled.has(v))
+    }
+
+    // No admin-config set — fall back to env. binanceUS shares the
+    // family name 'binance' here, so we treat both env tokens as alias.
+    if (exchanges.length) {
+      return family === 'binance'
+        ? exchanges.includes('binance') || exchanges.includes('binanceus')
+        : exchanges.includes(family)
+    }
+    return true
+  }
+
+  get isBinance() {
+    return this.isFamilyNeeded('binance')
+  }
+  get isBinanceUS() {
+    return exchanges.length ? exchanges.includes('binanceus') : true
+  }
+  get isBybit() {
+    return this.isFamilyNeeded('bybit')
+  }
+  get isKucoin() {
+    return this.isFamilyNeeded('kucoin')
+  }
+  get isOkx() {
+    return this.isFamilyNeeded('okx')
+  }
+  get isCoinbase() {
+    return this.isFamilyNeeded('coinbase')
+  }
+  get isBitget() {
+    return this.isFamilyNeeded('bitget')
+  }
+  get isHyperliquid() {
+    return this.isFamilyNeeded('hyperliquid')
+  }
+  get isKraken() {
+    return this.isFamilyNeeded('kraken')
+  }
+
   constructor() {
     this.initWorker = this.initWorker.bind(this)
     if (isCandle || isAll) {
@@ -93,6 +191,47 @@ class Connector {
         `>🚀 Price <-> Backend stream | Listen to candlesRequests channel`,
       )
     }
+
+    if (isAdminConfigEnabled()) {
+      onAdminConfigChange(() => this.reconcileWorkers())
+    }
+  }
+
+  /**
+   * Reconcile this.workers against the current isFamilyNeeded() answers.
+   * Called once on init() (after admin-config sync completes) and on
+   * every admin-config change. Symbol re-subscription is the responsibility
+   * of upstream rabbit consumers — backend re-emits candlesRequests
+   * after restarts, so a freshly-spawned worker gets re-fed naturally.
+   */
+  private reconcileWorkers() {
+    for (const family of Object.keys(FAMILY_VARIANTS)) {
+      const variants = FAMILY_VARIANTS[family]
+      const workerKey = variants[0]
+      const needed = this.isFamilyNeeded(family)
+      const have = this.workers.has(workerKey)
+      if (needed && !have) {
+        logger.info(`admin-config: spawning ${family} worker`)
+        this.initWorker(workerKey)
+      } else if (!needed && have) {
+        logger.info(`admin-config: terminating ${family} worker`)
+        this.terminateFamily(workerKey)
+      }
+    }
+  }
+
+  /**
+   * Tear down a single family's worker. Suppresses the 'exit' handler's
+   * auto-restart so a deliberate termination doesn't immediately respawn.
+   */
+  private terminateFamily(workerKey: ExchangeEnum) {
+    const worker = this.workers.get(workerKey)
+    if (!worker) return
+    worker.removeAllListeners('exit')
+    worker.removeAllListeners('error')
+    void worker.terminate()
+    this.workers.delete(workerKey)
+    this.subscribedCandlesMap.delete(workerKey)
   }
 
   private subscribeCandleCb() {
@@ -110,106 +249,24 @@ class Connector {
         return
       }
       const exchange = mapPaperToReal(_exchange, false)
-      const bybitWorker = this.workers.get(ExchangeEnum.bybit)
-      const binanceWorker = this.workers.get(ExchangeEnum.binance)
-      const kucoinWorker = this.workers.get(ExchangeEnum.kucoin)
-      const okxWorker = this.workers.get(ExchangeEnum.okx)
-      const bitgetWorker = this.workers.get(ExchangeEnum.bitget)
-      const coinbaseWorker = this.workers.get(ExchangeEnum.coinbase)
-      const hyperliquidWorker = this.workers.get(ExchangeEnum.hyperliquid)
-      const krakenWorker = this.workers.get(ExchangeEnum.kraken)
-      if (
-        [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidLinear].includes(
-          exchange,
-        ) &&
-        hyperliquidWorker
-      ) {
-        hyperliquidWorker.postMessage({
-          do: 'subscribeCandle',
-          data: { symbol, interval, exchange },
-        })
+      // Variant-level admin-config gate: skip silently when the operator
+      // disabled this specific exchange (e.g. binanceUsdm) even though
+      // the family's worker may still be alive for sibling variants.
+      // In cloud builds isExchangeEnabled always returns true.
+      if (!isExchangeEnabled(exchange)) {
+        logger.info(
+          `Skip subscribe ${symbol} ${exchange} ${interval}: exchange disabled by host config`,
+        )
+        return
       }
-      if (
-        [
-          ExchangeEnum.bybit,
-          ExchangeEnum.bybitCoinm,
-          ExchangeEnum.bybitUsdm,
-        ].includes(exchange) &&
-        bybitWorker
-      ) {
-        bybitWorker.postMessage({
-          do: 'subscribeCandle',
-          data: { symbol, interval, exchange },
-        })
-      }
-      if (
-        [
-          ExchangeEnum.bitget,
-          ExchangeEnum.bitgetCoinm,
-          ExchangeEnum.bitgetUsdm,
-        ].includes(exchange) &&
-        bitgetWorker
-      ) {
-        bitgetWorker.postMessage({
-          do: 'subscribeCandle',
-          data: { symbol, interval, exchange },
-        })
-      }
-      if (
-        [
-          ExchangeEnum.binance,
-          ExchangeEnum.binanceCoinm,
-          ExchangeEnum.binanceUsdm,
-          ExchangeEnum.binanceUS,
-        ].includes(exchange) &&
-        binanceWorker
-      ) {
-        binanceWorker.postMessage({
-          do: 'subscribeCandle',
-          data: { symbol, interval, exchange },
-        })
-      }
-      if (
-        [
-          ExchangeEnum.okx,
-          ExchangeEnum.okxInverse,
-          ExchangeEnum.okxLinear,
-        ].includes(exchange) &&
-        okxWorker
-      ) {
-        okxWorker.postMessage({
-          do: 'subscribeCandle',
-          data: { symbol, interval, exchange },
-        })
-      }
-      if (
-        [
-          ExchangeEnum.kucoin,
-          ExchangeEnum.kucoinInverse,
-          ExchangeEnum.kucoinLinear,
-        ].includes(exchange) &&
-        kucoinWorker
-      ) {
-        kucoinWorker.postMessage({
-          do: 'subscribeCandle',
-          data: { symbol, interval, exchange },
-        })
-      }
-      if ([ExchangeEnum.coinbase].includes(exchange) && coinbaseWorker) {
-        coinbaseWorker.postMessage({
-          do: 'subscribeCandle',
-          data: { symbol, interval, exchange },
-        })
-      }
-      if (
-        [ExchangeEnum.kraken, ExchangeEnum.krakenUsdm].includes(exchange) &&
-        krakenWorker
-      ) {
-        krakenWorker.postMessage({
-          do: 'subscribeCandle',
-          data: { symbol, interval, exchange },
-        })
-      }
+      const workerKey = VARIANT_TO_WORKER_KEY[exchange]
+      if (!workerKey) return
+      const worker = this.workers.get(workerKey)
+      if (!worker) return
+      worker.postMessage({
+        do: 'subscribeCandle',
+        data: { symbol, interval, exchange },
+      })
     }
   }
 

@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.8.0] - 2026-05-28
+
+### Added
+- Self-hosted admin-config sync (gated by `ADMIN_CONFIG_ENABLED`). Reads
+  `gainium:admin:enabled_exchanges` from Redis, subscribes to
+  `gainium:admin:config` pubsub, and runs a 10s periodic refresh as a
+  safety net. When the flag is off (cloud / unflagged) every code path
+  is a hard no-op — no Redis subscriber, no timers, no log lines.
+
 ## [1.7.1] - 2026-05-27
 
 ### Fixed

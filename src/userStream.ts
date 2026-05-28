@@ -79,6 +79,11 @@ import {
 } from './utils/exchange'
 import { convertSymbol, convertSymbolToKucoin } from './utils/kucoin'
 import { ExchangeEnum, mapPaperToReal, wsLoggerOptions } from './utils/common'
+import {
+  isAdminConfigEnabled,
+  isExchangeEnabled,
+  onAdminConfigChange,
+} from './utils/adminConfig'
 import RedisClient from './utils/redis'
 import { v4 } from 'uuid'
 import Rabbit from './utils/rabbit'
@@ -629,7 +634,36 @@ class UserConnector {
         serviceLogRedis,
         JSON.stringify({ restart: 'userStream' }),
       )
+      if (isAdminConfigEnabled()) {
+        onAdminConfigChange(() => this.dropStreamsForDisabledExchanges())
+      }
     }
+  }
+
+  /**
+   * Close + remove user-streams whose provider was disabled by the
+   * operator. Idempotent — only acts on streams that are still in
+   * `this.users`. Errors during close() are swallowed so a stuck WS
+   * doesn't block the rest of the cleanup.
+   */
+  private dropStreamsForDisabledExchanges() {
+    const survivors: typeof this.users = []
+    for (const user of this.users) {
+      const real = mapPaperToReal(user.provider, false)
+      if (isExchangeEnabled(real)) {
+        survivors.push(user)
+        continue
+      }
+      this.logger(
+        `Closing user-stream for disabled exchange ${real} (user ${user.id.slice(0, 8)})`,
+      )
+      try {
+        user.close()
+      } catch (err) {
+        this.logger(`user.close() threw: ${err}`, true)
+      }
+    }
+    this.users = survivors
   }
 
   /**
@@ -821,6 +855,17 @@ class UserConnector {
     ) {
       return this.logger(
         'Socket only supports Binance(US), Kucoin, FTX(US), ByBit, OKX, Bitget, Coinbase and MEXC',
+        true,
+      )
+    }
+    // Self-hosted only — reject user-key subscribes for exchanges the
+    // operator disabled. The real exchange (post-paper-mapping) is what
+    // the WS would actually connect to. In cloud builds isExchangeEnabled
+    // always returns true so this branch is inert.
+    const realProvider = mapPaperToReal(msg.api.provider, false)
+    if (!isExchangeEnabled(realProvider)) {
+      return this.logger(
+        `Skip user-stream subscribe for ${realProvider}: exchange disabled by host config`,
         true,
       )
     }

@@ -3,6 +3,10 @@ import logger from './src/utils/logger'
 import sleep from './src/utils/sleep'
 import { skipReason } from './type'
 import HealthServer from './src/utils/healthServer'
+import {
+  isAdminConfigEnabled,
+  startAdminConfigSync,
+} from './src/utils/adminConfig'
 
 // Start health server for Docker health checks
 const healthServer = new HealthServer()
@@ -22,7 +26,16 @@ const getStream = () => {
   return str
 }
 
-let stream = getStream()
+let stream: Connector | null = null
+
+async function main() {
+  if (isAdminConfigEnabled()) {
+    await startAdminConfigSync()
+  }
+  stream = getStream()
+}
+
+void main()
 
 let lock = false
 
@@ -57,7 +70,7 @@ process
       retry = 1
     }
     retryStart = time
-    stream.stop()
+    stream?.stop()
     stream = getStream()
   })
   .on('uncaughtException', async (err) => {
@@ -92,6 +105,6 @@ process
       retry = 1
     }
     retryStart = time
-    stream.stop()
+    stream?.stop()
     stream = getStream()
   })

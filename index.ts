@@ -3,10 +3,18 @@ import logger from './src/utils/logger'
 import sleep from './src/utils/sleep'
 import { skipReason } from './type'
 import HealthServer from './src/utils/healthServer'
+import {
+  isAdminConfigEnabled,
+  startAdminConfigSync,
+} from './src/utils/adminConfig'
 
 // Start health server for Docker health checks
 const healthServer = new HealthServer()
 healthServer.start()
+
+if (isAdminConfigEnabled()) {
+  void startAdminConfigSync()
+}
 
 export const stream = new Connector()
 
