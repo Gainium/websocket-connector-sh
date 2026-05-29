@@ -20,6 +20,9 @@ const logger = {
   info: (...msg: any[]) => {
     log('info', ...msg)
   },
+  debug: (...msg: any[]) => {
+    log('info', ...msg)
+  },
 }
 
 export default logger

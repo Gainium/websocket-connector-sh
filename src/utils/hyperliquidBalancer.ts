@@ -45,9 +45,20 @@ export const isHyperliquidExchange = (e: ExchangeEnum | undefined): boolean =>
 const ASSIGN_PREFIX = 'userStream:assignment:'
 const WORKER_BOOT_KEY = (id: string) => `userStream:worker:${id}:boot`
 const WORKER_HB_KEY = (id: string) => `userStream:worker:${id}:hb`
+const WORKER_CAP_KEY = (id: string) => `userStream:worker:${id}:cap`
 const WORKER_USERS_KEY = (id: string) => `userStream:worker:${id}:users`
 const LAST_BOOT_KEY = (id: string) => `userStream:lastBoot:${id}`
 export const workerQueueName = (id: string) => `usersStream:worker:${id}`
+
+/** Worker's reply to an `open stream` RPC from the balancer. */
+export type WorkerOpenResponse = {
+  accepted: boolean
+  /** Populated on accepted=false. 'cap' = worker is at the 10-cap.
+   *  'error' = an exception was raised processing the open. */
+  reason?: 'cap' | 'error'
+  workerId?: string
+  message?: string
+}
 
 type Assignment = {
   workerId: string
@@ -94,6 +105,11 @@ class HyperliquidBalancer {
   private assignments = new Map<string, Assignment>()
   /** workerId → last-seen bootEpoch. Tracks restart detection. */
   private workerBoot = new Map<string, string>()
+  private workerCapMap = new Map<string, number>()
+  private selectionCounter = new Map<string, number>()
+  private rpcTimeoutMs = +(
+    process.env.USER_STREAM_HL_RPC_TIMEOUT_MS ?? 5 * 60 * 1000
+  )
   private watchdog: NodeJS.Timeout | null = null
   private initialized = false
 
@@ -101,7 +117,7 @@ class HyperliquidBalancer {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
-  private workerCap = +(process.env.USER_STREAM_HL_WORKER_CAP ?? '10')
+  private defaultWorkerCap = +(process.env.USER_STREAM_HL_WORKER_CAP ?? '10')
   private heartbeatSec = +(process.env.USER_STREAM_HL_HEARTBEAT_SEC ?? '30')
 
   /** True when at least one worker is configured — i.e. balancer should
@@ -138,37 +154,73 @@ class HyperliquidBalancer {
   // routing is cheap (an in-memory map update + one rabbit send + one
   // redis set), so the throughput hit is negligible.
   @IdMute(routeMutex, () => 'route')
-  async routeOpen(uuid: string, payload: unknown): Promise<boolean> {
+  async routeOpen(
+    uuid: string,
+    payload: Record<string, unknown>,
+  ): Promise<boolean> {
     if (!this.enabled()) return false
-    let target: string | null = this.assignments.get(uuid)?.workerId ?? null
-    if (!target || !(await this.alive(target))) {
-      target = await this.leastLoadedAlive()
-    }
-    if (!target) {
-      logger.error(
-        `Hyperliquid balancer: no healthy worker available for ${uuid}; open dropped`,
+    const tried = new Set<string>()
+    let lastReason: string | undefined
+    while (tried.size < this.workers.length) {
+      let target: string | null = null
+      // Prefer the existing assignment if it's alive and not yet tried.
+      if (tried.size === 0) {
+        const existingTarget = this.assignments.get(uuid)?.workerId
+        if (
+          existingTarget &&
+          !tried.has(existingTarget) &&
+          (await this.alive(existingTarget))
+        ) {
+          target = existingTarget
+        }
+      }
+      if (!target) target = await this.leastLoadedAlive(tried)
+      if (!target) break
+
+      const assignment: Assignment = { workerId: target, openPayload: payload }
+      // Provisionally update the in-memory load so concurrent (sub-tick)
+      // reads through `loadByWorker()` see this user; the mutex already
+      // serialises us, but this keeps state coherent if we yield.
+      this.assignments.set(uuid, assignment)
+
+      const result = await this.rabbit.sendWithCallback<
+        Record<string, unknown>,
+        WorkerOpenResponse
+      >(workerQueueName(target), payload, this.rpcTimeoutMs)
+
+      if (result?.response?.accepted) {
+        await this.redisSet.set(
+          `${ASSIGN_PREFIX}${uuid}`,
+          JSON.stringify(assignment),
+        )
+        const load = this.loadByWorker().get(target) ?? 0
+        const retryNote = tried.size
+          ? ` (after retries through ${[...tried].join(',')})`
+          : ''
+        logger.info(
+          `Hyperliquid routed open ${uuid} → ${target} (load ${load}/${this.capFor(target)})${retryNote}`,
+        )
+        return true
+      }
+
+      // Rejected — undo the provisional assignment, record the worker
+      // as tried, retry the loop.
+      this.assignments.delete(uuid)
+      tried.add(target)
+      lastReason = result?.response?.reason ?? 'unknown'
+      logger.warn(
+        `Hyperliquid worker ${target} rejected ${uuid} (reason=${lastReason}${result?.response?.message ? `, ${result?.response?.message}` : ''}); will retry`,
       )
-      return false
     }
-    const assignment: Assignment = { workerId: target, openPayload: payload }
-    // Update in-memory state synchronously before any awaits so the
-    // mutex-guarded section reflects the new load immediately. The
-    // mutex already prevents concurrent leastLoadedAlive races, but
-    // setting first also keeps the load consistent if a future caller
-    // bypasses the mutex (defensive). Persist to redis after the rabbit
-    // send so a balancer crash between rabbit and redis leaves no
-    // orphaned redis entry without a corresponding worker subscription.
-    this.assignments.set(uuid, assignment)
-    await this.rabbit.send(workerQueueName(target), payload)
-    await this.redisSet.set(
-      `${ASSIGN_PREFIX}${uuid}`,
-      JSON.stringify(assignment),
+
+    logger.error(
+      `Hyperliquid balancer: open ${uuid} dropped${
+        tried.size
+          ? ` after every worker rejected (${[...tried].join(',')}, lastReason=${lastReason})`
+          : ` — no healthy worker available`
+      }`,
     )
-    const load = this.loadByWorker().get(target) ?? 0
-    logger.info(
-      `Hyperliquid routed open ${uuid} → ${target} (load ${load}/${this.workerCap})`,
-    )
-    return true
+    return false
   }
 
   @IdMute(routeMutex, () => 'route')
@@ -225,11 +277,14 @@ class HyperliquidBalancer {
     for (const id of this.workers) {
       const boot = await this.redisSet.get(WORKER_BOOT_KEY(id))
       const hb = await this.redisSet.get(WORKER_HB_KEY(id))
+      const capRaw = await this.redisSet.get(WORKER_CAP_KEY(id))
+      const cap = capRaw ? +capRaw : NaN
+      if (Number.isFinite(cap) && cap > 0) this.workerCapMap.set(id, cap)
       const prev = this.workerBoot.get(id)
       const counts = this.loadByWorker()
       const load = counts.get(id) ?? 0
       if (!hb) {
-        states.push(`${id}=dead(load=${load})`)
+        states.push(`${id}=dead(load=${load}/${this.capFor(id)})`)
         // No heartbeat — worker is dead (or never started). If we
         // previously saw it alive we have users to redistribute.
         if (prev) {
@@ -241,7 +296,7 @@ class HyperliquidBalancer {
         continue
       }
       if (!boot) {
-        states.push(`${id}=hb-no-boot(load=${load})`)
+        states.push(`${id}=hb-no-boot(load=${load}/${this.capFor(id)})`)
         continue // unusual, skip until next tick
       }
       if (!prev) {
@@ -251,7 +306,7 @@ class HyperliquidBalancer {
         // works only when we have an established baseline.
         this.workerBoot.set(id, boot)
         await this.redisSet.set(LAST_BOOT_KEY(id), boot)
-        states.push(`${id}=alive-new(load=${load})`)
+        states.push(`${id}=alive-new(load=${load}/${this.capFor(id)})`)
         await this.reconcileWorkerAssignments(id)
         continue
       }
@@ -262,7 +317,7 @@ class HyperliquidBalancer {
         await this.resendTo(id)
         this.workerBoot.set(id, boot)
         await this.redisSet.set(LAST_BOOT_KEY(id), boot)
-        states.push(`${id}=restarted(load=${load})`)
+        states.push(`${id}=restarted(load=${load}/${this.capFor(id)})`)
         await this.reconcileWorkerAssignments(id)
         continue
       }
@@ -273,7 +328,7 @@ class HyperliquidBalancer {
       // catches it. Recompute load after reconciliation for the log.
       await this.reconcileWorkerAssignments(id)
       const recountedLoad = this.loadByWorker().get(id) ?? 0
-      states.push(`${id}=alive(load=${recountedLoad})`)
+      states.push(`${id}=alive(load=${recountedLoad}/${this.capFor(id)})`)
     }
     logger.info(`Hyperliquid balancer tick: ${states.join(' ')}`)
   }
@@ -386,19 +441,58 @@ class HyperliquidBalancer {
   // Worker selection                                                 //
   // ---------------------------------------------------------------- //
 
-  private async leastLoadedAlive(exclude?: string): Promise<string | null> {
+  /** Worker's effective HL cap. Falls back to `defaultWorkerCap` when
+   *  the worker hasn't yet published its `:cap` key (cold start, or
+   *  legacy worker that doesn't publish). */
+  private capFor(workerId: string): number {
+    return this.workerCapMap.get(workerId) ?? this.defaultWorkerCap
+  }
+
+  /**
+   * Pick the alive worker with the lowest load/cap ratio.
+   */
+  private async leastLoadedAlive(
+    exclude?: string | Set<string>,
+  ): Promise<string | null> {
+    const excludeSet =
+      exclude instanceof Set
+        ? exclude
+        : exclude
+          ? new Set([exclude])
+          : new Set<string>()
     const counts = this.loadByWorker()
-    let best: string | null = null
-    let bestLoad = this.workerCap
+    let bestRatio = Infinity
     for (const id of this.workers) {
-      if (id === exclude) continue
+      if (excludeSet.has(id)) continue
       if (!(await this.alive(id))) continue
       const load = counts.get(id) ?? 0
-      if (load >= this.workerCap) continue
-      if (load < bestLoad) {
-        bestLoad = load
+      const cap = this.capFor(id)
+      if (load >= cap) continue
+      const ratio = load / cap
+      if (ratio < bestRatio) bestRatio = ratio
+    }
+    if (!Number.isFinite(bestRatio)) return null
+    const EPS = 1e-9
+    let best: string | null = null
+    let bestCounter = Infinity
+    for (const id of this.workers) {
+      if (excludeSet.has(id)) continue
+      if (!(await this.alive(id))) continue
+      const load = counts.get(id) ?? 0
+      const cap = this.capFor(id)
+      if (load >= cap) continue
+      if (Math.abs(load / cap - bestRatio) > EPS) continue
+      const counter = this.selectionCounter.get(id) ?? 0
+      if (counter < bestCounter) {
+        bestCounter = counter
         best = id
       }
+    }
+    if (best) {
+      this.selectionCounter.set(
+        best,
+        (this.selectionCounter.get(best) ?? 0) + 1,
+      )
     }
     return best
   }

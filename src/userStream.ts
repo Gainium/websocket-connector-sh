@@ -92,7 +92,15 @@ import { RestClientV5 } from 'bybit-api'
 import ExpirableMap from './utils/expirableMap'
 import HyperliquidBalancer, {
   workerQueueName,
+  type WorkerOpenResponse,
 } from './utils/hyperliquidBalancer'
+import {
+  hyperliquidIpStatus,
+  installHyperliquidIpRotation,
+  releaseHyperliquidIp,
+  reserveHyperliquidIp,
+} from './utils/hyperliquidIpRotation'
+import { HyperliquidUserClient } from './utils/hyperliquidUserClient'
 
 const mutex = new IdMutex()
 
@@ -546,6 +554,8 @@ export type PaperBalance = {
   balance: { asset: string; free: number; locked: number }[]
 }
 
+let HYPERLIQUID_USER_CAP = 10
+
 const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
   5 * 60 * 60 * 1000,
   true,
@@ -624,6 +634,15 @@ class UserConnector {
           'USER_STREAM_ROLE=worker requires USER_STREAM_WORKER_ID',
         )
       }
+      if (this.role === 'worker') {
+        const { ips, cap } = installHyperliquidIpRotation()
+        HYPERLIQUID_USER_CAP = cap
+        this.logger(
+          `Worker effective HL cap=${cap} across ${ips.length} IPv4 [${
+            ips.join(',') || '<none>'
+          }]`,
+        )
+      }
       this.setupRabbit()
       if (this.role === 'worker') {
         void this.startWorkerHeartbeat()
@@ -677,6 +696,7 @@ class UserConnector {
     if (!this.workerId) return
     const bootEpoch = `${Date.now()}`
     const ttl = this.heartbeatSec * 3
+    const hlCap = HYPERLIQUID_USER_CAP
     try {
       await this.redisSet?.set(
         `userStream:worker:${this.workerId}:boot`,
@@ -685,18 +705,37 @@ class UserConnector {
       await this.redisSet?.set(`userStream:worker:${this.workerId}:hb`, '1', {
         EX: ttl,
       })
+      await this.redisSet?.set(
+        `userStream:worker:${this.workerId}:cap`,
+        `${hlCap}`,
+        { EX: ttl },
+      )
       await this.publishWorkerUserList(ttl)
     } catch (e) {
       this.logger(`Worker heartbeat init failed: ${e}`, true)
     }
     if (this.workerHeartbeatTimer) clearInterval(this.workerHeartbeatTimer)
+    let tick = 0
     this.workerHeartbeatTimer = setInterval(() => {
       this.redisSet
         ?.set(`userStream:worker:${this.workerId}:hb`, '1', { EX: ttl })
         .catch((e) => this.logger(`Worker heartbeat tick failed: ${e}`, true))
+      this.redisSet
+        ?.set(`userStream:worker:${this.workerId}:cap`, `${hlCap}`, { EX: ttl })
+        .catch((e) => this.logger(`Worker cap publish failed: ${e}`, true))
       this.publishWorkerUserList(ttl).catch((e) =>
         this.logger(`Worker user-list publish failed: ${e}`, true),
       )
+      // Every 10th tick, log per-IP HL socket load. No-op when single-IP.
+      if (++tick % 10 === 0) {
+        const status = hyperliquidIpStatus()
+        if (status.ips.length > 1) {
+          const parts = status.ips.map(
+            (ip) => `${ip}=${status.load[ip] ?? 0}/${status.perIpCap}`,
+          )
+          this.logger(`HL IP load: ${parts.join(' ')}`)
+        }
+      }
     }, this.heartbeatSec * 1000)
     this.logger(
       `User-stream worker ${this.workerId} bootEpoch=${bootEpoch} hbInterval=${this.heartbeatSec}s queue=${workerQueueName(this.workerId)}`,
@@ -734,12 +773,18 @@ class UserConnector {
       this.role === 'worker'
         ? workerQueueName(this.workerId)
         : rabbitUsersStreamKey
+    type RabbitOpenMsg = {
+      event: 'open stream'
+      data: OpenStreamInput
+      uuid: string
+    }
+    type RabbitCloseMsg = { event: 'close stream'; uuid: string }
     this.rabbit?.listenWithCallback<
-      | { event: 'open stream'; data: OpenStreamInput; uuid: string }
-      | { event: 'close stream'; uuid: string }
+      RabbitOpenMsg | RabbitCloseMsg,
+      WorkerOpenResponse | undefined
     >(
       queue,
-      async (msg) => {
+      async (msg): Promise<WorkerOpenResponse | undefined> => {
         // Balancer mode: forward HL events to a worker before any
         // local processing. `route` returns true only when it claimed
         // the message (HL open or known HL uuid close); everything
@@ -749,14 +794,51 @@ class UserConnector {
             this.logger(`HL balancer route error: ${e}`, true)
             return false
           })
-          if (handled) return
+          if (handled) return undefined
         }
+
         if (msg.event === 'open stream') {
+          const isHl =
+            msg.data?.api?.provider === ExchangeEnum.hyperliquid ||
+            msg.data?.api?.provider === ExchangeEnum.hyperliquidLinear
+
+          // Worker RPC pre-check: if this would push us over the 10-cap
+          // for a new (not yet tracked) HL user, reject before doing
+          // any setup so the balancer can route to another worker.
+          if (isHl && this.role === 'worker') {
+            const alreadyTracked = this.users.some((u) => u.id === msg.uuid)
+            const hlCount = this.users.filter(
+              (u) =>
+                u.provider === ExchangeEnum.hyperliquid ||
+                u.provider === ExchangeEnum.hyperliquidLinear,
+            ).length
+            if (!alreadyTracked && hlCount >= HYPERLIQUID_USER_CAP) {
+              this.logger(
+                `HL cap pre-check failed (have ${hlCount}/${HYPERLIQUID_USER_CAP}); rejecting ${msg.uuid}`,
+              )
+              return {
+                accepted: false,
+                reason: 'cap',
+                workerId: this.workerId,
+              }
+            }
+          }
+
           this.openStreamCallback(msg.data, msg.uuid)
+          if (isHl && this.role === 'worker') {
+            this.logger(`HL worker accepted open ${msg.uuid}`)
+            return { accepted: true, workerId: this.workerId }
+          }
+          return undefined
         }
+
         if (msg.event === 'close stream') {
           this.closeStreamCallback(msg.uuid)
+          if (this.role === 'worker') {
+            return { accepted: true, workerId: this.workerId }
+          }
         }
+        return undefined
       },
       0,
     )
@@ -2044,8 +2126,9 @@ class UserConnector {
         // every user past the cap enters a reconnect storm that also burns
         // through the "30 new connections / minute" limit. Counting from
         // this.users (which already includes self via the saveUser above)
-        // and excluding self.
-        const HYPERLIQUID_USER_CAP = 10
+        // and excluding self. In worker mode the balancer does a stricter
+        // pre-check via RPC before this point; this is the safety net for
+        // legacy single-host runs and for the rare worker-side race.
         const otherHl = this.users.filter(
           (u) =>
             u.id !== id &&
@@ -2068,71 +2151,70 @@ class UserConnector {
           // hammering at the lib's default cadence guarantees we exhaust
           // that 30/min budget and stay rejected indefinitely.
           let lastCapRejectAt = 0
-          const transport = new hl.WebSocketTransport({
-            url:
-              process.env.HYPERLIQUIDENV === 'demo'
-                ? 'wss://api.hyperliquid-testnet.xyz/ws'
-                : 'wss://api.hyperliquid.xyz/ws',
-            reconnect: {
-              maxRetries: 10,
-              connectionDelay: (attempt) => {
-                const base = Math.min(2 ** attempt * 1000, 60_000)
-                // If the most recent close was cap-related, force the
-                // next attempt to wait ≥60s so HL has time to drain.
-                if (Date.now() - lastCapRejectAt < 60_000) {
-                  return Math.max(base, 60_000)
-                }
-                return base
-              },
+          const hlUrl =
+            process.env.HYPERLIQUIDENV === 'demo'
+              ? 'wss://api.hyperliquid-testnet.xyz/ws'
+              : 'wss://api.hyperliquid.xyz/ws'
+          // Custom minimal client replaces @nktkas's SubscriptionClient
+          // for the user-stream path. See `hyperliquidUserClient.ts` for
+          // the rationale — the library's `ReconnectingWebSocket` +
+          // `WebSocketAsyncRequest` layers were swallowing the
+          // subscribe-ack on multi-IP workers and never resolving
+          // `orderUpdates`. Protocol is small enough to handle directly.
+          const hlClient = new HyperliquidUserClient({
+            url: hlUrl,
+            user: api.key as `0x${string}`,
+            tag: id,
+            pickLocalAddress: reserveHyperliquidIp,
+            releaseLocalAddress: releaseHyperliquidIp,
+            onOpen: ({ boundLocalAddress }) => {
+              const ipTag = boundLocalAddress ? ` via=${boundLocalAddress}` : ''
+              this.logger(`Hyperliquid connected ${id}${ipTag}`)
+            },
+            onClose: ({ reason, boundLocalAddress }) => {
+              if (reason?.includes('Cannot open more than')) {
+                lastCapRejectAt = Date.now()
+              }
+              const ipTag = boundLocalAddress ? ` via=${boundLocalAddress}` : ''
+              this.logger(`Hyperliquid closed: ${reason} ${id}${ipTag}`)
+            },
+            onError: (err) => {
+              const ip = hlClient.getBoundLocalAddress()
+              const ipTag = ip ? ` via=${ip}` : ''
+              const msg = err instanceof Error ? err.message : `${err}`
+              this.logger(`Hyperliquid error: ${msg} ${id}${ipTag}`, true)
+            },
+            onOrderUpdates: async (msgs) => {
+              const prepared = await this.prepareHyperliquidOrder(
+                msgs as hl.OrderStatus<hl.Order>[],
+              )
+              prepared.map((o) => this.userStreamEvent(id, o))
+            },
+            onUserFills: (data) => {
+              if (data.isSnapshot) return
+              for (const f of data.fills as hl.WsUserFills['fills']) {
+                if (!f.cloid) continue
+                const get = hyperliquidExpirableMap.get(f.cloid) ?? []
+                get.push(f)
+                hyperliquidExpirableMap.set(f.cloid, get)
+              }
+            },
+            getReconnectDelay: (attempt) => {
+              const base = Math.min(2 ** attempt * 1000, 60_000)
+              // If the most recent close was cap-related, force the
+              // next attempt to wait ≥60s so HL has time to drain its
+              // per-IP 30/min budget.
+              if (Date.now() - lastCapRejectAt < 60_000) {
+                return Math.max(base, 60_000)
+              }
+              return base
             },
           })
-          transport.socket.onclose = (event) => {
-            if (event.reason?.includes('Cannot open more than')) {
-              lastCapRejectAt = Date.now()
-            }
-            this.logger(`Hyperliquid closed: ${event.reason} ${id}`)
-          }
-          transport.socket.onerror = (event) => {
-            this.logger(
-              `Hyperliquid error: ${JSON.stringify(event)} ${id}`,
-              true,
-            )
-          }
-          transport.socket.onopen = () => {
-            this.logger(`Hyperliquid connected ${id}`)
-          }
-          /** New exchange instance */
-          const client = new hl.SubscriptionClient({
-            transport,
-          })
 
-          const close = (
-            await client.orderUpdates(
-              { user: api.key as `0x${string}` },
-              async (msg) =>
-                (await this.prepareHyperliquidOrder(msg)).map((o) =>
-                  this.userStreamEvent(id, o),
-                ),
-            )
-          ).unsubscribe
-
-          client.userFills({ user: api.key as `0x${string}` }, (data) => {
-            if (data.isSnapshot) {
-              return
-            }
-            for (const f of data.fills) {
-              if (!f.cloid) {
-                continue
-              }
-              const get = hyperliquidExpirableMap.get(f.cloid) ?? []
-              get.push(f)
-              hyperliquidExpirableMap.set(f.cloid, get)
-            }
-          })
+          await hlClient.start(15_000)
 
           const closeFn = async () => {
-            await close()
-            transport.close()
+            hlClient.close()
           }
 
           /** Save user id and close function in users array */
