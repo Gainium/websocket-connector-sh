@@ -4,6 +4,7 @@
   "description": "Websocket connector",
   "author": "Maksym Shamko",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "push": "git push origin main",
     "pull": "git pull origin main",

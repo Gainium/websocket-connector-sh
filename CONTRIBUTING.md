@@ -1,634 +1,100 @@
-# Contributing to WebSocket Connector
+# Contributing
 
-Thank you for your interest in contributing to the WebSocket Connector service! This document provides guidelines and instructions for contributing to this project.
+Thanks for your interest in contributing! This project is licensed under
+the **MIT License** (see [`LICENSE`](./LICENSE)). To keep the contribution
+chain of trust clear and to certify that you have the right to submit the
+code you contribute, **every commit must be signed off** using the
+Developer Certificate of Origin (DCO).
 
-## Table of Contents
+## Sign-off — required on every commit
 
-- [Development Setup](#development-setup)
-- [Project Structure](#project-structure)
-- [Adding New Exchanges](#adding-new-exchanges)
-- [Coding Standards](#coding-standards)
-- [Testing Guidelines](#testing-guidelines)
-- [Pull Request Process](#pull-request-process)
-- [WebSocket Implementation Guidelines](#websocket-implementation-guidelines)
-
-## Development Setup
-
-### Prerequisites
-
-- Node.js 16+
-- npm 8+
-- TypeScript 5.8+
-- Redis server
-- RabbitMQ server
-- Git
-
-### Initial Setup
-
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd websocket-connector-sh
-   ```
-
-2. **Install dependencies**
-   ```bash
-   npm install
-   ```
-
-3. **Environment Configuration**
-   ```bash
-   cp .env.sample .env
-   # Edit .env with your configuration
-   ```
-
-4. **Build the project**
-   ```bash
-   npm run build
-   ```
-
-5. **Run the services**
-   ```bash
-   # Terminal 1: User streams
-   npm run main
-   
-   # Terminal 2: Price streams
-   npm run price
-   ```
-
-### Available Scripts
+Add the `-s` flag every time you commit:
 
 ```bash
-# Development
-npm run build              # Build TypeScript to JavaScript
-npm run main               # Run user stream connector
-npm run price              # Run price stream connector
-
-# Code Quality
-npm run lint               # Run ESLint and TypeScript checks
-npm run lint:fix           # Fix ESLint issues
-
-# Maintenance
-npm run fullInit           # Full initialization with KuCoin API
-npm run push               # Git push to main
-npm run pull               # Git pull from main
+git commit -s -m "your commit message"
 ```
 
-## Project Structure
+This appends a `Signed-off-by:` line to your commit message that looks like:
 
 ```
-websocket-connector-sh/
-├── src/
-│   ├── index.js                    # User stream entry point
-│   ├── index.price.js              # Price stream entry point
-│   ├── userStream.ts               # Main user stream connector
-│   ├── priceConnector.ts           # Price stream connector
-│   ├── price/                      # Price stream implementations
-│   │   ├── service.ts              # Price service coordinator
-│   │   ├── worker.js               # Worker thread implementation
-│   │   ├── types.ts                # Price stream type definitions
-│   │   ├── common.ts               # Shared price utilities
-│   │   ├── binance.ts              # Binance price streams
-│   │   ├── bybit.ts                # Bybit price streams
-│   │   ├── kucoin.ts               # KuCoin price streams
-│   │   ├── okx.ts                  # OKX price streams
-│   │   ├── bitget.ts               # Bitget price streams
-│   │   └── coinbase.ts             # Coinbase price streams
-│   └── utils/                      # Utility modules
-│       ├── binance.ts              # Binance utilities
-│       ├── kucoin.ts               # KuCoin utilities
-│       ├── common.ts               # Common enums and functions
-│       ├── exchange.ts             # Exchange utilities
-│       ├── logger.ts               # Logging utilities
-│       ├── mutex.ts                # Concurrency control
-│       ├── redis.ts                # Redis client
-│       ├── rabbit.ts               # RabbitMQ client
-│       ├── sleep.ts                # Sleep utilities
-│       └── paperTradingWS.ts       # Paper trading WebSocket
-├── bybit-custom/                   # Custom Bybit client
-├── type.ts                         # Global type definitions
-├── package.json
-├── tsconfig.json
-├── eslint.config.mjs
-└── .prettierrc.js
+Signed-off-by: Your Name <your.email@example.com>
 ```
 
-### Key Components
+The line must contain a real name and a working email address (anonymous
+or pseudonymous sign-offs are not accepted).
 
-- **User Stream Connector**: Handles real-time account data (balances, orders, positions)
-- **Price Stream Connector**: Manages market data streams (candles, tickers)
-- **Exchange Implementations**: Specific WebSocket integrations for each exchange
-- **Utility Modules**: Shared functionality for logging, caching, messaging
-- **Worker Threads**: Multi-threaded price stream processing
+### What you're certifying
 
-## Adding New Exchanges
+By adding `Signed-off-by`, you certify the
+[Developer Certificate of Origin 1.1](https://developercertificate.org/),
+which is a lightweight statement that you wrote the change yourself or
+otherwise have the right to contribute it under the project's MIT license.
+The full text:
 
-### Step 1: Create Exchange Price Stream Implementation
+> **Developer Certificate of Origin**
+> Version 1.1
+>
+> By making a contribution to this project, I certify that:
+>
+> (a) The contribution was created in whole or in part by me and I have
+>     the right to submit it under the open source license indicated in
+>     the file; or
+>
+> (b) The contribution is based upon previous work that, to the best of
+>     my knowledge, is covered under an appropriate open source license
+>     and I have the right under that license to submit that work with
+>     modifications, whether created in whole or in part by me, under the
+>     same open source license (unless I am permitted to submit under a
+>     different license), as indicated in the file; or
+>
+> (c) The contribution was provided directly to me by some other person
+>     who certified (a), (b) or (c) and I have not modified it.
+>
+> (d) I understand and agree that this project and the contribution are
+>     public and that a record of the contribution (including all personal
+>     information I submit with it, including my sign-off) is maintained
+>     indefinitely and may be redistributed consistent with this project
+>     or the open source license(s) involved.
 
-Create a new file in `src/price/newexchange.ts`:
+### Automating sign-off
 
-```typescript
-import { ExchangeEnum } from '../utils/common'
-import logger from '../utils/logger'
-import { Candle, Ticker } from './types'
-
-class NewExchangeConnector {
-  private subscribedCandlesMap: Map<ExchangeEnum, Set<string>>
-  private ws: WebSocket | null = null
-  
-  constructor(subscribedCandlesMap: Map<ExchangeEnum, Set<string>>) {
-    this.subscribedCandlesMap = subscribedCandlesMap
-  }
-  
-  async connect(): Promise<void> {
-    try {
-      this.ws = new WebSocket('wss://new-exchange-websocket-url')
-      
-      this.ws.onopen = () => {
-        logger.info('NewExchange WebSocket connected')
-        this.subscribeToStreams()
-      }
-      
-      this.ws.onmessage = (event) => {
-        this.handleMessage(JSON.parse(event.data))
-      }
-      
-      this.ws.onclose = () => {
-        logger.warn('NewExchange WebSocket disconnected')
-        this.reconnect()
-      }
-      
-      this.ws.onerror = (error) => {
-        logger.error('NewExchange WebSocket error:', error)
-      }
-    } catch (error) {
-      logger.error('NewExchange connection failed:', error)
-      throw error
-    }
-  }
-  
-  private subscribeToStreams(): void {
-    const symbols = this.subscribedCandlesMap.get(ExchangeEnum.newexchange)
-    if (!symbols || symbols.size === 0) return
-    
-    // Subscribe to candlestick streams
-    for (const symbol of symbols) {
-      this.subscribeToCandles(symbol)
-    }
-  }
-  
-  private subscribeToCandles(symbol: string): void {
-    const subscribeMessage = {
-      method: 'SUBSCRIBE',
-      params: [`${symbol.toLowerCase()}@kline_1m`],
-      id: Date.now()
-    }
-    
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(subscribeMessage))
-    }
-  }
-  
-  private handleMessage(data: any): void {
-    if (data.stream && data.stream.includes('@kline_')) {
-      this.handleCandleMessage(data)
-    }
-  }
-  
-  private handleCandleMessage(data: any): void {
-    const kline = data.data.k
-    const candle: Candle = {
-      start: kline.t,
-      open: kline.o,
-      high: kline.h,
-      low: kline.l,
-      close: kline.c,
-      volume: kline.v
-    }
-    
-    // Emit candle data to parent process
-    if (process.send) {
-      process.send({
-        type: 'candle',
-        exchange: ExchangeEnum.newexchange,
-        symbol: kline.s,
-        data: candle
-      })
-    }
-  }
-  
-  private reconnect(): void {
-    setTimeout(() => {
-      this.connect().catch(error => {
-        logger.error('NewExchange reconnection failed:', error)
-      })
-    }, 5000)
-  }
-  
-  disconnect(): void {
-    if (this.ws) {
-      this.ws.close()
-      this.ws = null
-    }
-  }
-}
-
-export default NewExchangeConnector
-```
-
-### Step 2: Update Price Service
-
-Add your exchange to `src/price/service.ts`:
-
-```typescript
-import NewExchangeConnector from './newexchange'
-
-type ConnectorType =
-  | ExchangeEnum.binance
-  | ExchangeEnum.bybit
-  | ExchangeEnum.kucoin
-  | ExchangeEnum.okx
-  | ExchangeEnum.coinbase
-  | ExchangeEnum.bitget
-  | ExchangeEnum.newexchange // Add your exchange
-
-const createConnector = (exchange: ConnectorType, payload: Payload) => {
-  // ... existing cases
-  if (exchange === ExchangeEnum.newexchange) {
-    return new NewExchangeConnector(payload.subscribedCandlesMap)
-  }
-  // ... rest of function
-}
-```
-
-### Step 3: Add User Stream Support
-
-Add user stream handling to `src/userStream.ts`:
-
-```typescript
-// Add to the main UserStream class
-private async connectNewExchange(userId: string, api: ApiCredentials): Promise<void> {
-  try {
-    // Initialize WebSocket connection with user credentials
-    const ws = new WebSocket(`wss://new-exchange-user-stream-url`)
-    
-    ws.onopen = () => {
-      logger.info(`NewExchange user stream opened for user ${userId}`)
-      this.authenticate(ws, api)
-    }
-    
-    ws.onmessage = (event) => {
-      this.handleNewExchangeMessage(userId, JSON.parse(event.data))
-    }
-    
-    ws.onclose = () => {
-      logger.warn(`NewExchange user stream closed for user ${userId}`)
-      this.scheduleReconnect(userId, api)
-    }
-    
-    // Store connection reference
-    this.connections.set(`${userId}_newexchange`, ws)
-    
-  } catch (error) {
-    logger.error(`NewExchange connection failed for user ${userId}:`, error)
-    throw error
-  }
-}
-
-private handleNewExchangeMessage(userId: string, data: any): void {
-  // Handle different message types
-  switch (data.e) {
-    case 'executionReport':
-      this.handleOrderUpdate(userId, this.mapNewExchangeOrder(data))
-      break
-    case 'outboundAccountPosition':
-      this.handleBalanceUpdate(userId, this.mapNewExchangeBalance(data))
-      break
-    default:
-      logger.debug(`Unknown NewExchange message type: ${data.e}`)
-  }
-}
-```
-
-### Step 4: Update Common Utilities
-
-Add your exchange to `src/utils/common.ts`:
-
-```typescript
-export enum ExchangeEnum {
-  // ... existing exchanges
-  newexchange = 'newexchange',
-  paperNewexchange = 'paperNewexchange',
-}
-
-export const mapPaperToReal = (exchange: string): string => {
-  const mapping: Record<string, string> = {
-    // ... existing mappings
-    [ExchangeEnum.paperNewexchange]: ExchangeEnum.newexchange,
-  }
-  return mapping[exchange] || exchange
-}
-```
-
-### Step 5: Add Package Dependencies
-
-If your exchange requires specific packages:
+Configure git once so every commit is automatically signed off:
 
 ```bash
-npm install newexchange-websocket-api
+git config user.name  "Your Name"
+git config user.email "your.email@example.com"
+# add to commits in this repo automatically:
+git config format.signoff true
 ```
 
-Update `package.json` dependencies as needed.
-
-## Coding Standards
-
-### TypeScript Guidelines
-
-- **Strict Mode**: Always use TypeScript strict mode
-- **Type Safety**: Prefer explicit types over `any`
-- **Interface Consistency**: Use consistent interfaces for WebSocket messages
-- **Error Handling**: Implement proper error handling with reconnection logic
-
-```typescript
-// ✅ Good - Proper type definitions and error handling
-interface OrderUpdateMessage {
-  eventType: 'executionReport'
-  symbol: string
-  orderId: string
-  orderStatus: string
-  side: string
-  price: string
-  quantity: string
-}
-
-async connectExchange(credentials: ApiCredentials): Promise<void> {
-  try {
-    const ws = new WebSocket(this.getWebSocketUrl(credentials))
-    this.setupEventHandlers(ws)
-  } catch (error) {
-    logger.error('Connection failed:', error)
-    throw error
-  }
-}
-
-// ❌ Bad - No types and poor error handling
-async connectExchange(credentials: any): Promise<any> {
-  const ws = new WebSocket('some-url')
-  // No error handling
-}
-```
-
-### WebSocket Patterns
-
-Follow established patterns for WebSocket handling:
-
-```typescript
-// Connection Management
-class ExchangeConnector {
-  private ws: WebSocket | null = null
-  private reconnectAttempts = 0
-  private maxReconnectAttempts = 5
-  
-  async connect(): Promise<void> {
-    // Connection logic
-  }
-  
-  private setupEventHandlers(ws: WebSocket): void {
-    ws.onopen = () => this.handleOpen()
-    ws.onmessage = (event) => this.handleMessage(event)
-    ws.onclose = () => this.handleClose()
-    ws.onerror = (error) => this.handleError(error)
-  }
-  
-  private async handleClose(): Promise<void> {
-    if (this.reconnectAttempts < this.maxReconnectAttempts) {
-      await this.reconnect()
-    }
-  }
-  
-  private async reconnect(): Promise<void> {
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000)
-    this.reconnectAttempts++
-    
-    setTimeout(() => {
-      this.connect().catch(error => {
-        logger.error('Reconnection failed:', error)
-      })
-    }, delay)
-  }
-}
-```
-
-### Message Handling
-
-Standardize message processing:
-
-```typescript
-// Message Processing Pattern
-private handleMessage(event: MessageEvent): void {
-  try {
-    const data = JSON.parse(event.data)
-    
-    switch (data.eventType || data.e) {
-      case 'executionReport':
-        this.processOrderUpdate(data)
-        break
-      case 'outboundAccountPosition':
-        this.processBalanceUpdate(data)
-        break
-      default:
-        logger.debug(`Unhandled message type: ${data.eventType || data.e}`)
-    }
-  } catch (error) {
-    logger.error('Message parsing failed:', error)
-  }
-}
-
-// Data Mapping
-private mapToStandardFormat(exchangeData: any): StandardOrder {
-  return {
-    orderId: exchangeData.i || exchangeData.orderId,
-    symbol: exchangeData.s || exchangeData.symbol,
-    side: this.mapSide(exchangeData.S || exchangeData.side),
-    price: exchangeData.p || exchangeData.price,
-    quantity: exchangeData.q || exchangeData.quantity,
-    status: this.mapStatus(exchangeData.X || exchangeData.status),
-    timestamp: exchangeData.T || exchangeData.timestamp
-  }
-}
-```
-
-## Testing Guidelines
-
-### Unit Testing
-
-Create tests for exchange-specific logic:
-
-```typescript
-describe('NewExchangeConnector', () => {
-  let connector: NewExchangeConnector
-  let mockWebSocket: jest.Mocked<WebSocket>
-  
-  beforeEach(() => {
-    mockWebSocket = createMockWebSocket()
-    connector = new NewExchangeConnector(new Map())
-  })
-  
-  it('should connect to WebSocket successfully', async () => {
-    await connector.connect()
-    expect(mockWebSocket.send).toHaveBeenCalled()
-  })
-  
-  it('should handle order update messages', () => {
-    const orderMessage = {
-      eventType: 'executionReport',
-      symbol: 'BTCUSDT',
-      orderId: '12345'
-    }
-    
-    connector.handleMessage(orderMessage)
-    // Assert message was processed correctly
-  })
-  
-  it('should reconnect on connection loss', async () => {
-    const reconnectSpy = jest.spyOn(connector, 'reconnect')
-    
-    // Simulate connection close
-    mockWebSocket.onclose?.(new CloseEvent('close'))
-    
-    expect(reconnectSpy).toHaveBeenCalled()
-  })
-})
-```
-
-### Integration Testing
-
-Test with exchange sandbox/testnet environments:
-
-```typescript
-describe('Exchange Integration', () => {
-  it('should connect to exchange testnet', async () => {
-    const connector = new NewExchangeConnector(new Map(), {
-      sandbox: true,
-      apiKey: process.env.TESTNET_API_KEY,
-      apiSecret: process.env.TESTNET_API_SECRET
-    })
-    
-    await expect(connector.connect()).resolves.not.toThrow()
-  })
-})
-```
-
-### Manual Testing
-
-Use development scripts for manual testing:
+If you forgot to sign-off a commit, amend the last one:
 
 ```bash
-# Test specific exchange connection
-DEBUG=newexchange npm run main
-
-# Monitor WebSocket messages
-DEBUG=websocket npm run price
+git commit --amend --signoff --no-edit
 ```
 
-## Pull Request Process
+For a chain of commits, rebase and sign-off:
 
-### Before Submitting
-
-1. **Code Quality Checks**
-   ```bash
-   npm run lint
-   npm run build
-   ```
-
-2. **Environment Testing**
-   - Test with both live and paper trading modes
-   - Verify reconnection logic works
-   - Test with multiple symbols/markets
-
-3. **Documentation Updates**
-   - Update README.md if adding new features
-   - Add JSDoc comments for public APIs
-   - Include usage examples
-
-### PR Requirements
-
-1. **WebSocket Compliance**: Follow established WebSocket patterns
-2. **Error Handling**: Implement proper error handling and reconnection
-3. **Message Mapping**: Use consistent data mapping to standard formats
-4. **Paper Trading**: Support both live and paper trading modes
-5. **Logging**: Include appropriate logging for debugging
-
-### PR Template
-
-```markdown
-## Description
-Brief description of the exchange implementation or changes
-
-## Exchange Details
-- Exchange Name: [Exchange Name]
-- WebSocket API Version: [Version]
-- Supported Features: [User streams, Price streams, Paper trading]
-- Market Types: [Spot, Futures, Options]
-
-## Testing
-- [ ] WebSocket connection established successfully
-- [ ] Message handling works correctly
-- [ ] Reconnection logic implemented
-- [ ] Paper trading mode supported
-- [ ] Manual testing completed
-- [ ] Error handling tested
-
-## Documentation
-- [ ] JSDoc comments added
-- [ ] README updated if needed
-- [ ] Usage examples included
+```bash
+git rebase --signoff HEAD~<N>
 ```
 
-## WebSocket Implementation Guidelines
+## Pull requests
 
-### Connection Management
+- Open the PR against `main`.
+- Keep the diff small and focused — one PR per logical change.
+- Update [`CHANGELOG.md`](./CHANGELOG.md) if the change is user-visible.
+- CI must be green before review.
 
-All WebSocket implementations must follow these patterns:
+PRs without a `Signed-off-by` line on every commit will be blocked until
+the sign-off is added.
 
-1. **Automatic Reconnection**: Implement exponential backoff reconnection
-2. **Connection State Tracking**: Monitor connection health
-3. **Graceful Shutdown**: Clean up resources on disconnect
-4. **Error Handling**: Log errors and attempt recovery
+## Reporting bugs / security issues
 
-### Message Processing
+For non-sensitive bug reports, open an issue. For security-sensitive
+reports, email **security@gainium.io** rather than filing a public issue.
 
-1. **Type Safety**: Use TypeScript interfaces for all messages
-2. **Standard Mapping**: Map exchange-specific data to common formats
-3. **Event Emission**: Use consistent event names across exchanges
-4. **Error Recovery**: Handle malformed messages gracefully
+## License
 
-### Authentication
-
-1. **Secure Credentials**: Never log API keys or secrets
-2. **Token Management**: Handle authentication tokens properly
-3. **Reconnection Auth**: Re-authenticate on reconnection
-4. **Paper Trading**: Support paper trading authentication
-
-### Performance Considerations
-
-1. **Memory Management**: Clean up event listeners and connections
-2. **Rate Limiting**: Respect exchange rate limits
-3. **Message Queuing**: Use RabbitMQ for reliable message delivery
-4. **Worker Threads**: Use worker threads for CPU-intensive processing
-
-## Getting Help
-
-- **Architecture Questions**: Consult with the core team
-- **WebSocket Issues**: Check exchange documentation and test in sandbox
-- **Connection Problems**: Verify network connectivity and credentials
-- **Performance Issues**: Monitor memory usage and connection counts
-
-## Recognition
-
-Contributors will be acknowledged in:
-- Project documentation
-- Release notes for significant contributions
-- Internal team recognition
-
-Thank you for contributing to the WebSocket Connector service!
+By submitting a contribution, you agree that it will be licensed under the
+MIT License terms in [`LICENSE`](./LICENSE).
