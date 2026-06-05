@@ -68,7 +68,7 @@ export function getBoundLocalAddress(socket: unknown): string | undefined {
  * interfaces that can't reach the public internet, hanging the open
  * handshake until timeout. `addr.internal` only flags loopback.
  */
-function isPrivateIPv4(ip: string): boolean {
+export function isPrivateIPv4(ip: string): boolean {
   const parts = ip.split('.').map(Number)
   if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return true
   const [a, b] = parts
