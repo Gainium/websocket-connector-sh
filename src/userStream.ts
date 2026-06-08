@@ -3070,11 +3070,16 @@ class UserConnector {
     time: number,
     userId: string,
   ): OutboundAccountPosition | undefined {
-    const balances = msg.map((m) => ({
-      asset: m.marginCoin,
-      free: m.available,
-      locked: m.frozen,
-    }))
+    const balances = msg.map((m) => {
+      const available = +m.available
+      const margin = +m.equity - +((m as any).unrealizedPL ?? '0') - available
+
+      return {
+        asset: m.marginCoin,
+        free: `${available}`,
+        locked: `${margin}`,
+      }
+    })
     return {
       balances,
       eventTime: time,
