@@ -1,4 +1,5 @@
-import Connector from './src/userStream'
+import './src/userStream'
+import { getConnectorClass } from './src/connectorClass'
 import logger from './src/utils/logger'
 import sleep from './src/utils/sleep'
 import { skipReason } from './type'
@@ -16,7 +17,7 @@ if (isAdminConfigEnabled()) {
   void startAdminConfigSync()
 }
 
-export const stream = new Connector()
+export const stream = new (getConnectorClass())()
 
 let retry = 0
 

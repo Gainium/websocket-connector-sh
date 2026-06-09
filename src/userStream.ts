@@ -875,6 +875,50 @@ class UserConnector {
     this.users.push(user)
   }
 
+  /**
+   * Extension seams for downstream builds (default: inert / current
+   * behaviour). A subclass can spread outbound connections across
+   * multiple source IPs and pace/log them per-IP without forking core.
+   */
+
+  /** Called once per *new* connection, before the per-provider open. */
+  protected async onBeforeOpenStream(
+    _provider: ExchangeEnum,
+    _id: string,
+  ): Promise<void> {}
+
+  /** Called after a stream is closed/removed. */
+  protected onAfterCloseStream(_id: string): void {}
+
+  /** Per-provider connection pacing, in ms. Mirrors the historical
+   *  trailing sleeps after a successful open. */
+  protected paceMsFor(provider: ExchangeEnum): number {
+    const p = `${provider}`.toLowerCase()
+    if (p.includes('binance')) return 1000
+    if (p.includes('bybit')) return 2000
+    if (p.includes('okx')) return 650
+    if (p.includes('bitget')) return 2000
+    if (p.includes('kraken')) return 2000
+    return 0 // kucoin, coinbase, hyperliquid (its own pacing), paper
+  }
+
+  /** Pace after a successful open. Default sleeps the per-provider gap
+   *  globally; a multi-IP subclass paces per-IP before the open instead
+   *  and makes this a no-op. */
+  protected async paceAfterOpen(provider: ExchangeEnum): Promise<void> {
+    const ms = this.paceMsFor(provider)
+    if (ms > 0) await sleep(ms)
+  }
+
+  /** Emit the connection-state log line. Default: provider→count map. */
+  protected logUserState(): void {
+    const usersMap: Map<string, number> = new Map()
+    this.users.forEach((u) => {
+      usersMap.set(u.provider, (usersMap.get(u.provider) ?? 0) + 1)
+    })
+    logger.info(usersMap)
+  }
+
   @IdMute(mutex, () => `closeStreamBybit`)
   private async closeBybitConnection(client: BybitClient) {
     client.closeAll(true)
@@ -993,6 +1037,7 @@ class UserConnector {
 
     /** Does this user id exist already in opened streams */
     if (!find) {
+      await this.onBeforeOpenStream(api.provider, id)
       /** User do not exist in users array */
       if (
         [
@@ -1176,7 +1221,7 @@ class UserConnector {
           this.logger(
             `Was subscribed to the user ${userId} room ${id} ${api.provider}`,
           )
-          await sleep(1000)
+          await this.paceAfterOpen(api.provider)
         } catch (err) {
           findUser = { ...findUser, pending: false }
           this.saveUser(findUser)
@@ -1598,7 +1643,7 @@ class UserConnector {
           this.logger(
             `Was subscribed to the user ${userId} room ${id} ${api.provider}`,
           )
-          await sleep(2000)
+          await this.paceAfterOpen(api.provider)
         } catch (err) {
           /** Catch error, emit error to socket */
 
@@ -1782,7 +1827,7 @@ class UserConnector {
           this.logger(
             `Was subscribed to the user ${userId} room ${id} ${api.provider}`,
           )
-          await sleep(650)
+          await this.paceAfterOpen(api.provider)
         } catch (err) {
           findUser = { ...findUser, pending: false }
           this.saveUser(findUser)
@@ -2106,7 +2151,7 @@ class UserConnector {
           this.logger(
             `Was subscribed to the user ${userId} room ${id} ${api.provider}`,
           )
-          await sleep(2000)
+          await this.paceAfterOpen(api.provider)
         } catch (err) {
           findUser = { ...findUser, pending: false }
           this.saveUser(findUser)
@@ -2386,7 +2431,7 @@ class UserConnector {
           this.logger(
             `Was subscribed to the user ${userId} room ${id} ${api.provider}`,
           )
-          await sleep(2000)
+          await this.paceAfterOpen(api.provider)
         } catch (err) {
           findUser = { ...findUser, pending: false }
           this.saveUser(findUser)
@@ -2454,11 +2499,7 @@ class UserConnector {
       return
     }
     this.subscribeMsgsMap.set(id, msg)
-    const usersMap: Map<string, number> = new Map()
-    this.users.forEach((u) => {
-      usersMap.set(u.provider, (usersMap.get(u.provider) ?? 0) + 1)
-    })
-    logger.info(usersMap)
+    this.logUserState()
 
     if (!this.testMode) {
       return this.redis?.publish(
@@ -2594,6 +2635,7 @@ class UserConnector {
           this.logger(`${uuid} unsubscribed event`)
           /** Log user stream closed */
           this.logger(`User ${uuid} stream was closed`)
+          this.onAfterCloseStream(uuid)
         } else {
           return this.logger(`User ${uuid} not found`, true)
         }
