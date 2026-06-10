@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.9.3] - 2026-06-10
+
+### Added
+- Binance connection race
+
 ## [1.9.2] - 2026-06-08
 
 ### Added

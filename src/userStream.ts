@@ -1206,7 +1206,21 @@ class UserConnector {
         })
         /** Open stream and set callback  */
         try {
-          await startMethod()
+          let connectTimer: NodeJS.Timeout | undefined
+          await Promise.race([
+            startMethod(),
+            new Promise<void>((_, reject) => {
+              connectTimer = setTimeout(() => {
+                this.logger(
+                  `Binance connection timeout ${id} ${userId} ${api.provider}`,
+                  true,
+                )
+                reject(new Error(`Binance connection timeout ${api.provider}`))
+              }, 60 * 1000)
+            }),
+          ]).finally(() => {
+            if (connectTimer) clearTimeout(connectTimer)
+          })
 
           /** Save user id and close function in users array */
           findUser = { ...findUser, close: stopMethod }
