@@ -45,7 +45,7 @@ function parseArgs(): TestOptions {
     console.log('Optional parameters:')
     console.log('  - passphrase (required for Kucoin, OKX, Bitget)')
     console.log('  - environment=sandbox (for exchanges that support testnet)')
-    console.log('  - bybitHost=eu|com|nl|tr|kz|ge (for Bybit)')
+    console.log('  - bybitHost=<your Bybit domain, e.g. bybit.com> (for Bybit)')
     console.log('  - keysType=legacy|cloud (for Coinbase)')
     console.log('  - okxSource=my|com (for OKX)')
     process.exit(1)
