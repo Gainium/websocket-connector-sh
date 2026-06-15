@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.9.4] - 2026-06-15
+
+### Changed
+- Bybit user-stream REST/WS hosts are now derived from a user-supplied domain (`api.<host>` / `stream.<host>`) instead of a fixed zone map; legacy zone codes (`eu`/`com`/…) still resolve for unmigrated accounts.
+
 ## [1.9.3] - 2026-06-10
 
 ### Added
