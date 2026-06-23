@@ -585,6 +585,9 @@ class UserConnector {
   private coinbaseErrors: Map<string, Map<string, number>> = new Map()
   /** Kucoin errors */
   private kucoinErrors: Map<string, number> = new Map()
+  /** Rolling-window reconnect timestamps per `${exchange}:${id}`, for the
+   *  user-stream flap detector (noteReconnect). Emit-only telemetry. */
+  private streamFlaps: Map<string, number[]> = new Map()
   private kucoinSymbols: { coinm: KucoinSymbol[]; usdm: KucoinSymbol[] } = {
     coinm: [],
     usdm: [],
@@ -967,6 +970,50 @@ class UserConnector {
           : 'undefined'
       }`,
   )
+  /**
+   * User-stream flap detector. A single reconnect is healthy auto-recovery;
+   * *repeated* reconnects (or forced error-threshold restarts) in a short
+   * window are the "connected but dead" fingerprint Maksym described (Q7) —
+   * the only reliable liveness signal we have, since most exchanges post by
+   * event, not interval. When the count crosses the threshold we emit a
+   * structured event to the existing `serviceLog` Redis channel; main-app's
+   * consumer forwards it to the admin watchdog (same pipeline as the price
+   * data-stall alert). Strictly emit-only: it never throws and never alters
+   * stream control flow.
+   */
+  private noteReconnect(id: string, exchange: string) {
+    try {
+      const windowMs =
+        Number(process.env.USER_STREAM_FLAP_WINDOW_MS) || 10 * 60 * 1000
+      const threshold = Number(process.env.USER_STREAM_FLAP_THRESHOLD) || 4
+      const key = `${exchange}:${id}`
+      const now = Date.now()
+      const hits = (this.streamFlaps.get(key) ?? []).filter(
+        (t) => now - t < windowMs,
+      )
+      hits.push(now)
+      if (hits.length >= threshold) {
+        // Reset so we alert once per burst, not on every subsequent reconnect.
+        this.streamFlaps.delete(key)
+        this.redis?.publish(
+          'serviceLog',
+          JSON.stringify({
+            userStreamFlap: {
+              exchange,
+              userId: id,
+              reconnects: hits.length,
+              windowSec: Math.round(windowMs / 1000),
+            },
+          }),
+        )
+      } else {
+        this.streamFlaps.set(key, hits)
+      }
+    } catch {
+      // emit-only: a counter/publish failure must never affect the stream
+    }
+  }
+
   private async openStreamCallback(msg: OpenStreamInput, uuid?: string) {
     if (!msg || !msg.userId || !msg.api) {
       return this.logger('Not enough data', true)
@@ -1171,6 +1218,7 @@ class UserConnector {
         }) // receive notification that a reconnection completed successfully (e.g use REST to check for missing data)
         client.on('reconnected', (data) => {
           this.logger(`${id} ws has reconnected ${data.wsKey}  ${api.provider}`)
+          this.noteReconnect(id, api.provider)
         })
         client.on('close', (data) => {
           this.logger(`${id} ws has closed ${data.wsKey} ${api.provider}`)
@@ -1299,6 +1347,7 @@ class UserConnector {
 
                 this.kucoinErrors.delete(id)
                 this.logger(`Restart due to Kucoin error ${id}`, true)
+                this.noteReconnect(id, api.provider)
               }
             }
           }
@@ -1574,6 +1623,7 @@ class UserConnector {
               `userStreamInfo${id}`,
               `Subscribed to user ${id}`,
             )
+            this.noteReconnect(id, api.provider)
           })
           const close = () => {
             this.closeBybitConnection(client)
@@ -1824,6 +1874,7 @@ class UserConnector {
 
                 this.okxErrors.delete(id)
                 this.logger(`restart connection ${id} ${api.provider}`)
+                this.noteReconnect(id, api.provider)
               }
             },
           )
@@ -1914,6 +1965,7 @@ class UserConnector {
 
               this.coinbaseErrors.delete(id)
               this.logger(`restart connection ${id} ${api.provider}`)
+              this.noteReconnect(id, api.provider)
             }
           })
 
@@ -1952,6 +2004,7 @@ class UserConnector {
 
               this.coinbaseErrors.delete(id)
               this.logger(`restart connection ${id} ${api.provider}`)
+              this.noteReconnect(id, api.provider)
             }
           })
           client.ws.connect()
@@ -2083,6 +2136,7 @@ class UserConnector {
               `userStreamInfo${id}`,
               `Subscribed to user ${id}`,
             )
+            this.noteReconnect(id, api.provider)
           })
           const close = () => {
             this.closeBitgetConnection(client)
@@ -2406,6 +2460,7 @@ class UserConnector {
 
           client.on('reconnected', () => {
             this.logger(`${id} Kraken ws has reconnected ${api.provider}`)
+            this.noteReconnect(id, api.provider)
           })
 
           const close = () => {

@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Price/candle data-stall observability: the price connector's per-channel watchdog now publishes a `{ watchdogStall }` event to the `serviceLog` Redis channel before it self-restarts, so the otherwise-silent recovery is visible to the admin watchdog (Telegram/email).
+- User-stream flap detector: a rolling-window reconnect counter per exchange+user (`noteReconnect`) emits a `{ userStreamFlap }` event to `serviceLog` once reconnects cross `USER_STREAM_FLAP_THRESHOLD` (default 4) within `USER_STREAM_FLAP_WINDOW_MS` (default 10 min) — the "connected but dead" signal. Hooked at the reconnect/forced-reconnect sites of Binance, Bybit, Bitget, Kraken, KuCoin, OKX, Coinbase. Strictly emit-only.
 
 ### Changed
 

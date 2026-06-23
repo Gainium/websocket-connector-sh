@@ -111,6 +111,30 @@ class CommonConnector {
     )
   }
 
+  /**
+   * Make a watchdog-triggered self-restart visible to ops. The price/candle
+   * stall recovery is otherwise silent (worker throws -> exits -> parent
+   * respawns). We publish a structured event to the existing `serviceLog`
+   * Redis channel; main-app's serviceLog consumer forwards it to the watchdog
+   * alerting path. Fire-and-forget — must never block or replace the throw.
+   */
+  private reportStall(
+    exchange: ExchangeEnum,
+    kind: 'price' | 'candle' | 'connect',
+    staleSeconds: number,
+  ) {
+    try {
+      this.redis.publish(
+        'serviceLog',
+        JSON.stringify({
+          watchdogStall: { exchange, kind, staleSeconds, role: priceRole },
+        }),
+      )
+    } catch (e) {
+      logger.error(`Failed to publish watchdog stall for ${exchange}: ${e}`)
+    }
+  }
+
   private watchdogFn() {
     const now = new Date().getTime()
     const keys = Object.keys(this.mainData) as ExchangeEnum[]
@@ -126,20 +150,22 @@ class CommonConnector {
           this.mainData[exchange].lastData === 0 &&
           now - this.mainData[exchange].connectTime > this.connectTime
         ) {
-          throw new Error(
-            `Exchange exceed connect time ${Math.floor(
-              (now - this.mainData[exchange].connectTime) / 1000,
-            )}s | ${exchange}`,
+          const stale = Math.floor(
+            (now - this.mainData[exchange].connectTime) / 1000,
           )
+          this.reportStall(exchange, 'connect', stale)
+          throw new Error(`Exchange exceed connect time ${stale}s | ${exchange}`)
         }
         if (
           this.mainData[exchange].lastData > 0 &&
           now - this.mainData[exchange].lastData > this.timeout
         ) {
+          const stale = Math.floor(
+            (now - this.mainData[exchange].lastData) / 1000,
+          )
+          this.reportStall(exchange, 'price', stale)
           throw new Error(
-            `Exchange not received new data for ${Math.floor(
-              (now - this.mainData[exchange].lastData) / 1000,
-            )}s | ${exchange}`,
+            `Exchange not received new data for ${stale}s | ${exchange}`,
           )
         }
       }
@@ -149,10 +175,12 @@ class CommonConnector {
           now - (this.mainData[exchange].lastDataTrade ?? now) >
             this.tradeTimeout
         ) {
+          const stale = Math.floor(
+            (now - (this.mainData[exchange].lastDataTrade ?? 0)) / 1000,
+          )
+          this.reportStall(exchange, 'candle', stale)
           throw new Error(
-            `Trades on exchange not received new data for ${Math.floor(
-              (now - (this.mainData[exchange].lastDataTrade ?? 0)) / 1000,
-            )}s | ${exchange}`,
+            `Trades on exchange not received new data for ${stale}s | ${exchange}`,
           )
         }
       }
