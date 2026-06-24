@@ -17,9 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-### Fixed
-
 ### Security
+
+## [1.9.4] - 2026-06-24
+
+### Fixed
+- HL balancer: load per-worker caps from Redis at `init()`, not only on the 30s watchdog tick. A multi-IP worker (e.g. 6 IPs → cap 60) was undersized to `defaultWorkerCap` (10) right after boot, so the balancer dropped/self-routed every HL open past 10 until the first tick.
+- HL balancer: never open HL locally. `route()` now always claims an HL `open stream` once enabled (even when routing fails — no worker yet / all at cap); a failed route is logged and left for main-app to retry. Previously a failed route fell through and the balancer self-opened the HL stream, double-binding IPs it shares with the worker and hitting its own default 10-cap.
 
 ## [1.9.3] - 2026-06-10
 

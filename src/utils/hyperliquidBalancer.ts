@@ -133,10 +133,27 @@ class HyperliquidBalancer {
     if (!this.enabled()) return
     await this.loadAssignments()
     await this.loadLastBoots()
+    // Load published per-worker caps up front. Without this, capFor() falls
+    // back to defaultWorkerCap until the first watchdog tick (up to
+    // heartbeatSec later), so a multi-IP worker (e.g. 6 IPs → cap 60) looks
+    // capped at the default 10 right after boot and the balancer drops /
+    // self-routes every HL open past 10.
+    await this.loadWorkerCaps()
     logger.info(
       `Hyperliquid balancer init: ${this.assignments.size} active assignments across ${this.workers.length} workers`,
     )
     this.startWatchdog()
+  }
+
+  /** Load per-worker effective caps (IPs × per-IP cap) published to Redis
+   *  by each worker. Called at boot from `init()`; `tick()` keeps the same
+   *  map fresh thereafter. */
+  private async loadWorkerCaps(): Promise<void> {
+    for (const id of this.workers) {
+      const capRaw = await this.redisSet.get(WORKER_CAP_KEY(id))
+      const cap = capRaw ? +capRaw : NaN
+      if (Number.isFinite(cap) && cap > 0) this.workerCapMap.set(id, cap)
+    }
   }
 
   /** Returns true if this uuid has been routed to a worker (i.e. it's
@@ -251,7 +268,13 @@ class HyperliquidBalancer {
     if (!this.enabled()) return false
     if (msg.event === 'open stream') {
       if (!isHyperliquidExchange(msg.data?.api?.provider)) return false
-      return this.routeOpen(msg.uuid, msg)
+      // Always claim HL opens once the balancer is enabled — even when
+      // routing fails (no worker yet / all at cap). The balancer must never
+      // open HL locally: it shares the host with the worker(s) and never
+      // raises its own cap, so a self-open would double-bind IPs and break.
+      // A failed route is logged in routeOpen and left for main-app to retry.
+      await this.routeOpen(msg.uuid, msg)
+      return true
     }
     // close stream: if we have an assignment, forward; otherwise
     // it's a non-HL user, fall through to local.
