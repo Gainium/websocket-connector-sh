@@ -154,7 +154,9 @@ class CommonConnector {
             (now - this.mainData[exchange].connectTime) / 1000,
           )
           this.reportStall(exchange, 'connect', stale)
-          throw new Error(`Exchange exceed connect time ${stale}s | ${exchange}`)
+          throw new Error(
+            `Exchange exceed connect time ${stale}s | ${exchange}`,
+          )
         }
         if (
           this.mainData[exchange].lastData > 0 &&

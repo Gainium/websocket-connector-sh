@@ -935,41 +935,6 @@ class UserConnector {
     client.on('exception', () => null)
     client.on('update', () => null)
   }
-
-  /** Open stream callback
-   * Check if stream for this user is already opened
-   * If not - try open, catch and emit error
-   * If exist, check if bot exist in subscriber
-   * If not - add to subscribers and to socket room
-   * Emit successful message
-   * @param {Socket} socket socket instance
-   * @param {OpenStreamInput} msg data from bot
-   * @returns {void}
-   * @private
-   */
-  @IdMute(
-    mutex,
-    (msg: OpenStreamInput) =>
-      `openStream${
-        msg?.api?.provider
-          ? msg.api.provider.startsWith('bybit')
-            ? 'bybit'
-            : msg.api.provider.startsWith('okx')
-              ? 'okx'
-              : msg.api.provider.startsWith('binance')
-                ? 'binance'
-                : msg.api.provider.startsWith('bitget')
-                  ? 'bitget'
-                  : msg.api.provider.startsWith('kucoin')
-                    ? 'kucoin'
-                    : msg.api.provider.startsWith('hyperliquid')
-                      ? 'hyperliquid'
-                      : msg.api.provider.startsWith('kraken')
-                        ? 'kraken'
-                        : msg.api.provider
-          : 'undefined'
-      }`,
-  )
   /**
    * User-stream flap detector. A single reconnect is healthy auto-recovery;
    * *repeated* reconnects (or forced error-threshold restarts) in a short
@@ -1014,6 +979,40 @@ class UserConnector {
     }
   }
 
+  /** Open stream callback
+   * Check if stream for this user is already opened
+   * If not - try open, catch and emit error
+   * If exist, check if bot exist in subscriber
+   * If not - add to subscribers and to socket room
+   * Emit successful message
+   * @param {Socket} socket socket instance
+   * @param {OpenStreamInput} msg data from bot
+   * @returns {void}
+   * @private
+   */
+  @IdMute(
+    mutex,
+    (msg: OpenStreamInput) =>
+      `openStream${
+        msg?.api?.provider
+          ? msg.api.provider.startsWith('bybit')
+            ? 'bybit'
+            : msg.api.provider.startsWith('okx')
+              ? 'okx'
+              : msg.api.provider.startsWith('binance')
+                ? 'binance'
+                : msg.api.provider.startsWith('bitget')
+                  ? 'bitget'
+                  : msg.api.provider.startsWith('kucoin')
+                    ? 'kucoin'
+                    : msg.api.provider.startsWith('hyperliquid')
+                      ? 'hyperliquid'
+                      : msg.api.provider.startsWith('kraken')
+                        ? 'kraken'
+                        : msg.api.provider
+          : 'undefined'
+      }`,
+  )
   private async openStreamCallback(msg: OpenStreamInput, uuid?: string) {
     if (!msg || !msg.userId || !msg.api) {
       return this.logger('Not enough data', true)
@@ -1067,7 +1066,6 @@ class UserConnector {
       }
       this.saveUser(findUser)
     } else if (findUser && findUser.pending) {
-      this.logger(`waiting for 500ms to process ${api.provider}`)
       findUser.timer = setTimeout(async () => {
         const findUser = this.users.find((user) => user.id === id)
         if (findUser) {
