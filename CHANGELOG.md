@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Price/candle data-stall observability: the price connector's per-channel watchdog now publishes a `{ watchdogStall }` event to the `serviceLog` Redis channel before it self-restarts, so the otherwise-silent recovery is visible to the admin watchdog (Telegram/email).
 - User-stream flap detector: a rolling-window reconnect counter per exchange+user (`noteReconnect`) emits a `{ userStreamFlap }` event to `serviceLog` once reconnects cross `USER_STREAM_FLAP_THRESHOLD` (default 4) within `USER_STREAM_FLAP_WINDOW_MS` (default 10 min) — the "connected but dead" signal. Hooked at the reconnect/forced-reconnect sites of Binance, Bybit, Bitget, Kraken, KuCoin, OKX, Coinbase. Strictly emit-only.
+- Opt-in per-account user-stream liveness guard (`USER_STREAM_LIVENESS_ENABLED=true`, dark by default): periodically force-recreates a single account's stream when it has delivered no events for `USER_STREAM_LIVENESS_STALE_MS` (default 20 min), healing the "connected but dead" paper/exchange bridge that otherwise leaves bots relying on the reconcile sweep. Per-account (never a global reload — that was reverted), cooldown-gated (`USER_STREAM_LIVENESS_COOLDOWN_MS`, default 60 min), capped per scan (`USER_STREAM_LIVENESS_MAX_PER_SCAN`, default 15), scan interval `USER_STREAM_LIVENESS_SCAN_MS` (default 2 min), paper-only unless `USER_STREAM_LIVENESS_PAPER_ONLY=false`.
 
 ### Changed
 

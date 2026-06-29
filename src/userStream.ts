@@ -616,6 +616,11 @@ class UserConnector {
   private heartbeatSec = +(process.env.USER_STREAM_HL_HEARTBEAT_SEC ?? '30')
   private hlBalancer = HyperliquidBalancer.getInstance()
   private workerHeartbeatTimer: NodeJS.Timeout | null = null
+  /** Per-room last user-stream-event time + last forced re-subscribe time,
+   *  for the opt-in liveness guard (see startLivenessGuard). */
+  private lastEventAt: Map<string, number> = new Map()
+  private lastResubAt: Map<string, number> = new Map()
+  private livenessTimer: NodeJS.Timeout | null = null
   /** Constructor method
    * Determine class variables
    * Start server
@@ -659,6 +664,7 @@ class UserConnector {
       if (isAdminConfigEnabled()) {
         onAdminConfigChange(() => this.dropStreamsForDisabledExchanges())
       }
+      this.startLivenessGuard()
     }
   }
 
@@ -686,6 +692,128 @@ class UserConnector {
       }
     }
     this.users = survivors
+  }
+
+  /**
+   * Opt-in per-account liveness guard (USER_STREAM_LIVENESS_ENABLED=true).
+   *
+   * Born from the paper user-stream "connected-but-dead" class (community
+   * thread 4863 follow-up): a room can sit in `this.users` looking healthy
+   * while its upstream (paper socket / exchange WS) silently delivers nothing,
+   * so the bot only learns its fills via the reconcile sweep (2-5 min lag).
+   *
+   * This periodically force-recreates ONE account's stream at a time once it
+   * has gone quiet beyond a threshold — never a global "reload all" (that soft
+   * fix was tried and reverted). Conservative by construction: per-account,
+   * cooldown-gated, capped per scan, paper-only by default (live exchange WS
+   * churn needs a settle delay), and dark unless explicitly enabled.
+   */
+  private startLivenessGuard() {
+    if (process.env.USER_STREAM_LIVENESS_ENABLED !== 'true' || this.testMode) {
+      return
+    }
+    const scanMs = Math.max(
+      30_000,
+      +(process.env.USER_STREAM_LIVENESS_SCAN_MS ?? 120_000),
+    )
+    const staleMs = Math.max(
+      60_000,
+      +(process.env.USER_STREAM_LIVENESS_STALE_MS ?? 1_200_000),
+    )
+    const cooldownMs = Math.max(
+      staleMs,
+      +(process.env.USER_STREAM_LIVENESS_COOLDOWN_MS ?? 3_600_000),
+    )
+    const maxPerScan = Math.max(
+      1,
+      +(process.env.USER_STREAM_LIVENESS_MAX_PER_SCAN ?? 15),
+    )
+    const paperOnly = process.env.USER_STREAM_LIVENESS_PAPER_ONLY !== 'false'
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer)
+    }
+    this.livenessTimer = setInterval(() => {
+      try {
+        this.scanLiveness({ staleMs, cooldownMs, maxPerScan, paperOnly })
+      } catch (e) {
+        this.logger(`liveness scan failed: ${(e as Error).message}`, true)
+      }
+    }, scanMs)
+    this.logger(
+      `user-stream liveness guard armed (scan ${scanMs}ms, stale ${staleMs}ms, cooldown ${cooldownMs}ms, cap ${maxPerScan}, paperOnly ${paperOnly})`,
+    )
+  }
+
+  private scanLiveness(opts: {
+    staleMs: number
+    cooldownMs: number
+    maxPerScan: number
+    paperOnly: boolean
+  }) {
+    const now = Date.now()
+    let kicked = 0
+    for (const user of this.users) {
+      if (kicked >= opts.maxPerScan) {
+        break
+      }
+      if (user.pending) {
+        continue
+      }
+      if (opts.paperOnly && !paperExchanges.includes(user.provider)) {
+        continue
+      }
+      const last = this.lastEventAt.get(user.id) ?? 0
+      if (now - last < opts.staleMs) {
+        continue
+      }
+      const lastResub = this.lastResubAt.get(user.id) ?? 0
+      if (now - lastResub < opts.cooldownMs) {
+        continue
+      }
+      kicked++
+      void this.forceResubscribe(user.id, Math.round((now - last) / 1000))
+    }
+    if (kicked) {
+      this.logger(`liveness guard re-subscribed ${kicked} stale account(s)`)
+    }
+  }
+
+  /**
+   * Tear down and re-create a single account's stream while preserving its
+   * subscriber refcount. Reuses the tested open path so the recreate matches
+   * a normal subscribe; stamps lastResubAt so the cooldown holds.
+   */
+  private async forceResubscribe(id: string, staleSec: number) {
+    const msg = this.subscribeMsgsMap.get(id)
+    const user = this.users.find((u) => u.id === id)
+    if (!msg || !user) {
+      return
+    }
+    const refcount = this.subscribersMap.get(id) ?? 1
+    this.lastResubAt.set(id, Date.now())
+    this.logger(
+      `liveness guard: re-subscribing ${id} (${user.provider}) — no events for ${staleSec}s`,
+    )
+    try {
+      user.close()
+    } catch (e) {
+      this.logger(`liveness close threw for ${id}: ${e}`, true)
+    }
+    this.users = this.users.filter((u) => u.id !== id)
+    this.subscribersMap.delete(id)
+    try {
+      await this.openStreamCallback(msg, id)
+    } catch (e) {
+      this.logger(
+        `liveness re-subscribe failed for ${id}: ${(e as Error).message}`,
+        true,
+      )
+    }
+    // openStreamCallback resets the count to 1; restore the real subscriber
+    // count so a later 'close stream' doesn't prematurely tear the room down.
+    this.subscribersMap.set(id, refcount)
+    // Grace period before this room can be a candidate again.
+    this.lastEventAt.set(id, Date.now())
   }
 
   /**
@@ -2566,6 +2694,9 @@ class UserConnector {
       return
     }
     this.subscribeMsgsMap.set(id, msg)
+    // Seed liveness clock on (re)subscribe so a freshly-created room gets a
+    // grace period before the liveness guard can consider it stale.
+    this.lastEventAt.set(id, Date.now())
     this.logUserState()
 
     if (!this.testMode) {
@@ -2727,6 +2858,9 @@ class UserConnector {
     if (!streamMsg) {
       return
     }
+    // Liveness signal: this room delivered an event. Used by the liveness
+    // guard to tell a silently-dead stream from a healthy one.
+    this.lastEventAt.set(id, Date.now())
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
 
     if (!this.testMode) {
