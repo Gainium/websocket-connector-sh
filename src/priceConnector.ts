@@ -2,7 +2,7 @@ import { Worker } from 'worker_threads'
 import { ExchangeEnum, mapPaperToReal } from './utils/common'
 import logger from './utils/logger'
 import { IdMute, IdMutex } from './utils/mutex'
-import RedisClient from './utils/redis'
+import RedisClient, { RedisWrapper } from './utils/redis'
 import RabbitClient from './utils/rabbit'
 import {
   getEnabledSnapshot,
@@ -107,11 +107,10 @@ const VARIANT_TO_WORKER_KEY: Record<string, ExchangeEnum> = (() => {
 
 /** Connector class connects to every pair websocket stream separataly. This is a option to controll every pair socket stream, and reload it if necessary */
 class Connector {
-  private redis = RedisClient.getInstance()
+  private redis: RedisWrapper | null = null
   private rabbit = new RabbitClient()
   private workers: Map<ExchangeEnum, Worker> = new Map()
   private subscribedCandlesMap: Map<ExchangeEnum, Set<string>> = new Map()
-
   /**
    * Is at least one variant in this family enabled?
    *
@@ -176,6 +175,7 @@ class Connector {
 
   constructor() {
     this.initWorker = this.initWorker.bind(this)
+    this.initRedis()
     if (isCandle || isAll) {
       this.rabbit.listenWithCallback<{
         symbol: string
@@ -195,6 +195,10 @@ class Connector {
     if (isAdminConfigEnabled()) {
       onAdminConfigChange(() => this.reconcileWorkers())
     }
+  }
+
+  private async initRedis() {
+    this.redis = await RedisClient.getInstance()
   }
 
   /**

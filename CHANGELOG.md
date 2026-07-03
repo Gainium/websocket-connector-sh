@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.10.0] - 2026-07-03
+
+### Added
+- User Stream Watchdog. 
+
 ## [1.9.4] - 2026-06-24
 
 ### Fixed

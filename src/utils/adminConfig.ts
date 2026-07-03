@@ -1,4 +1,3 @@
-import type { createClient } from 'redis'
 import RedisClient from './redis'
 import logger from './logger'
 
@@ -26,8 +25,6 @@ let cache: Set<string> | null = null
 let initialized = false
 let started = false
 
-type RedisClientLike = ReturnType<typeof createClient>
-
 export function isAdminConfigEnabled(): boolean {
   return ENABLED
 }
@@ -53,7 +50,7 @@ export function getEnabledSnapshot(): Set<string> | null {
   return cache ? new Set(cache) : null
 }
 
-function parseRaw(raw: string | null | undefined): Set<string> | null {
+function parseRaw(raw: string | null | undefined | void): Set<string> | null {
   if (!raw) return null
   try {
     const parsed = JSON.parse(raw)
@@ -101,7 +98,7 @@ export async function startAdminConfigSync(): Promise<void> {
   if (!ENABLED || started) return
   started = true
 
-  const redis = RedisClient.getInstance() as RedisClientLike
+  const redis = await RedisClient.getInstance()
 
   const refresh = async () => {
     try {
@@ -135,10 +132,10 @@ export async function startAdminConfigSync(): Promise<void> {
   // subscription mode — duplicate the existing connection so we share
   // socket options + reconnect strategy.
   try {
-    const sub = redis.duplicate()
-    sub.on('error', (err) => logger.error(`admin-config sub error: ${err}`))
-    await sub.connect()
-    await sub.subscribe(CHANNEL, () => {
+    const sub = redis.instance?.duplicate()
+    sub?.on('error', (err) => logger.error(`admin-config sub error: ${err}`))
+    await sub?.connect()
+    await sub?.subscribe(CHANNEL, () => {
       void refresh()
     })
   } catch (err) {

@@ -1,6 +1,6 @@
 import { parentPort } from 'worker_threads'
 import { ExchangeEnum } from '../utils/common'
-import RedisClient from '../utils/redis'
+import RedisClient, { RedisWrapper } from '../utils/redis'
 import sleep from '../utils/sleep'
 import logger from '../utils/logger'
 
@@ -37,7 +37,7 @@ class CommonConnector {
     ticker: null,
     trade: null,
   }
-  private redis = RedisClient.getInstance()
+  private redis: RedisWrapper | null = null
 
   constructor() {
     this.cbWs = this.cbWs.bind(this)
@@ -47,12 +47,17 @@ class CommonConnector {
     this.subscribeCandleCb = this.subscribeCandleCb.bind(this)
     this.commonWsOpenCb = this.commonWsOpenCb.bind(this)
     this.commonWsReconnectCb = this.commonWsReconnectCb.bind(this)
+    this.intiRedis()
     parentPort?.on('message', (msg: { do: string; data: any }) => {
       if (msg?.do === 'subscribeCandle') {
         const d = msg.data as SubscribeCandlePayload
         this.subscribeCandleCb(d)
       }
     })
+  }
+
+  private async intiRedis() {
+    this.redis = await RedisClient.getInstance()
   }
 
   getCandleRoomName(symbol: string, exchange: string, interval: string) {
@@ -83,7 +88,7 @@ class CommonConnector {
       }
       data.uniqueMessageId = `${data.uniqueMessageId}${data.price}${data.volume}${data.bestAsk}${data.bestBid}${data.bestAskQnt}${data.bestBidQnt}`
 
-      this.redis.publish(
+      this.redis?.publish(
         `trade@${symbol}@${exchange}`,
         JSON.stringify({ ...data, exchange }),
       )
@@ -105,7 +110,7 @@ class CommonConnector {
       volume: trade.k.v,
       uniqueMessageId: `${symbol}${trade.k.t}${trade.k.o}${trade.k.h}${trade.k.l}${trade.k.c}${trade.k.v}${interval}@${exchange}`,
     }
-    this.redis.publish(
+    this.redis?.publish(
       `${this.getCandleRoomName(symbol, exchange, interval)}`,
       JSON.stringify(data),
     )
@@ -124,7 +129,7 @@ class CommonConnector {
     staleSeconds: number,
   ) {
     try {
-      this.redis.publish(
+      this.redis?.publish(
         'serviceLog',
         JSON.stringify({
           watchdogStall: { exchange, kind, staleSeconds, role: priceRole },

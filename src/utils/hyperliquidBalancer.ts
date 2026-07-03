@@ -1,4 +1,4 @@
-import RedisClient from './redis'
+import RedisClient, { RedisWrapper } from './redis'
 import Rabbit from './rabbit'
 import logger from './logger'
 import { IdMute, IdMutex } from './mutex'
@@ -76,6 +76,7 @@ type RoutedEvent =
       uuid: string
     }
   | { event: 'close stream'; uuid: string }
+  | { event: 'force restart stream'; uuid: string }
 
 // Global mutex used by both `routeOpen` and `routeClose`. The whole
 // reason the mutex exists is to keep the in-memory `assignments` map
@@ -99,7 +100,7 @@ class HyperliquidBalancer {
   // Use the dedicated set/get client; the shared `redis` instance is
   // reserved for pub/sub and will throw on regular commands once it's
   // entered subscriber mode somewhere else in the process.
-  private redisSet = RedisClient.getInstance()
+  private redisSet: RedisWrapper | null = null
   private rabbit = new Rabbit()
   /** uuid → assignment. In-memory mirror of `userStream:assignment:*`. */
   private assignments = new Map<string, Assignment>()
@@ -124,6 +125,14 @@ class HyperliquidBalancer {
    *  forward HL events instead of handling them locally. */
   enabled(): boolean {
     return this.workers.length > 0
+  }
+
+  constructor() {
+    this.intiRedis()
+  }
+
+  private async intiRedis() {
+    this.redisSet = await RedisClient.getInstance()
   }
 
   /** Snapshot of assignments + caps + watcher start. Idempotent and
@@ -161,7 +170,7 @@ class HyperliquidBalancer {
    *  map fresh thereafter. */
   private async loadWorkerCaps(): Promise<void> {
     for (const id of this.workers) {
-      const capRaw = await this.redisSet.get(WORKER_CAP_KEY(id))
+      const capRaw = await this.redisSet?.get(WORKER_CAP_KEY(id))
       const cap = capRaw ? +capRaw : NaN
       if (Number.isFinite(cap) && cap > 0) this.workerCapMap.set(id, cap)
     }
@@ -217,7 +226,7 @@ class HyperliquidBalancer {
       >(workerQueueName(target), payload, this.rpcTimeoutMs)
 
       if (result?.response?.accepted) {
-        await this.redisSet.set(
+        await this.redisSet?.set(
           `${ASSIGN_PREFIX}${uuid}`,
           JSON.stringify(assignment),
         )
@@ -258,7 +267,16 @@ class HyperliquidBalancer {
     if (!a) return false
     await this.rabbit.send(workerQueueName(a.workerId), payload)
     this.assignments.delete(uuid)
-    await this.redisSet.del(`${ASSIGN_PREFIX}${uuid}`)
+    await this.redisSet?.del(`${ASSIGN_PREFIX}${uuid}`)
+    return true
+  }
+
+  @IdMute(routeMutex, () => 'route')
+  async routeForceRestart(uuid: string, payload: unknown): Promise<boolean> {
+    if (!this.enabled()) return false
+    const a = this.assignments.get(uuid)
+    if (!a) return false
+    await this.rabbit.send(workerQueueName(a.workerId), payload)
     return true
   }
 
@@ -296,10 +314,19 @@ class HyperliquidBalancer {
       )
       return true
     }
-    // close stream: if we have an assignment, forward; otherwise
-    // it's a non-HL user, fall through to local.
-    if (!this.has(msg.uuid)) return false
-    return this.routeClose(msg.uuid, msg)
+    if (msg.event === 'close stream') {
+      // close stream: if we have an assignment, forward; otherwise
+      // it's a non-HL user, fall through to local.
+      if (!this.has(msg.uuid)) return false
+      return this.routeClose(msg.uuid, msg)
+    }
+    if (msg.event === 'force restart stream') {
+      // close stream: if we have an assignment, forward; otherwise
+      // it's a non-HL user, fall through to local.
+      if (!this.has(msg.uuid)) return false
+      return this.routeForceRestart(msg.uuid, msg)
+    }
+    return false
   }
 
   // ---------------------------------------------------------------- //
@@ -318,9 +345,9 @@ class HyperliquidBalancer {
   private async tick(): Promise<void> {
     const states: string[] = []
     for (const id of this.workers) {
-      const boot = await this.redisSet.get(WORKER_BOOT_KEY(id))
-      const hb = await this.redisSet.get(WORKER_HB_KEY(id))
-      const capRaw = await this.redisSet.get(WORKER_CAP_KEY(id))
+      const boot = await this.redisSet?.get(WORKER_BOOT_KEY(id))
+      const hb = await this.redisSet?.get(WORKER_HB_KEY(id))
+      const capRaw = await this.redisSet?.get(WORKER_CAP_KEY(id))
       const cap = capRaw ? +capRaw : NaN
       if (Number.isFinite(cap) && cap > 0) this.workerCapMap.set(id, cap)
       const prev = this.workerBoot.get(id)
@@ -334,7 +361,7 @@ class HyperliquidBalancer {
           logger.warn(`Hyperliquid worker ${id} dead — rebalancing its users`)
           await this.rebalanceFrom(id)
           this.workerBoot.delete(id)
-          await this.redisSet.del(LAST_BOOT_KEY(id))
+          await this.redisSet?.del(LAST_BOOT_KEY(id))
         }
         continue
       }
@@ -348,7 +375,7 @@ class HyperliquidBalancer {
         // previous balancer instance. Subsequent restart detection
         // works only when we have an established baseline.
         this.workerBoot.set(id, boot)
-        await this.redisSet.set(LAST_BOOT_KEY(id), boot)
+        await this.redisSet?.set(LAST_BOOT_KEY(id), boot)
         states.push(`${id}=alive-new(load=${load}/${this.capFor(id)})`)
         await this.reconcileWorkerAssignments(id)
         continue
@@ -359,7 +386,7 @@ class HyperliquidBalancer {
         )
         await this.resendTo(id)
         this.workerBoot.set(id, boot)
-        await this.redisSet.set(LAST_BOOT_KEY(id), boot)
+        await this.redisSet?.set(LAST_BOOT_KEY(id), boot)
         states.push(`${id}=restarted(load=${load}/${this.capFor(id)})`)
         await this.reconcileWorkerAssignments(id)
         continue
@@ -396,7 +423,7 @@ class HyperliquidBalancer {
    * (e.g. very first tick after a fresh boot).
    */
   private async reconcileWorkerAssignments(workerId: string): Promise<void> {
-    const raw = await this.redisSet.get(WORKER_USERS_KEY(workerId))
+    const raw = await this.redisSet?.get(WORKER_USERS_KEY(workerId))
     if (!raw) return
     let reported: string[]
     try {
@@ -412,7 +439,7 @@ class HyperliquidBalancer {
       if (a.workerId !== workerId) continue
       if (actual.has(uuid)) continue
       this.assignments.delete(uuid)
-      await this.redisSet.del(`${ASSIGN_PREFIX}${uuid}`)
+      await this.redisSet?.del(`${ASSIGN_PREFIX}${uuid}`)
       dropped++
     }
     for (const uuid of actual) {
@@ -449,7 +476,7 @@ class HyperliquidBalancer {
       }
       a.workerId = newId
       this.assignments.set(uuid, a)
-      await this.redisSet.set(`${ASSIGN_PREFIX}${uuid}`, JSON.stringify(a))
+      await this.redisSet?.set(`${ASSIGN_PREFIX}${uuid}`, JSON.stringify(a))
       await this.rabbit.send(workerQueueName(newId), a.openPayload)
       moved++
     }
@@ -541,7 +568,7 @@ class HyperliquidBalancer {
   }
 
   private async alive(id: string): Promise<boolean> {
-    const hb = await this.redisSet.get(WORKER_HB_KEY(id))
+    const hb = await this.redisSet?.get(WORKER_HB_KEY(id))
     return Boolean(hb)
   }
 
@@ -552,13 +579,15 @@ class HyperliquidBalancer {
   private async loadAssignments(): Promise<void> {
     let cursor = '0'
     do {
-      const reply = await this.redisSet.scan(cursor, {
+      const reply = await this.redisSet?.instance?.scan(cursor, {
         MATCH: `${ASSIGN_PREFIX}*`,
         COUNT: 200,
       })
+      if (!reply) break
       cursor = `${reply.cursor}`
       if (reply.keys.length === 0) continue
-      const vals = await this.redisSet.mGet(reply.keys)
+      const vals = await this.redisSet?.instance?.mGet(reply.keys)
+      if (!vals) continue
       reply.keys.forEach((k: string, i: number) => {
         const uuid = k.slice(ASSIGN_PREFIX.length)
         const raw = vals[i]
@@ -576,7 +605,7 @@ class HyperliquidBalancer {
 
   private async loadLastBoots(): Promise<void> {
     for (const id of this.workers) {
-      const prev = await this.redisSet.get(LAST_BOOT_KEY(id))
+      const prev = await this.redisSet?.get(LAST_BOOT_KEY(id))
       if (prev) this.workerBoot.set(id, prev)
     }
   }

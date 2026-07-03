@@ -84,7 +84,7 @@ import {
   isExchangeEnabled,
   onAdminConfigChange,
 } from './utils/adminConfig'
-import RedisClient from './utils/redis'
+import RedisClient, { RedisWrapper } from './utils/redis'
 import { v4 } from 'uuid'
 import Rabbit from './utils/rabbit'
 import { rabbitUsersStreamKey, serviceLogRedis } from '../type'
@@ -561,13 +561,15 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
   true,
 )
 
+const LAST_STREM_EVENT_TIME_KEY = 'stream:lastEventTime'
+
 class UserConnector {
   private krakenLastUpdate: { spot: number; usdm: number } = {
     spot: 0,
     usdm: 0,
   }
-  private redisSet = RedisClient.getInstance()
-  private redis = RedisClient.getInstance()
+  private redisSet: RedisWrapper | null = null
+  private redis: RedisWrapper | null = null
   private rabbit = new Rabbit()
   private testMode: boolean
   /** Array of users for whom binance stream are opened */
@@ -652,20 +654,27 @@ class UserConnector {
         )
       }
       this.setupRabbit()
+      this.intiRedis()
       if (this.role === 'worker') {
         void this.startWorkerHeartbeat()
       } else if (this.role === 'balancer') {
         void this.hlBalancer.init()
       }
-      this.redis?.publish(
-        serviceLogRedis,
-        JSON.stringify({ restart: 'userStream' }),
-      )
+
       if (isAdminConfigEnabled()) {
         onAdminConfigChange(() => this.dropStreamsForDisabledExchanges())
       }
       this.startLivenessGuard()
     }
+  }
+
+  private async intiRedis() {
+    this.redis = await RedisClient.getInstance()
+    this.redisSet = await RedisClient.getInstance()
+    this.redis?.publish(
+      serviceLogRedis,
+      JSON.stringify({ restart: 'userStream' }),
+    )
   }
 
   /**
@@ -833,13 +842,15 @@ class UserConnector {
         `userStream:worker:${this.workerId}:boot`,
         bootEpoch,
       )
-      await this.redisSet?.set(`userStream:worker:${this.workerId}:hb`, '1', {
-        EX: ttl,
-      })
+      await this.redisSet?.set(
+        `userStream:worker:${this.workerId}:hb`,
+        '1',
+        ttl,
+      )
       await this.redisSet?.set(
         `userStream:worker:${this.workerId}:cap`,
         `${hlCap}`,
-        { EX: ttl },
+        ttl,
       )
       await this.publishWorkerUserList(ttl)
     } catch (e) {
@@ -849,10 +860,10 @@ class UserConnector {
     let tick = 0
     this.workerHeartbeatTimer = setInterval(() => {
       this.redisSet
-        ?.set(`userStream:worker:${this.workerId}:hb`, '1', { EX: ttl })
+        ?.set(`userStream:worker:${this.workerId}:hb`, '1', ttl)
         .catch((e) => this.logger(`Worker heartbeat tick failed: ${e}`, true))
       this.redisSet
-        ?.set(`userStream:worker:${this.workerId}:cap`, `${hlCap}`, { EX: ttl })
+        ?.set(`userStream:worker:${this.workerId}:cap`, `${hlCap}`, ttl)
         .catch((e) => this.logger(`Worker cap publish failed: ${e}`, true))
       this.publishWorkerUserList(ttl).catch((e) =>
         this.logger(`Worker user-list publish failed: ${e}`, true),
@@ -895,7 +906,7 @@ class UserConnector {
     await this.redisSet.set(
       `userStream:worker:${this.workerId}:users`,
       JSON.stringify(ids),
-      { EX: ttl },
+      ttl,
     )
   }
 
@@ -910,8 +921,9 @@ class UserConnector {
       uuid: string
     }
     type RabbitCloseMsg = { event: 'close stream'; uuid: string }
+    type RabbitForceRestartMsg = { event: 'force restart stream'; uuid: string }
     this.rabbit?.listenWithCallback<
-      RabbitOpenMsg | RabbitCloseMsg,
+      RabbitOpenMsg | RabbitCloseMsg | RabbitForceRestartMsg,
       WorkerOpenResponse | undefined
     >(
       queue,
@@ -968,6 +980,9 @@ class UserConnector {
           if (this.role === 'worker') {
             return { accepted: true, workerId: this.workerId }
           }
+        }
+        if (msg.event === 'force restart stream') {
+          this.restartStreams(msg.uuid)
         }
         return undefined
       },
@@ -2774,13 +2789,12 @@ class UserConnector {
   }
 
   @IdMute(mutex, () => 'restartStreams')
-  public async restartStreams() {
+  private async restartStreams(uuid?: string) {
     let c = 0
-    for (const user of this.users) {
+    for (const user of this.users.filter((u) =>
+      uuid ? u.id === uuid : true,
+    )) {
       c++
-      if (paperExchanges.includes(user.provider)) {
-        continue
-      }
       const count = this.subscribersMap.get(user.id) || 0
       const msg = this.subscribeMsgsMap.get(user.id)
       if (count && msg) {
@@ -2792,10 +2806,14 @@ class UserConnector {
           await this.openStreamCallback(msg, undefined)
         }
         this.logger(
-          `Restarted ${c} of ${this.users.length} ${user.id} ${msg.userId}`,
+          `Restarted ${c}${uuid ? '' : ` of ${this.users.length} `}${user.id} ${msg.userId}`,
         )
       }
     }
+  }
+
+  private async removeAccountFromWatchlist(accountId: string) {
+    await this.redis?.zRem(LAST_STREM_EVENT_TIME_KEY, accountId)
   }
 
   /** Close stream callback
@@ -2812,6 +2830,7 @@ class UserConnector {
     if (uuid) {
       const find = this.subscribersMap.get(uuid)
       if (!find) {
+        this.removeAccountFromWatchlist(uuid)
         return this.logger(`${uuid} has no subscribers`, true)
       }
       const left = find - 1
@@ -2824,6 +2843,7 @@ class UserConnector {
           try {
             user.close()
           } catch (err) {
+            this.removeAccountFromWatchlist(uuid)
             /** Catch error and emit to bot */
             return this.logger(err, true)
           }
@@ -2835,11 +2855,13 @@ class UserConnector {
           this.logger(`User ${uuid} stream was closed`)
           this.onAfterCloseStream(uuid)
         } else {
+          this.removeAccountFromWatchlist(uuid)
           return this.logger(`User ${uuid} not found`, true)
         }
       } else {
         this.logger(`${uuid} unsubscribed event`)
       }
+      this.removeAccountFromWatchlist(uuid)
       return
     }
   }
@@ -2864,7 +2886,12 @@ class UserConnector {
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
 
     if (!this.testMode) {
-      this.redis.publish(id, JSON.stringify(streamMsg))
+      this.redis?.publish(id, JSON.stringify(streamMsg))
+      this.redis?.zAdd(
+        LAST_STREM_EVENT_TIME_KEY,
+        { score: Date.now(), value: id },
+        true,
+      )
     } else {
       console.log('Stream Event:', JSON.stringify(streamMsg, null, 2))
     }
