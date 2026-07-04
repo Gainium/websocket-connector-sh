@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-07-04
+
+### Changed
+
+- Hyperliquid: Unit-bridged spot bases now normalize to their canonical ticker (`UETH→ETH`, `USOL→SOL`, …), derived authoritatively from `spotMeta` `fullName` (never a blanket `U` strip). The raw Unit pair is dual-registered so streams requested under the pre-normalization pair still resolve.
+
+### Fixed
+
+- Hyperliquid: spot candle subscriptions on a display name shared by a perp (e.g. `BTC-USDC`, and the newly-normalized `ETH-USDC`/`SOL-USDC`) now resolve to the spot `@N` stream instead of the perp — futures candles are no longer served to spot bots.
+
+## [1.10.0] - 2026-07-04
+
 ### Added
 - Price/candle data-stall observability: the price connector's per-channel watchdog now publishes a `{ watchdogStall }` event to the `serviceLog` Redis channel before it self-restarts, so the otherwise-silent recovery is visible to the admin watchdog (Telegram/email).
 - User-stream flap detector: a rolling-window reconnect counter per exchange+user (`noteReconnect`) emits a `{ userStreamFlap }` event to `serviceLog` once reconnects cross `USER_STREAM_FLAP_THRESHOLD` (default 4) within `USER_STREAM_FLAP_WINDOW_MS` (default 10 min) — the "connected but dead" signal. Hooked at the reconnect/forced-reconnect sites of Binance, Bybit, Bitget, Kraken, KuCoin, OKX, Coinbase. Strictly emit-only.

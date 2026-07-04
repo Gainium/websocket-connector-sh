@@ -24,6 +24,8 @@ class HyperliquidConnector extends CommonConnector {
     {
       coin: string
       interval: hl.WsCandleParameters['interval']
+      /** true = spot request (resolve the spot @N code, not the perp). */
+      isSpot: boolean
     }
   > = new Map()
   private symbols = HyperliquidSymbolMap.getInstance()
@@ -36,7 +38,11 @@ class HyperliquidConnector extends CommonConnector {
     /** Candle subscriptions currently active on this connection. Used to re-queue on reconnect. */
     items: Map<
       string,
-      { coin: string; interval: hl.WsCandleParameters['interval'] }
+      {
+        coin: string
+        interval: hl.WsCandleParameters['interval']
+        isSpot: boolean
+      }
     >
   }[] = [
     {
@@ -174,7 +180,11 @@ class HyperliquidConnector extends CommonConnector {
    */
   private async resubscribeEntry(
     entry: (typeof this.hyperliquidClientCandle)[number],
-    items: { coin: string; interval: hl.WsCandleParameters['interval'] }[],
+    items: {
+      coin: string
+      interval: hl.WsCandleParameters['interval']
+      isSpot: boolean
+    }[],
   ) {
     if (items.length === 0) return
     // Serialize subscriptions: send one at a time with a pause between each.
@@ -191,7 +201,7 @@ class HyperliquidConnector extends CommonConnector {
         continue
       }
       entry.items.set(`${c.coin}-${c.interval}`, c)
-      const wsCoin = this.toWsCoin(c.coin)
+      const wsCoin = this.toWsCoin(c.coin, c.isSpot)
       if (!wsCoin) {
         logger.error(
           `Failed to translate symbol ${c.coin} for Hyperliquid candle resubscription — skipping`,
@@ -357,8 +367,15 @@ class HyperliquidConnector extends CommonConnector {
           ExchangeEnum.paperHyperliquid,
         ].includes(exchange)
       ) {
+        // `exchange` is already mapped to the real venue (paper stripped),
+        // so spot = plain `hyperliquid` (perp = `hyperliquidLinear`).
+        const isSpot = exchange === ExchangeEnum.hyperliquid
         this.connectHyperliquidCandleStreams([
-          { symbol, interval: interval as hl.WsCandleParameters['interval'] },
+          {
+            symbol,
+            interval: interval as hl.WsCandleParameters['interval'],
+            isSpot,
+          },
         ])
       }
     }
@@ -388,8 +405,12 @@ class HyperliquidConnector extends CommonConnector {
    * (e.g. "BTC-USDC") → "BTC"; builder-dex pairs are always prefixed
    * `provider:BASE-QUOTE` (e.g. "xyz:HYUNDAI-USDC") → "xyz:HYUNDAI".
    */
-  private toWsCoin(coin: string): string | undefined {
-    return this.symbols.pairToCode(coin)
+  private toWsCoin(coin: string, isSpot: boolean): string | undefined {
+    // For a spot request, resolve the spot @N code even when a perp shares the
+    // display name (dev-confirmed: perp candles must not be served to spot).
+    return isSpot
+      ? this.symbols.spotPairToCode(coin)
+      : this.symbols.pairToCode(coin)
   }
 
   private stopHyperliquid() {
@@ -460,20 +481,23 @@ class HyperliquidConnector extends CommonConnector {
   }
 
   private async reconnectHyperliquidCandleStream() {
-    const store: string[][] = []
+    const store: { symbol: string; interval: string; isSpot: boolean }[] = []
     for (const ex of [
       ExchangeEnum.hyperliquid,
       ExchangeEnum.hyperliquidLinear,
     ] as const) {
+      const isSpot = ex === ExchangeEnum.hyperliquid
       const set = this.subscribedCandlesMap.get(ex) ?? new Set()
       set.forEach((s) => {
-        store.push(this.splitCandleRoomName(s))
+        const [symbol, interval] = this.splitCandleRoomName(s)
+        store.push({ symbol, interval, isSpot })
       })
     }
     this.connectHyperliquidCandleStreams(
-      store.map(([symbol, interval]) => ({
+      store.map(({ symbol, interval, isSpot }) => ({
         symbol,
         interval: interval as hl.WsCandleParameters['interval'],
+        isSpot,
       })),
     )
   }
@@ -528,17 +552,22 @@ class HyperliquidConnector extends CommonConnector {
 
   @IdMute(mutex, () => 'connectHyperliquid')
   private async connectHyperliquidCandleStreams(
-    _data: { symbol: string; interval: hl.WsCandleParameters['interval'] }[],
+    _data: {
+      symbol: string
+      interval: hl.WsCandleParameters['interval']
+      isSpot: boolean
+    }[],
     timer = false,
   ) {
-    const data = _data.map(({ symbol, interval }) => {
-      return { coin: symbol, interval }
+    const data = _data.map(({ symbol, interval, isSpot }) => {
+      return { coin: symbol, interval, isSpot }
     })
     if (!timer) {
       data.forEach((d) => {
         this.inQueueCandles.set(`${d.coin}-${d.interval}`, {
           coin: d.coin,
           interval: d.interval,
+          isSpot: d.isSpot,
         })
       })
       // First-win debounce: set the timer once on the first queued item.
@@ -557,6 +586,7 @@ class HyperliquidConnector extends CommonConnector {
       (d) => ({
         coin: d.coin,
         interval: d.interval,
+        isSpot: d.isSpot,
       }),
     )
     const keys = [...(this.inQueueCandles?.keys() ?? [])]
@@ -575,11 +605,13 @@ class HyperliquidConnector extends CommonConnector {
       [] as {
         coin: string
         interval: hl.WsCandleParameters['interval']
+        isSpot: boolean
       }[][],
     )
     const failedItems: {
       coin: string
       interval: hl.WsCandleParameters['interval']
+      isSpot: boolean
     }[] = []
     let i = 0
     for (const chunk of chunks) {
@@ -605,8 +637,9 @@ class HyperliquidConnector extends CommonConnector {
           ownerEntry?.items.set(`${c.coin}-${c.interval}`, {
             coin: c.coin,
             interval: c.interval,
+            isSpot: c.isSpot,
           })
-          const wsCoin = this.toWsCoin(c.coin)
+          const wsCoin = this.toWsCoin(c.coin, c.isSpot)
           if (!wsCoin) {
             logger.error(
               `Failed to translate symbol ${c.coin} for Hyperliquid candle subscription — skipping`,

@@ -2,15 +2,62 @@ import * as hl from '@nktkas/hyperliquid'
 import logger from './logger'
 
 /**
- * Hyperliquid spot tokens use deployer-chosen names that differ from how
- * the UI renders them. UBTC → BTC (wrapped BTC), USDT0 → USDT (wrapped
- * USDT, used by `cash` dex).
+ * Hyperliquid spot tokens use deployer-chosen names that differ from the
+ * canonical ticker the rest of the platform thinks in. The dominant case is
+ * **Unit** (hyperunit.xyz), which bridges spot assets under a `U`-prefixed
+ * name whose `fullName` is `Unit <Asset>` (UBTC/'Unit Bitcoin',
+ * UETH/'Unit Ethereum', …). We display those under the stripped ticker
+ * (UBTC→BTC), derived authoritatively from Hyperliquid's own `spotMeta`
+ * (fullName starts with 'Unit ' AND name starts with 'U'), never a blanket
+ * strip. Guards: safe-ident + no collision with an already-listed token
+ * (UPUMP→PUMP stays raw). `USDT0` (wrapped-USDT quote, not a Unit token)
+ * keeps a small explicit alias to USDT.
+ *
+ * MUST stay identical to the connector's `buildTokenDisplayMap`
+ * (exchange-connector-sh `hyperliquid/index.ts`): the pair↔wire mapping here
+ * and the pair naming there have to agree, or streams for a normalized pair
+ * fail to resolve. See root Danger List #5.
  */
-const TOKEN_ALIASES: Record<string, string> = {
-  UBTC: 'BTC',
-  USDT0: 'USDT',
+const QUOTE_TOKEN_ALIASES: Record<string, string> = { USDT0: 'USDT' }
+
+function buildTokenDisplayMap(
+  tokens: ReadonlyArray<{ name: string; fullName?: string | null }>,
+): Map<string, string> {
+  const rawNames = new Set(tokens.map((t) => t.name))
+  const proposals: Array<[string, string]> = []
+  const proposedCount = new Map<string, number>()
+  for (const t of tokens) {
+    if (
+      (t.fullName ?? '').startsWith('Unit ') &&
+      t.name.startsWith('U') &&
+      t.name.length > 1
+    ) {
+      const stripped = t.name.slice(1)
+      if (isSafeIdent(stripped)) {
+        proposals.push([t.name, stripped])
+        proposedCount.set(stripped, (proposedCount.get(stripped) ?? 0) + 1)
+      }
+    }
+  }
+  const map = new Map<string, string>()
+  for (const [name, display] of proposals) {
+    if (rawNames.has(display)) continue
+    if ((proposedCount.get(display) ?? 0) > 1) continue
+    map.set(name, display)
+  }
+  for (const [from, to] of Object.entries(QUOTE_TOKEN_ALIASES)) {
+    if (!rawNames.has(to) && !map.has(from)) map.set(from, to)
+  }
+  return map
 }
-const aliasToken = (name: string): string => TOKEN_ALIASES[name] ?? name
+
+/** Rebuilt on every spotMeta fetch. Seeded with the old static pair so a
+ *  failed/late first fetch can't regress UBTC/USDT0. */
+let tokenDisplayMap: Map<string, string> = new Map([
+  ['UBTC', 'BTC'],
+  ['USDT0', 'USDT'],
+])
+const aliasToken = (name: string): string => tokenDisplayMap.get(name) ?? name
 
 /**
  * HIP-3 builder dexes let third-party deployers register arbitrary
@@ -67,8 +114,15 @@ class HyperliquidSymbolMap {
     return HyperliquidSymbolMap.instance
   }
 
-  /** display pair → wire code */
+  /** display pair → wire code. A display name shared by a spot and a perp
+   *  market (e.g. 'BTC-USDC') resolves to the PERP code here (futures is
+   *  processed last and overwrites). Use `spotPairToCode` when the caller
+   *  knows it wants the spot market. */
   private nameToCode: Map<string, string> = new Map()
+  /** display pair → SPOT wire code only (never overwritten by perps). Lets a
+   *  spot candle subscription pick the spot `@N` stream instead of the perp
+   *  when the two share a display name. */
+  private spotNameToCode: Map<string, string> = new Map()
   /** wire code → display pair */
   private codeToName: Map<string, string> = new Map()
   /** Builder-dex names with at least one listed market (HL native excluded). */
@@ -87,6 +141,12 @@ class HyperliquidSymbolMap {
 
   pairToCode(pair: string): string | undefined {
     return this.nameToCode.get(pair)
+  }
+
+  /** Spot wire code for a display pair, falling back to the general map for
+   *  spot-only names (e.g. builder-dex or non-colliding spot pairs). */
+  spotPairToCode(pair: string): string | undefined {
+    return this.spotNameToCode.get(pair) ?? this.nameToCode.get(pair)
   }
 
   codeToPair(code: string): string | undefined {
@@ -129,18 +189,29 @@ class HyperliquidSymbolMap {
   private async _refresh(): Promise<void> {
     try {
       const newName = new Map<string, string>()
+      const newSpotName = new Map<string, string>()
       const newCode = new Map<string, string>()
 
       // Spot
       const spot = await this.client.spotMeta()
       const spotTokens = spot.tokens
+      tokenDisplayMap = buildTokenDisplayMap(spotTokens)
       spot.universe.forEach((u) => {
         const base = spotTokens.find((t) => t.index === u.tokens[0])
-        const baseName = base?.name ? aliasToken(base.name) : undefined
         const quote = spotTokens.find((t) => t.index === u.tokens[1])
-        if (!baseName || !quote) return
-        const display = `${baseName}-${aliasToken(quote.name)}`
+        if (!base?.name || !quote) return
+        const display = `${aliasToken(base.name)}-${aliasToken(quote.name)}`
+        // Register the raw Unit pair as a backward-compat alias so a stream
+        // requested under the pre-normalization pair (e.g. 'UETH-USDC' from a
+        // bot created before this change) still resolves to the same wire
+        // code. The Redis channel (codeToName) uses the normalized form.
+        const rawPair = `${base.name}-${quote.name}`
         newName.set(display, u.name)
+        if (rawPair !== display) newName.set(rawPair, u.name)
+        // Spot-only map: keep the spot @N code even when a perp later claims
+        // the same display name, so spot candle subscriptions stay on spot.
+        newSpotName.set(display, u.name)
+        if (rawPair !== display) newSpotName.set(rawPair, u.name)
         newCode.set(u.name, display)
       })
 
@@ -215,6 +286,7 @@ class HyperliquidSymbolMap {
 
       if (newName.size > 0) {
         this.nameToCode = newName
+        this.spotNameToCode = newSpotName
         this.codeToName = newCode
         this.dexNames = newDexNames
         logger.info(
