@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-07-05
+
+### Fixed
+
+- Candle watchdog crash-loop (bybit, binance, okx): the candle liveness signal (`lastDataTrade`) only advanced on *confirmed* (closed) candles, so any candle subscription on an interval ≥~2min looked stalled between closes and the watchdog crash-looped the worker every ~5min (chronic since v1.5.4's confirmed-only change; bybit was actively tripping, binance/okx were latent — kept fresh only by short-interval subs). Liveness now advances on every kline frame (confirmed or not) in all three; publishing stays confirmed-only, so downstream data is unchanged. bitget/kraken/kucoin/hyperliquid were never gated and are unaffected.
+
+### Changed
+
+- Stall isolation: on a candle stall, `BybitConnector` now restarts only its candle streams (targeted `handleStall` recovery) instead of throwing and crashing the whole worker (which also dropped ticker feeds and every other bybit market). Bounded to `maxTargetedRestarts` (2) between real data events before escalating to the previous full-worker restart, so a genuinely dead worker is still recovered. Other connectors keep the throw-based behavior unchanged.
+
 ## [1.11.0] - 2026-07-04
 
 ### Changed

@@ -94,6 +94,11 @@ class BybitConnector extends CommonConnector {
   private bybitCandleCb(e: ExchangeEnum) {
     return (msg: any) => {
       if (msg.topic.includes('kline')) {
+        // Liveness: every kline frame (confirmed or not) proves the feed is
+        // alive. Without this, lastDataTrade only advances on candle *close*,
+        // so any interval >~2min looks stalled between closes and the watchdog
+        // crash-loops the worker. Publishing stays confirmed-only below.
+        this.noteCandleActivity(e)
         if (!msg?.data[0]?.confirm) {
           return
         }
@@ -406,6 +411,51 @@ class BybitConnector extends CommonConnector {
   override stop() {
     super.stop()
     this.stopBybit()
+  }
+
+  /**
+   * Recreate the candle WS clients (spot/linear/inverse) and re-subscribe all
+   * tracked candle topics, without tearing down ticker sockets or crashing the
+   * worker. Used for targeted stall recovery.
+   */
+  private restartCandleStreams() {
+    this.bybitClientCandle = this.bybitClientCandle.map((c) => ({
+      id: c.id,
+      count: 0,
+      client: this.getBybitClient(ExchangeEnum.bybit, 'candle', c.client),
+    }))
+    this.bybitClientCandleUsdm = this.bybitClientCandleUsdm.map((c) => ({
+      id: c.id,
+      count: 0,
+      client: this.getBybitClient(ExchangeEnum.bybitUsdm, 'candle', c.client),
+    }))
+    this.bybitClientCandleCoinm = this.bybitClientCandleCoinm.map((c) => ({
+      id: c.id,
+      count: 0,
+      client: this.getBybitClient(ExchangeEnum.bybitCoinm, 'candle', c.client),
+    }))
+    this.reconnectBybitCandleStream()
+  }
+
+  /**
+   * Fix #1: recover a candle stall by restarting only the bybit candle streams
+   * instead of crashing the whole worker (which also drops the ticker feeds and
+   * every other bybit market). Ticker/connect stalls still fall through to the
+   * full-worker restart. `CommonConnector` bounds how many times this runs
+   * before escalating to the old throw-based restart.
+   */
+  protected override handleStall(
+    exchange: ExchangeEnum,
+    kind: 'price' | 'candle' | 'connect',
+  ): boolean {
+    if (kind !== 'candle') {
+      return false
+    }
+    logger.info(
+      `Bybit ${exchange} candle stall — targeted candle-stream restart (no full-worker crash)`,
+    )
+    this.restartCandleStreams()
+    return true
   }
 
   private convertBybitTicker(

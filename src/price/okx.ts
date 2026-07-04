@@ -100,6 +100,10 @@ class OkxConnector extends CommonConnector {
   private okxCandleCb(e: ExchangeEnum) {
     return (msg: any) => {
       if (msg.arg.channel.includes('candle')) {
+        // Liveness on every kline frame (index 8 = confirmed); publishing stays
+        // confirmed-only below. Otherwise lastDataTrade only advances on candle
+        // close and long-interval-only subs trip the watchdog. See bybit.ts.
+        this.noteCandleActivity(e)
         if (msg.data[0][8] !== '1') {
           return
         }

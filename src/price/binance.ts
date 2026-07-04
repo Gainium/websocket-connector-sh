@@ -88,6 +88,10 @@ class BinanceConnector extends CommonConnector {
   private binanceCandleCb(e: ExchangeEnum) {
     return (d: WsRawMessage) => {
       if (!Array.isArray(d) && d.e === 'kline') {
+        // Liveness on every kline frame (open or closed); publishing stays
+        // closed-only below. Otherwise lastDataTrade only advances on candle
+        // close and long-interval-only subs trip the watchdog. See bybit.ts.
+        this.noteCandleActivity(e)
         if (!d.k.x) {
           return
         }
