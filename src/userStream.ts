@@ -590,6 +590,15 @@ class UserConnector {
   /** Rolling-window reconnect timestamps per `${exchange}:${id}`, for the
    *  user-stream flap detector (noteReconnect). Emit-only telemetry. */
   private streamFlaps: Map<string, number[]> = new Map()
+  /** Consecutive Binance auth-rejection (-2015/-2014/-2008 / HTTP 401) count
+   *  per room id. A rejected key/IP/permission never recovers by reconnecting,
+   *  so we circuit-break instead of looping every ~60s. Cleared once the room
+   *  delivers a real user-data event (proof the key is authorized). */
+  private binanceAuthErrors: Map<string, number> = new Map()
+  /** Rooms in an auth-rejection cooldown: id → epoch-ms when a retry is
+   *  allowed. While in cooldown we neither reopen the stream nor emit a flap
+   *  alert for the room (it's a user credential problem, not dead infra). */
+  private authCooldownUntil: Map<string, number> = new Map()
   private kucoinSymbols: { coinm: KucoinSymbol[]; usdm: KucoinSymbol[] } = {
     coinm: [],
     usdm: [],
@@ -1091,6 +1100,16 @@ class UserConnector {
    */
   private noteReconnect(id: string, exchange: string) {
     try {
+      // Don't page on reconnect churn for a room we've already flagged as
+      // auth-rejected — that's a user credential problem the circuit-breaker is
+      // handling, not a "connected but dead" stream. Suppresses from the first
+      // observed auth error, before the cooldown even arms.
+      if (
+        (this.binanceAuthErrors.get(id) ?? 0) > 0 ||
+        (this.authCooldownUntil.get(id) ?? 0) > Date.now()
+      ) {
+        return
+      }
       const windowMs =
         Number(process.env.USER_STREAM_FLAP_WINDOW_MS) || 10 * 60 * 1000
       const threshold = Number(process.env.USER_STREAM_FLAP_THRESHOLD) || 4
@@ -1198,6 +1217,20 @@ class UserConnector {
           `${userId}${api.key}${api.secret}${api.provider}${api.passphrase}${api.keysType}${api.okxSource}`,
         )
         .digest('hex')
+    // Auth-rejection cooldown: a key Binance rejected (-2015 etc.) is
+    // circuit-broken — don't reopen until the cooldown elapses, regardless of
+    // who requests it (self-retry, main-app health loop, bot restart). A
+    // regenerated key hashes to a different `id`, so this only gates the exact
+    // rejected credential and never blocks a fixed key.
+    const cooldownUntil = this.authCooldownUntil.get(id) ?? 0
+    if (cooldownUntil > Date.now()) {
+      return this.logger(
+        `Skip subscribe for ${userId} (${api.provider}): key in auth-rejection cooldown for ${Math.round(
+          (cooldownUntil - Date.now()) / 1000,
+        )}s`,
+        true,
+      )
+    }
     let findUser = this.users.find((user) => user.id === id)
     if (!findUser) {
       findUser = {
@@ -1377,6 +1410,60 @@ class UserConnector {
             `${id} ${userId} ws saw error ${data?.wsKey} ${errorMsg} ${api.provider}`,
             true,
           )
+          // Auth-rejection circuit-breaker. A rejected key/IP/permission
+          // (-2015 invalid key/IP/perms, -2014 bad key format, -2008 invalid
+          // key, or a raw HTTP 401) will NOT recover by reconnecting — retrying
+          // every ~60s just burns Binance weight, holds the shared
+          // `openStream<provider>` mutex against healthy users, and trips the
+          // user-stream flap watchdog. After a small run of consecutive auth
+          // errors, stop and back off instead of resubscribing.
+          const wsErr: any = data ?? {}
+          const authCode = Number(wsErr?.error?.code ?? wsErr?.code)
+          const isAuthReject =
+            [-2015, -2014, -2008].includes(authCode) ||
+            Number(wsErr?.status) === 401
+          if (isAuthReject) {
+            const fails = (this.binanceAuthErrors.get(id) ?? 0) + 1
+            this.binanceAuthErrors.set(id, fails)
+            const threshold =
+              Number(process.env.USER_STREAM_AUTH_FAIL_THRESHOLD) || 3
+            if (fails < threshold) return
+            const cooldownMs = Math.max(
+              60_000,
+              Number(process.env.USER_STREAM_AUTH_COOLDOWN_MS) ||
+                30 * 60 * 1000,
+            )
+            this.authCooldownUntil.set(id, Date.now() + cooldownMs)
+            this.binanceAuthErrors.delete(id)
+            this.binanceErrors.delete(id)
+            await stopMethod()
+            this.users = this.users.filter((u) => u.id !== id)
+            const subs = this.subscribersMap.get(id)
+            this.subscribersMap.delete(id)
+            this.logger(
+              `${id} ${userId} Binance key rejected (code ${
+                authCode || 401
+              }); circuit-broken for ${Math.round(
+                cooldownMs / 1000,
+              )}s — no reconnect, no flap alert`,
+              true,
+            )
+            // One delayed retry after the cooldown so a key fixed in place
+            // (e.g. egress IP added to the whitelist without regenerating the
+            // key) self-heals without a bot restart. If it's still rejected,
+            // this handler simply re-arms the cooldown.
+            if (subs) {
+              setTimeout(() => {
+                if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
+                  this.authCooldownUntil.delete(id)
+                  ;[...Array(subs)].forEach(() =>
+                    this.openStreamCallback(msg, uuid),
+                  )
+                }
+              }, cooldownMs)
+            }
+            return
+          }
           this.binanceErrors.set(id, (this.binanceErrors.get(id) ?? 0) + 1)
           if ((this.binanceErrors.get(id) ?? 0) >= 2) {
             await stopMethod()
@@ -2883,6 +2970,10 @@ class UserConnector {
     // Liveness signal: this room delivered an event. Used by the liveness
     // guard to tell a silently-dead stream from a healthy one.
     this.lastEventAt.set(id, Date.now())
+    // A delivered event proves the key is authorized — clear any auth-rejection
+    // state so a recovered account isn't held back by a stale counter/cooldown.
+    if (this.binanceAuthErrors.has(id)) this.binanceAuthErrors.delete(id)
+    if (this.authCooldownUntil.has(id)) this.authCooldownUntil.delete(id)
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
 
     if (!this.testMode) {

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-07-05
+
+### Fixed
+
+- Binance user-stream auth-rejection loop: a rejected API key (`-2015` invalid key/IP/permissions, `-2014`/`-2008`, or HTTP 401) made the WS-API session reconnect every ~60s indefinitely (observed 11 days on one account) — burning Binance request weight, holding the shared per-provider `openStream<provider>` mutex against healthy users, and tripping the user-stream flap watchdog with misleading "connected but dead" pages. Added a circuit-breaker: after `USER_STREAM_AUTH_FAIL_THRESHOLD` (3) consecutive auth errors the room stops and backs off for `USER_STREAM_AUTH_COOLDOWN_MS` (30min) instead of resubscribing, with a single self-retry after the cooldown so a key fixed in place (e.g. egress IP whitelisted without regenerating) self-heals. Flap alerts are suppressed from the first auth error for that room. Auth state clears on the next delivered user-data event; a regenerated key hashes to a new room id and is never gated.
+
 ## [1.11.1] - 2026-07-05
 
 ### Fixed
