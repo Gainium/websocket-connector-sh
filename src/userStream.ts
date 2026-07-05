@@ -634,6 +634,21 @@ class UserConnector {
   private lastEventAt: Map<string, number> = new Map()
   private lastResubAt: Map<string, number> = new Map()
   private livenessTimer: NodeJS.Timeout | null = null
+  /**
+   * LOCAL-ONLY fault injector for the missed-fill failsafe repro harness
+   * (spec §9.1). When `DROP_USERSTREAM_FILLS` is set to a clientOrderId (matched
+   * against `msg.externalId`) OR a symbol (matched against `msg.symbol`), the
+   * next `DROP_USERSTREAM_FILLS_COUNT` (default 1) FILLED-family paper order
+   * events for that target are suppressed — simulating a user-stream drop so a
+   * fill sits `NEW` in main-app forever. Everything else (balances, other
+   * orders, non-fill statuses) passes through untouched. Default off; zero
+   * impact on real exchanges (paper `cbOrder` path only).
+   */
+  private dropFillsTarget = process.env.DROP_USERSTREAM_FILLS?.trim() || ''
+  private dropFillsRemaining =
+    this.dropFillsTarget !== ''
+      ? Math.max(1, +(process.env.DROP_USERSTREAM_FILLS_COUNT ?? '1') || 1)
+      : 0
   /** Constructor method
    * Determine class variables
    * Start server
@@ -676,6 +691,12 @@ class UserConnector {
         onAdminConfigChange(() => this.dropStreamsForDisabledExchanges())
       }
       this.startLivenessGuard()
+      if (this.dropFillsTarget !== '') {
+        this.logger(
+          `[FAULT-INJECTOR] ARMED — DROP_USERSTREAM_FILLS=${this.dropFillsTarget} ` +
+            `count=${this.dropFillsRemaining} (paper FILLED-family events only; LOCAL repro harness)`,
+        )
+      }
     }
   }
 
@@ -2761,6 +2782,23 @@ class UserConnector {
               return
             }
             if (msg) {
+              // LOCAL-ONLY missed-fill fault injector (spec §9.1). Suppress the
+              // relay of FILLED-family paper events matching the configured
+              // target so the fill is never booked in main-app (stuck NEW),
+              // reproducing the prod user-stream drop. Everything else flows.
+              if (
+                this.dropFillsRemaining > 0 &&
+                (msg.externalId === this.dropFillsTarget ||
+                  msg.symbol === this.dropFillsTarget) &&
+                (msg.status === 'FILLED' || msg.status === 'PARTIALLY_FILLED')
+              ) {
+                this.dropFillsRemaining -= 1
+                this.logger(
+                  `[FAULT-INJECTOR] dropping executionReport for ` +
+                    `${msg.externalId}/${msg.symbol} (${this.dropFillsRemaining} remaining)`,
+                )
+                return
+              }
               this.userStreamEvent(id, this.preparePaperOrderMsg(msg))
             }
           }

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.4] - 2026-07-05
+
+### Added
+- LOCAL-ONLY fault injector for the missed-fill failsafe repro harness: env-gated `DROP_USERSTREAM_FILLS=<clientOrderId|symbol>` (+`DROP_USERSTREAM_FILLS_COUNT`, default 1) suppresses matching FILLED-family paper `executionReport` relays in the paper `cbOrder` path; loud `[FAULT-INJECTOR]` logs; zero real-exchange impact (spec §9.1)
+
 ## [1.11.3] - 2026-07-05
 
 ### Fixed
