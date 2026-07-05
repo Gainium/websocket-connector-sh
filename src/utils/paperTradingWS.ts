@@ -9,8 +9,10 @@ export const connectPaper = (
   cbOrder: (msg: PaperOrderMessage) => void,
   cbAccount: (msg: PaperOutboundAccountInfo) => void,
 ) => {
-  const prefix = paper.startsWith('ws://') ? '' : 'ws://'
-  const manager = new Manager(`${prefix}${paper}`, {
+  // PAPER_WS may carry any scheme (prod configs vary); only prefix ws:// on a
+  // bare host:port — blindly prefixing yields ws://http://… = silently dead socket
+  const url = /^(https?|wss?):\/\//.test(paper) ? paper : `ws://${paper}`
+  const manager = new Manager(url, {
     transports: ['websocket', 'polling'],
   })
 
