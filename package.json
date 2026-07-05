@@ -43,7 +43,7 @@
     "axios": "^1.16.0",
     "binance": "^3.1.9",
     "bitget-api": "^2.3.6",
-    "bybit-api": "^4.1.17",
+    "bybit-api": "4.1.17",
     "coinbase-advanced-node": "^4.1.0",
     "dotenv": "^17.2.0",
     "isomorphic-ws": "^5.0.0",

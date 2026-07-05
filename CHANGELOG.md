@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.11.2] - 2026-07-05
+## [1.11.3] - 2026-07-05
+
+### Fixed
+
+- Auth-rejection circuit-breaker (1.11.2) never actually tripped: the failing WS-API frames also flow through the normal `userStreamEvent` path, whose "recovered" clear reset the consecutive auth-error counter every reconnect cycle, so it never reached the threshold (verified on prod — a key with 5 consecutive `-2015`s still looped). Now (a) the auth-error tracker is a **time window** (default 3 within `USER_STREAM_AUTH_WINDOW_MS`=10min) that interleaved frames can't silently reset, and (b) the recovery-clear is gated to **genuine account events** (`executionReport`/`outboundAccountPosition`/`balanceUpdate`/`ORDER_TRADE_UPDATE`/`ACCOUNT_UPDATE`/…) so a rejected key can no longer count its own error frames as recovery. Cooldown/self-retry behaviour unchanged.
 
 ### Fixed
 
