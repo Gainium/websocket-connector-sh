@@ -1436,6 +1436,10 @@ class UserConnector {
               (t) => now - t < windowMs,
             )
             hits.push(now)
+            this.logger(
+              `[authdbg] ${id} authFail hits=${hits.length}/${threshold} code=${authCode}`,
+              true,
+            )
             if (hits.length < threshold) {
               this.binanceAuthErrors.set(id, hits)
               return
@@ -2998,6 +3002,12 @@ class UserConnector {
       authOkEvent === 'ACCOUNT_UPDATE' ||
       authOkEvent === 'ACCOUNT_CONFIG_UPDATE'
     ) {
+      if (this.binanceAuthErrors.has(id) || this.authCooldownUntil.has(id)) {
+        this.logger(
+          `[authdbg] ${id} auth state CLEARED by account event=${authOkEvent}`,
+          true,
+        )
+      }
       if (this.binanceAuthErrors.has(id)) this.binanceAuthErrors.delete(id)
       if (this.authCooldownUntil.has(id)) this.authCooldownUntil.delete(id)
     }
