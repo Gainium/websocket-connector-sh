@@ -517,7 +517,7 @@ class BybitConnector extends CommonConnector {
       symbol: msg.symbol,
       bestBid: msg.bid1Price,
       bestAsk: msg.ask1Price,
-      bestAskQnt: msg.ask1Price,
+      bestAskQnt: msg.ask1Size,
       bestBidQnt: msg.bid1Size,
     }
   }

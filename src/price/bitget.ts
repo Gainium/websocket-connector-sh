@@ -642,7 +642,7 @@ class BitgetConnector extends CommonConnector {
       bestBid: msg.bidPr,
       bestAsk: msg.askPr,
       bestAskQnt: msg.askSz,
-      bestBidQnt: msg.bidPr,
+      bestBidQnt: msg.bidSz,
     }
   }
 }
