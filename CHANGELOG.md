@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-07-06
+
+### Fixed
+
+- **Hyperliquid two-channel fill drop (root cause of the ongoing HL missed fills).** HL splits order data across two WS channels — `orderUpdates` (status only) and `userFills` (the real px/sz, buffered by cloid in `hyperliquidExpirableMap`). `prepareHyperliquidOrder` emitted execution reports from `orderUpdates` and **hard-dropped a FILLED update whose fills weren't buffered** (`if (isFilled && !get) return false`, added in v1.6.3). The drop was deliberate — emitting a FILLED without the buffered fills books it at `limitPx` instead of the real average price (an earlier bug Maksym fixed by dropping) — but any lost/late/expired/reconnect-snapshot `userFills` message then meant the FILLED event was never relayed to main-app, so the order stayed `NEW` and the deal silently froze. Replaced the drop with **park-and-retry** (`src/utils/hyperliquidFillPark.ts`), preserving price accuracy while closing the hole:
+  - A FILLED-without-fills update is PARKED in a bounded, TTL'd map (keyed by cloid; `HL_FILL_PARK_MAX_SIZE`, default 5000) instead of dropped.
+  - Resolution order (first that yields fills wins): **(1) buffer** — fills arriving on `userFills` during a grace window (`HL_FILL_PARK_GRACE_MS`, default 5s) resolve it immediately with the real average price, exactly as before; **(2) REST** — grace expires with no buffered fill ⇒ one `info.userFillsByTime` lookup (public, address-scoped) fetches the real fills; **(3) limitPx** — REST also fails/empty ⇒ emit at `limitPx` as a loudly-logged last resort (a slightly-off average beats a permanently frozen deal).
+  - `userFills` snapshots (replayed on reconnect) are no longer skipped wholesale: snapshot fills are now applied for cloids that have a parked order waiting on them (still gated so unrelated snapshot fills don't re-pollute the buffer — the original reason snapshots were skipped).
+  - Interim safety net unchanged: the fill-failsafe detector already reconciles these within ~35–60s; this patches the hole the net was covering. **Changes Maksym's deliberate price-accuracy tradeoff — requires his semantic review before deploy (ClickUp 86ey5zc49 §1).**
+  - New env knobs: `HL_FILL_PARK_GRACE_MS`, `HL_FILL_PARK_MAX_SIZE`, `HL_FILL_REST_LOOKBACK_MS`. Unit coverage under `test/` (`npm test`): fill-after-park (real price), grace→REST fallback, REST-fail/empty→limitPx, snapshot-fill matches parked update, and size-cap eviction.
+
 ## [1.11.4] - 2026-07-05
 
 ### Added

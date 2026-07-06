@@ -21,6 +21,6 @@
     "baseUrl": ".",
     "experimentalDecorators": true,
   },
-  "exclude": ["node_modules"],
+  "exclude": ["node_modules", "test", "**/*.test.ts"],
   "include": ["**/*.ts", "**/*.tsx", "src/price/worker.js"]
 }
