@@ -33,6 +33,9 @@
  * testable without the surrounding `UserConnector`.
  */
 
+import { CommonOrder } from '../../type'
+import { ExchangeEnum } from './common'
+
 /** Context handed to the REST fallback for a parked, filled order. */
 export interface ParkContext {
   /** Client order id (map key). */
@@ -45,6 +48,8 @@ export interface ParkContext {
   user: string
   /** `statusTimestamp` of the FILLED update (ms epoch) — REST lookback anchor. */
   statusTimestamp: number
+  key: string
+  exchange: ExchangeEnum
 }
 
 /** Everything needed to park a filled order until its fills are known. */
@@ -70,9 +75,11 @@ export interface HyperliquidFillParkOptions<TOrder, TFill, TEvent> {
   /** Drop the buffered fills for a cloid once consumed. */
   clearBufferedFills: (cloid: string) => void
   /** REST fallback: fetch the real fills for a filled order (`[]` if none/unavailable). */
-  restLookup: (ctx: ParkContext) => Promise<TFill[]>
+  restLookup: (ctx: ParkContext) => Promise<CommonOrder | null>
   /** Build the execution-report event from an order + resolved fills (empty ⇒ limitPx). */
   buildEvent: (order: TOrder, fills: TFill[]) => TEvent
+  /** Build the execution-report event from an order + resolved commonOrder. */
+  buildEventFromCommonOrder: (order: TOrder, commonOrder: CommonOrder) => TEvent
   /** Relay a resolved event to the user-stream. */
   emit: (roomId: string, event: TEvent) => void
   /** Structured logging (msg, isError). */
@@ -190,22 +197,27 @@ export class HyperliquidFillParkResolver<TOrder, TFill, TEvent> {
 
     // 2. REST fallback: one lookup for the real fills.
     try {
-      const fills = await this.opts.restLookup({
+      const order = await this.opts.restLookup({
         cloid,
         roomId: entry.roomId,
         oid: entry.oid,
         user: entry.user,
         statusTimestamp: entry.statusTimestamp,
+        exchange: entry.exchange,
+        key: entry.key,
       })
-      if (fills && fills.length) {
-        this.opts.emit(entry.roomId, this.opts.buildEvent(entry.order, fills))
+      if (order) {
+        this.opts.emit(
+          entry.roomId,
+          this.opts.buildEventFromCommonOrder(entry.order, order),
+        )
         this.opts.log(
-          `[hl-park] resolved cloid ${cloid} via REST after ${trigger} (${fills.length} fills)`,
+          `[hl-park] resolved cloid ${cloid} via REST after ${trigger} (${order.status} status)`,
         )
         return
       }
       this.opts.log(
-        `[hl-park] REST returned no fills for cloid ${cloid} (oid ${entry.oid}) after ${trigger}; emitting at limitPx (LAST RESORT)`,
+        `[hl-park] REST returned no order for cloid ${cloid} (oid ${entry.oid}) after ${trigger}; emitting at limitPx (LAST RESORT)`,
         true,
       )
     } catch (err) {
@@ -215,9 +227,6 @@ export class HyperliquidFillParkResolver<TOrder, TFill, TEvent> {
         true,
       )
     }
-
-    // 3. Last resort: emit at limitPx (empty fills ⇒ buildEvent uses limitPx).
-    this.opts.emit(entry.roomId, this.opts.buildEvent(entry.order, []))
   }
 }
 

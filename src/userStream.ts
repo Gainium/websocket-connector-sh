@@ -72,7 +72,10 @@ import logger from './utils/logger'
 import { IdMute, IdMutex } from './utils/mutex'
 import sleep from './utils/sleep'
 import {
+  BaseReturn,
   KucoinSymbol,
+  ReturnBad,
+  StatusEnum,
   getKrakenSymbolMaps,
   getKucoinSymbolsByMarket,
   resetKrakenMaps,
@@ -87,7 +90,7 @@ import {
 import RedisClient, { RedisWrapper } from './utils/redis'
 import { v4 } from 'uuid'
 import Rabbit from './utils/rabbit'
-import { rabbitUsersStreamKey, serviceLogRedis } from '../type'
+import { CommonOrder, rabbitUsersStreamKey, serviceLogRedis } from '../type'
 import { RestClientV5 } from 'bybit-api'
 import ExpirableMap from './utils/expirableMap'
 import HyperliquidBalancer, {
@@ -106,6 +109,8 @@ import {
   ingestUserFills,
   type ParkContext,
 } from './utils/hyperliquidFillPark'
+import { exchangeUrl } from './utils/env'
+import axios from 'axios'
 
 const mutex = new IdMutex()
 
@@ -571,10 +576,6 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
 // arrive before falling back to a REST lookup. Size cap bounds the map.
 const HL_FILL_PARK_GRACE_MS = Number(process.env.HL_FILL_PARK_GRACE_MS) || 5000
 const HL_FILL_PARK_MAX_SIZE = Number(process.env.HL_FILL_PARK_MAX_SIZE) || 5000
-// REST fallback looks back this far from the FILLED update's statusTimestamp
-// when querying `userFillsByTime` (fills land within a few ms of the status).
-const HL_FILL_REST_LOOKBACK_MS =
-  Number(process.env.HL_FILL_REST_LOOKBACK_MS) || 5 * 60 * 1000
 
 const LAST_STREM_EVENT_TIME_KEY = 'stream:lastEventTime'
 
@@ -665,9 +666,11 @@ class UserConnector {
     clearBufferedFills: (cloid) => {
       hyperliquidExpirableMap.delete(cloid)
     },
-    restLookup: (ctx) => this.hlRestLookupFills(ctx),
+    restLookup: (ctx) => this.hlRestLookupOrder(ctx),
     buildEvent: (order, fills) =>
       this.buildHyperliquidExecutionReport(order, fills),
+    buildEventFromCommonOrder: (order, commonOrder) =>
+      this.buildHyperliquidExecutionReportFromCommonOrder(order, commonOrder),
     emit: (roomId, event) => this.userStreamEvent(roomId, event),
     log: (msg, isError) => this.logger(msg, isError),
   })
@@ -2598,7 +2601,12 @@ class UserConnector {
             onOrderUpdates: async (msgs) => {
               const prepared = await this.prepareHyperliquidOrder(
                 msgs as hl.OrderStatus<hl.Order>[],
-                { roomId: id, user: api.key },
+                {
+                  roomId: id,
+                  user: api.key,
+                  exchange: api.provider,
+                  key: api.key,
+                },
               )
               prepared.map((o) => this.userStreamEvent(id, o))
             },
@@ -2987,7 +2995,7 @@ class UserConnector {
         }
         await sleep(250)
         for (let i = 0; i < count; i++) {
-          await this.openStreamCallback(msg, undefined)
+          await this.openStreamCallback(msg, uuid)
         }
         this.logger(
           `Restarted ${c}${uuid ? '' : ` of ${this.users.length} `}${user.id} ${msg.userId}`,
@@ -3434,6 +3442,31 @@ class UserConnector {
     }
   }
 
+  private buildHyperliquidExecutionReportFromCommonOrder(
+    order: hl.OrderStatus<hl.Order>,
+    commonOrder: CommonOrder,
+  ): UserDataStreamEvent & { uniqueMessageId?: string } {
+    return {
+      creationTime: new Date(order.statusTimestamp).getTime(),
+      eventTime: new Date(order.statusTimestamp).getTime(),
+      eventType: 'executionReport',
+      newClientOrderId: order.order.cloid ?? '',
+      orderId: order.order.oid,
+      orderTime: new Date(order.statusTimestamp).getTime(),
+      orderStatus: commonOrder.status,
+      orderType: 'LIMIT',
+      originalClientOrderId: order.order.cloid ?? '',
+      price: commonOrder.price,
+      quantity: `${order.order.origSz}`,
+      side: order.order.side === 'A' ? 'BUY' : 'SELL',
+      symbol: order.order.coin,
+      totalQuoteTradeQuantity: `${commonOrder.cummulativeQuoteQty}`,
+      totalTradeQuantity: `${commonOrder.executedQty}`,
+      uniqueMessageId: `executionReport${JSON.stringify(order)},fills:${JSON.stringify(commonOrder)}`,
+      liquidation: false,
+    }
+  }
+
   /**
    * REST fallback for a parked HL fill: fetch the real per-fill px/sz via
    * `userFillsByTime` and keep only the fills for this cloid. Returns `[]` when
@@ -3442,19 +3475,37 @@ class UserConnector {
    * IP-whitelist), so this is a plain HTTPS call — reached only on the rare
    * dropped-fill path, never in steady state.
    */
-  private async hlRestLookupFills(ctx: ParkContext): Promise<hl.Fill[]> {
-    const isTestnet = process.env.HYPERLIQUIDENV === 'demo'
-    const transport = new hl.HttpTransport({ isTestnet, timeout: 10_000 })
-    const info = new hl.InfoClient({ transport })
-    const startTime = Math.max(
-      0,
-      (ctx.statusTimestamp || Date.now()) - HL_FILL_REST_LOOKBACK_MS,
-    )
-    const fills = await info.userFillsByTime({
-      user: ctx.user as `0x${string}`,
-      startTime,
-    })
-    return fills.filter((f) => !!f.cloid && `${f.cloid}` === ctx.cloid)
+  private async hlRestLookupOrder(
+    ctx: ParkContext,
+  ): Promise<CommonOrder | null> {
+    const url = exchangeUrl()
+    if (!url || !ctx.key || ctx.exchange) {
+      logger.error(
+        `Cannot get order ${ctx.cloid} when not enough data. url=${url} key=${ctx.key} exchange=${ctx.exchange}`,
+      )
+      return null
+    }
+    const data = await axios
+      .get<BaseReturn<CommonOrder>>(
+        `${url}/order?newClientOrderId=${ctx.cloid}`,
+        {
+          headers: {
+            exchange: ctx.exchange,
+            key: ctx.key,
+            secret: '',
+          },
+        },
+      )
+      .then((r) => r.data)
+      .catch((e) => {
+        logger.error(`Cannot get order info for ${ctx.cloid} ${e}`)
+        return {
+          status: StatusEnum.notok,
+          reason: 'Cannot get orders info',
+          data: null,
+        } as ReturnBad
+      })
+    return data.data
   }
 
   /**
@@ -3469,7 +3520,7 @@ class UserConnector {
    */
   private async prepareHyperliquidOrder(
     data: hl.OrderStatus<hl.Order>[],
-    ctx: { roomId: string; user: string },
+    ctx: { roomId: string; user: string; exchange: ExchangeEnum; key: string },
   ): Promise<(UserDataStreamEvent & { uniqueMessageId?: string })[]> {
     const out: (UserDataStreamEvent & { uniqueMessageId?: string })[] = []
     for (const order of data) {
@@ -3487,6 +3538,8 @@ class UserConnector {
           user: ctx.user,
           statusTimestamp: new Date(order.statusTimestamp).getTime(),
           order,
+          exchange: ctx.exchange,
+          key: ctx.key,
         })
         continue
       }

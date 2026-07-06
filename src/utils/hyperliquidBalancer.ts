@@ -127,11 +127,7 @@ class HyperliquidBalancer {
     return this.workers.length > 0
   }
 
-  constructor() {
-    this.intiRedis()
-  }
-
-  private async intiRedis() {
+  private async initRedis() {
     this.redisSet = await RedisClient.getInstance()
   }
 
@@ -147,6 +143,7 @@ class HyperliquidBalancer {
   private async doInit(): Promise<void> {
     if (!this.enabled()) return
     try {
+      await this.initRedis()
       await this.loadAssignments()
       await this.loadLastBoots()
       // Load published per-worker caps up front. Without this, capFor()
