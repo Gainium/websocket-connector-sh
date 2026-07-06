@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-07-06
+
+### Added
+
+- **Kraken tokenized-stock ("xStocks") price feed.** `getKrakenSymbolMaps()` (spot path) now also fetches `getAssetPairs({ aclass: 'tokenized_asset' })` and merges those pairs into the spot symbol maps, so xStock `wsname`s (e.g. `AAPLx/USD`) enter the subscription list consumed by `price/kraken.ts`. Their prices flow to Redis like any Kraken spot pair. Additive + flag-gated behind `KRAKEN_XSTOCKS_ENABLED` (default ON). Default AssetPairs returns zero tokenized pairs, so crypto pairs cannot regress.
+
+
 ## [1.12.0] - 2026-07-06
 
 ### Fixed

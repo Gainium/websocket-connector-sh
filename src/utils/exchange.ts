@@ -359,40 +359,62 @@ export const getKrakenSymbolMaps = async (
   maps.assetNameMap.set('XBT', 'BTC')
   maps.assetNameMap.set('XDG', 'DOGE')
   if (exchange === ExchangeEnum.kraken) {
+    const mergeSpotPairs = (
+      result: Record<string, { base: string; quote: string; wsname?: string }>,
+    ) => {
+      Object.entries(result).forEach(([_symbol, pair]) => {
+        const base = pair.base
+        const quote = pair.quote
+        let normalizedBase = realAssets.result[base]?.altname || base
+        let normalizedQuote = realAssets.result[quote]?.altname || quote
+        if (normalizedBase === 'XBT') {
+          normalizedBase = 'BTC'
+        }
+        if (normalizedQuote === 'XBT') {
+          normalizedQuote = 'BTC'
+        }
+        if (normalizedQuote === 'XDG') {
+          normalizedQuote = 'DOGE'
+        }
+        if (normalizedBase === 'XDG') {
+          normalizedBase = 'DOGE'
+        }
+        const pairName = `${normalizedBase}-${normalizedQuote}` // e.g. BTC/USD
+
+        const wsname = (pair.wsname || pairName)
+          ?.replace('/XBT', '/BTC')
+          .replace(new RegExp('^XBT\/'), 'BTC/')
+          .replace('/XDG', '/DOGE')
+          .replace(new RegExp('^XDG\/'), 'DOGE/')
+        const normalized = pairName
+        maps.wsnameToNormalized.set(wsname, normalized)
+        maps.normalizedToWsname.set(normalized, wsname)
+      })
+    }
     try {
       const result = await krakenClient.getAssetPairs()
       if (result.result) {
-        Object.entries(result.result).forEach(([_symbol, pair]) => {
-          const base = pair.base
-          const quote = pair.quote
-          let normalizedBase = realAssets.result[base]?.altname || base
-          let normalizedQuote = realAssets.result[quote]?.altname || quote
-          if (normalizedBase === 'XBT') {
-            normalizedBase = 'BTC'
-          }
-          if (normalizedQuote === 'XBT') {
-            normalizedQuote = 'BTC'
-          }
-          if (normalizedQuote === 'XDG') {
-            normalizedQuote = 'DOGE'
-          }
-          if (normalizedBase === 'XDG') {
-            normalizedBase = 'DOGE'
-          }
-          const pairName = `${normalizedBase}-${normalizedQuote}` // e.g. BTC/USD
-
-          const wsname = (pair.wsname || pairName)
-            ?.replace('/XBT', '/BTC')
-            .replace(new RegExp('^XBT\/'), 'BTC/')
-            .replace('/XDG', '/DOGE')
-            .replace(new RegExp('^XDG\/'), 'DOGE/')
-          const normalized = pairName
-          maps.wsnameToNormalized.set(wsname, normalized)
-          maps.normalizedToWsname.set(normalized, wsname)
-        })
+        mergeSpotPairs(result.result)
       }
     } catch (e) {
       logger.error('Failed to get kraken spot symbol maps', e)
+    }
+    // Also subscribe to Kraken tokenized-stock ("xStocks") pairs so their
+    // prices flow to Redis. Additive + flag-gated (default ON). The AssetPairs
+    // endpoint uses param `aclass` (value `tokenized_asset`); the lib serializes
+    // arbitrary params straight into the query string. Default AssetPairs (no
+    // aclass) returns zero tokenized pairs, so this cannot regress crypto pairs.
+    if (process.env.KRAKEN_XSTOCKS_ENABLED !== 'false') {
+      try {
+        const tokenizedResult = await krakenClient.getAssetPairs({
+          aclass: 'tokenized_asset',
+        } as Parameters<typeof krakenClient.getAssetPairs>[0])
+        if (tokenizedResult.result) {
+          mergeSpotPairs(tokenizedResult.result)
+        }
+      } catch (e) {
+        logger.error('Failed to get kraken tokenized spot symbol maps', e)
+      }
     }
   } else if (exchange === ExchangeEnum.krakenUsdm) {
     const isDemo = process.env.KRAKEN_ENV === 'demo'
