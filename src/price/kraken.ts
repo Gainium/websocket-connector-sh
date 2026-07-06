@@ -19,6 +19,17 @@ const maxSubsPerClient = 200 // Conservative limit for Kraken
 
 const chunkSize = 100 // Symbols per subscription request
 
+// Kraken's candle OHLC feed is trade-driven (no periodic kline frames), so thin
+// markets legitimately go quiet well past the default candle timeout. Widen the
+// stall window for Kraken; the connection-liveness check (isFeedAlive) is the
+// real "is this feed dead" signal.
+const krakenCandleTradeTimeout = 180000
+
+// wsKey the kraken-api client uses per product family (matches the `subscribe`
+// calls below); also what `isConnected(wsKey)` is queried with.
+const spotWsKey = 'spotPublicV2'
+const derivativesWsKey = 'derivativesPublicV1'
+
 type KrakenClient = {
   client: KrakenWsClient
   subs: number
@@ -528,6 +539,102 @@ class KrakenConnector extends CommonConnector {
     logger.info(
       `Subscribed to ${symbols.length} Kraken USDM markets across ${this.krakenUsdmClients.length} connections`,
     )
+  }
+
+  /**
+   * Recreate just the candle WS client for the stalled product family and
+   * re-subscribe every tracked candle topic, without touching ticker sockets or
+   * crashing the whole worker. Used for targeted stall recovery.
+   */
+  private restartKrakenCandleStreams(exchange: ExchangeEnum) {
+    const isUsdm = [
+      ExchangeEnum.krakenUsdm,
+      ExchangeEnum.paperKrakenUsdm,
+    ].includes(exchange)
+
+    if (isUsdm) {
+      if (this.krakenUsdmCandleClient) {
+        this.krakenUsdmCandleClient.closeAll(true)
+        this.krakenUsdmCandleClient.removeAllListeners()
+        this.krakenUsdmCandleClient = null
+      }
+    } else if (this.krakenCandleClient) {
+      this.krakenCandleClient.closeAll(true)
+      this.krakenCandleClient.removeAllListeners()
+      this.krakenCandleClient = null
+    }
+
+    for (const [ex, symbols] of this.subscribedCandlesMap) {
+      if (
+        !isUsdm &&
+        [ExchangeEnum.kraken, ExchangeEnum.paperKraken].includes(ex)
+      ) {
+        for (const data of symbols) {
+          const [symbol, interval] = this.splitCandleRoomName(data)
+          this.connectKrakenCandleStream(symbol, interval)
+        }
+      } else if (
+        isUsdm &&
+        [ExchangeEnum.krakenUsdm, ExchangeEnum.paperKrakenUsdm].includes(ex)
+      ) {
+        for (const data of symbols) {
+          const [symbol, interval] = this.splitCandleRoomName(data)
+          this.connectKrakenFuturesCandleStream(
+            symbol,
+            interval,
+            ExchangeEnum.krakenUsdm,
+          )
+        }
+      }
+    }
+  }
+
+  /**
+   * Connection-liveness signal used to suppress false-positive stalls. Kraken's
+   * candle/ticker feeds only push on trades, so a quiet thin market looks
+   * stalled while the socket is alive. `isConnected(wsKey)` reflects the real
+   * socket state (kept alive by the client's heartbeat/pong, reconnected when
+   * dead), so a CONNECTED socket means "alive, just quiet", not a stall.
+   */
+  protected override isFeedAlive(
+    exchange: ExchangeEnum,
+    kind: 'price' | 'candle',
+  ): boolean {
+    const isUsdm = exchange === ExchangeEnum.krakenUsdm
+    if (kind === 'candle') {
+      const client = isUsdm
+        ? this.krakenUsdmCandleClient
+        : this.krakenCandleClient
+      return !!client?.isConnected(isUsdm ? derivativesWsKey : spotWsKey)
+    }
+    const clients = isUsdm ? this.krakenUsdmClients : this.krakenSpotClients
+    const wsKey = isUsdm ? derivativesWsKey : spotWsKey
+    return clients.some((c) => c.client.isConnected(wsKey))
+  }
+
+  /**
+   * Recover a candle stall by restarting only the affected Kraken candle stream
+   * instead of crashing the whole worker (which drops every other exchange's
+   * candle streams too). Ticker/connect stalls fall through to the full-worker
+   * restart. `CommonConnector` bounds how many times this runs before escalating
+   * to the old throw-based restart.
+   */
+  protected override handleStall(
+    exchange: ExchangeEnum,
+    kind: 'price' | 'candle' | 'connect',
+  ): boolean {
+    if (kind !== 'candle') {
+      return false
+    }
+    logger.info(
+      `Kraken ${exchange} candle stall — targeted candle-stream restart (no full-worker crash)`,
+    )
+    this.restartKrakenCandleStreams(exchange)
+    return true
+  }
+
+  protected override getTradeTimeout(_exchange: ExchangeEnum): number {
+    return Math.max(this.tradeTimeout, krakenCandleTradeTimeout)
   }
 
   override stop() {

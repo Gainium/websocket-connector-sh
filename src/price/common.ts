@@ -176,6 +176,37 @@ class CommonConnector {
   }
 
   /**
+   * Side-channel liveness check: is the underlying WS connection for `exchange`
+   * still healthy even though no market data arrived within the timeout? Used to
+   * suppress false-positive stalls on trade-driven feeds. Kraken's candle OHLC
+   * (and ticker) feed only pushes on trades, so a thin/near-dead market goes
+   * quiet far past the timeout while the socket is perfectly alive — the
+   * kraken-api client keeps it up via heartbeat/pong and reconnects a dead one.
+   * A CONNECTED-but-quiet socket is therefore not a real stall: advance liveness
+   * and skip the crash. Tradeoff: a socket that stays open while a single topic
+   * subscription silently dies won't be caught here (very rare on Kraken v2,
+   * which persists + auto-resubscribes topics per connection) — a real socket
+   * drop still flips this to false and triggers the targeted restart. Base
+   * connectors have no side channel → false (unchanged behaviour).
+   */
+  protected isFeedAlive(
+    _exchange: ExchangeEnum,
+    _kind: 'price' | 'candle',
+  ): boolean {
+    return false
+  }
+
+  /**
+   * Per-exchange candle-stall timeout. Trade-driven candle feeds with no
+   * periodic frames (Kraken) legitimately go quiet far longer than the default
+   * before the feed is genuinely dead, so those exchanges widen the window.
+   * Default: the shared `tradeTimeout`.
+   */
+  protected getTradeTimeout(_exchange: ExchangeEnum): number {
+    return this.tradeTimeout
+  }
+
+  /**
    * Try a bounded targeted restart before escalating to a full-worker crash.
    * Returns true when the stall was handled in-place (skip the throw).
    */
@@ -230,6 +261,10 @@ class CommonConnector {
           const stale = Math.floor(
             (now - this.mainData[exchange].lastData) / 1000,
           )
+          if (this.isFeedAlive(exchange, 'price')) {
+            this.mainData[exchange].lastData = now
+            continue
+          }
           this.reportStall(exchange, 'price', stale)
           if (this.escalateOrHandle(exchange, 'price')) {
             this.mainData[exchange].lastData = now
@@ -244,11 +279,15 @@ class CommonConnector {
         if (
           (this.mainData[exchange].lastDataTrade ?? 0) > 0 &&
           now - (this.mainData[exchange].lastDataTrade ?? now) >
-            this.tradeTimeout
+            this.getTradeTimeout(exchange)
         ) {
           const stale = Math.floor(
             (now - (this.mainData[exchange].lastDataTrade ?? 0)) / 1000,
           )
+          if (this.isFeedAlive(exchange, 'candle')) {
+            this.mainData[exchange].lastDataTrade = now
+            continue
+          }
           this.reportStall(exchange, 'candle', stale)
           if (this.escalateOrHandle(exchange, 'candle')) {
             this.mainData[exchange].lastDataTrade = now
