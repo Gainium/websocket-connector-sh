@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-07-15
+
+### Fixed
+
+- **Kraken spot OHLC subscribe rejected — "Subscription ohlc interval must be an integer" (bug #77).** `connectKrakenCandleStream` passed the interval to the WS v2 `ohlc` subscribe as a *string* (`"240"`, `"1440"`, `"60"` — as it arrives from the candle room name), but Kraken only accepts a JSON number, so **every** Kraken spot candle WS subscription was rejected — on initial subscribe and again on every reconnect (the client replays the cached payload verbatim). Spot candles therefore never flowed over WS and consumers fell back to REST `getCandles` polling, contributing Kraken `EGeneral:Too many requests` pressure (alert #81). The interval is now coerced to a Kraken-supported integer (`1|5|15|30|60|240|1440|10080|21600`, with a named-interval fallback like `1h`→60), and unsupported values are skipped with a single warn instead of letting Kraken reject them on every replay. Futures (`candles_trade_*`) path unchanged.
+
 ## [1.13.0] - 2026-07-06
 
 ### Added

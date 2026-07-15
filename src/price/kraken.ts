@@ -30,6 +30,37 @@ const krakenCandleTradeTimeout = 180000
 const spotWsKey = 'spotPublicV2'
 const derivativesWsKey = 'derivativesPublicV1'
 
+// Kraken spot OHLC (WS v2) only accepts these interval values, and only as a
+// JSON *number* — a numeric string ("240") is rejected with "Subscription ohlc
+// interval must be an integer", both on the initial subscribe and on every
+// auto-resubscribe after reconnect (the client replays the cached payload
+// verbatim). Intervals arrive here as strings from the candle room name.
+const KRAKEN_SPOT_OHLC_INTERVALS = new Set([
+  1, 5, 15, 30, 60, 240, 1440, 10080, 21600,
+])
+
+// Named-interval fallback ("1h") → Kraken minutes, in case a caller ever sends
+// the generic ExchangeIntervals form instead of minutes. Unsupported values
+// (2h, 8h, …) are deliberately absent — better to skip than spam rejections.
+const NAMED_TO_KRAKEN_MINUTES: Record<string, number> = {
+  '1m': 1,
+  '5m': 5,
+  '15m': 15,
+  '30m': 30,
+  '1h': 60,
+  '4h': 240,
+  '1d': 1440,
+  '1w': 10080,
+}
+
+/** Coerce an interval string to a Kraken-supported integer, or null. */
+const toKrakenSpotInterval = (interval: string): number | null => {
+  const n = /^\d+$/.test(interval)
+    ? Number(interval)
+    : NAMED_TO_KRAKEN_MINUTES[interval]
+  return n !== undefined && KRAKEN_SPOT_OHLC_INTERVALS.has(n) ? n : null
+}
+
 type KrakenClient = {
   client: KrakenWsClient
   subs: number
@@ -294,6 +325,16 @@ class KrakenConnector extends CommonConnector {
   }
 
   private connectKrakenCandleStream(symbol: string, interval: string) {
+    // Kraken rejects non-integer intervals; an invalid value would also be
+    // replayed (and re-rejected) on every reconnect, so drop it up front.
+    const krakenInterval = toKrakenSpotInterval(interval)
+    if (krakenInterval === null) {
+      logger.warn(
+        `Kraken spot candle: unsupported interval "${interval}" for ${symbol}, skipping OHLC subscribe`,
+      )
+      return
+    }
+
     if (!this.krakenCandleClient) {
       this.krakenCandleClient = this.getKrakenClient('candle', false)
       this.krakenCandleClient.on(
@@ -308,7 +349,12 @@ class KrakenConnector extends CommonConnector {
 
     // Subscribe to ohlc for the symbol (spot only)
     this.krakenCandleClient.subscribe(
-      [{ topic: 'ohlc', payload: { symbol: [wsnameSymbol], interval } }],
+      [
+        {
+          topic: 'ohlc',
+          payload: { symbol: [wsnameSymbol], interval: krakenInterval },
+        },
+      ],
       'spotPublicV2',
     )
   }
