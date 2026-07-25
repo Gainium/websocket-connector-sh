@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.2] - 2026-07-25
+
+### Fixed
+
+- **Bybit price-connector crash-loop on harmless "already subscribed" WS replies — unbounded memory/CPU (bug #121).** Bybit answers a re-subscribe of a still-active topic with `{success:false, ret_msg:"error:already subscribed,topic:tickers.<SYM>"}`, and the vendored v5 client routes *any* `success:false` reply to the `exception` channel. `bybitRestartCb` treated every exception as fatal, so this informational message triggered a full `stopBybit()` + `initBybitWS()` + candle-stream reconnect. Compounding it, the restart path had **no re-entrancy guard** (unlike the `@IdMute`-wrapped candle helpers): the spot/linear/inverse clients each raise `exception` independently, so a burst started overlapping restart cycles — and since `initBybitWS` re-subscribes every ticker topic with 5s sleeps between markets, the overlap double-subscribed topics, producing more `already subscribed` and closing the feedback loop. WS clients/listeners were recreated faster than they were released (~1.3 GB RSS, ~270% CPU reported), until the watchdog saw no ticker data within 50s and — since `handleStall` only isolates `'candle'` stalls — escalated a `connect` stall to a full-worker crash every 40–90s. Fixes: `already subscribed` joins the existing benign-message skip list (`handler not found`, `format error`) and is logged at info rather than error; the restart cycle now runs under a `bybitRestarting` re-entrancy flag that **coalesces** concurrent exceptions into one cycle (deliberately a drop, not the serialising `IdMutex` — queueing would still run N full restarts for N exceptions) and clears in `finally` so later genuine failures still recover. `initBybitWS`'s failure path no longer recurses synchronously (which the guard would swallow) but retries via `setTimeout(wsReconnect)`. Genuinely fatal WS errors still trigger exactly one restart. Regression coverage in `test/bybitRestartStorm.test.ts`.
+
 ## [1.13.1] - 2026-07-15
 
 ### Fixed

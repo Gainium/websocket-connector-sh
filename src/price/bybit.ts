@@ -233,6 +233,24 @@ class BybitConnector extends CommonConnector {
     }))
   }
 
+  /**
+   * Bug #121: a restart cycle is in flight. The bybit clients (spot/linear/
+   * inverse, ticker + candle) each raise `exception` independently, so without
+   * this guard a burst of exceptions starts overlapping `stopBybit()` +
+   * `initBybitWS()` cycles. Because `initBybitWS` re-subscribes every ticker
+   * topic with 5s sleeps between markets, overlapping cycles double-subscribe
+   * the same topics — which makes bybit answer `already subscribed`, which
+   * (before the skip below) raised another exception. That feedback loop
+   * recreated WS clients faster than they were released: unbounded memory, a
+   * pinned core, and eventually a ticker stall the watchdog turned into a
+   * full-worker crash every 40-90s.
+   *
+   * Note this must COALESCE (drop) concurrent restarts, not queue them — the
+   * `IdMutex` used elsewhere in this file serialises, which would still run N
+   * full restarts back-to-back for a burst of N exceptions.
+   */
+  private bybitRestarting = false
+
   private bybitRestartCb(e?: ExchangeEnum) {
     return (data?: any) => {
       let skip = false
@@ -240,18 +258,49 @@ class BybitConnector extends CommonConnector {
         const msg = data.error ?? data.ret_msg
         skip =
           `${msg}`.indexOf('handler not found') !== -1 ||
-          `${msg}`.indexOf('format error') !== -1
-        logger.error(
-          `${e.toUpperCase()} error: ${`${data.wsKey}`.slice(0, 100)} ${
-            msg ?? JSON.stringify(data ?? {})
-          }`,
+          `${msg}`.indexOf('format error') !== -1 ||
+          // Informational reply to re-subscribing a still-active topic. Not a
+          // connection failure — restarting on it is what starts the storm.
+          `${msg}`.indexOf('already subscribed') !== -1
+        const line = `${e.toUpperCase()} error: ${`${data.wsKey}`.slice(
+          0,
+          100,
+        )} ${msg ?? JSON.stringify(data ?? {})}`
+        // Benign, self-clearing replies are logged as info: emitting them at
+        // error level made a healthy connector look broken.
+        if (skip) {
+          logger.info(line)
+        } else {
+          logger.error(line)
+        }
+      }
+      if (skip) {
+        return
+      }
+      if (this.bybitRestarting) {
+        logger.info(
+          `Bybit restart already in progress — coalescing ${e ?? 'init'} exception`,
         )
+        return
       }
-      if (!skip) {
-        this.stopBybit()
-        this.initBybitWS()
-        this.reconnectBybitCandleStream()
-      }
+      this.bybitRestarting = true
+      void this.runBybitRestart()
+    }
+  }
+
+  /**
+   * One full restart cycle, held under `bybitRestarting` until every step has
+   * settled so concurrent exceptions are dropped rather than interleaved.
+   */
+  private async runBybitRestart() {
+    try {
+      this.stopBybit()
+      await this.initBybitWS()
+      await this.reconnectBybitCandleStream()
+    } catch (err) {
+      logger.error(`Bybit restart cycle failed: ${err}`)
+    } finally {
+      this.bybitRestarting = false
     }
   }
 
@@ -284,8 +333,13 @@ class BybitConnector extends CommonConnector {
       const clientCoinm = this.bybitClientCoinm
       clientCoinm.subscribeV5(channelsCoinm, 'inverse', false)
       await sleep(5000)
-    } catch {
-      this.bybitRestartCb()()
+    } catch (err) {
+      logger.error(`Bybit ticker init failed: ${err}`)
+      // Retry on a later tick, not by immediate recursion: this runs inside the
+      // restart cycle, which still holds `bybitRestarting`, so a synchronous
+      // re-entry would be coalesced away and the retry lost. The delay also
+      // stops a persistently failing exchange-info fetch from spinning.
+      setTimeout(() => this.bybitRestartCb()(), this.wsReconnect)
     }
   }
 
