@@ -21,11 +21,20 @@
  * fills a grace window to arrive. Resolution order (first that yields fills wins):
  *   1. buffer  — fills arrive on `userFills` during the grace window (the common
  *                case; resolved immediately via {@link notifyFillArrived}).
- *   2. REST    — grace expires with no buffered fill ⇒ ONE `userFillsByTime`
- *                lookup fetches the real fills.
- *   3. limitPx — REST also fails/empty ⇒ emit at `limitPx` as a LAST resort
- *                (a slightly-off average beats a permanently frozen deal), logged
- *                loudly.
+ *   2. REST    — grace expires with no buffered fill ⇒ a REST order lookup
+ *                fetches the real fills, RETRIED with exponential backoff so a
+ *                transient balancer/exchange error doesn't cost us the real
+ *                price. The buffer is re-checked before every attempt, so fills
+ *                landing mid-backoff still win.
+ *   3. limitPx — only once EVERY REST attempt is spent ⇒ emit at `limitPx` as a
+ *                LAST resort (a slightly-off average beats a permanently frozen
+ *                deal), logged loudly.
+ *
+ * The parked entry stays in the map for the whole ladder, including the REST
+ * backoff, so {@link HyperliquidFillParkResolver.has} keeps reporting `true` and
+ * reconnect-snapshot fills for that cloid are still buffered ({@link
+ * ingestUserFills} gates snapshots on being parked). It is removed from the map
+ * at its single emit.
  *
  * This module is intentionally generic over the order / fill / event types and
  * takes all of its side-effects (buffer access, REST lookup, event build, emit,
@@ -59,11 +68,16 @@ export interface ParkInput<TOrder> extends ParkContext {
 }
 
 interface ParkEntry<TOrder> extends ParkInput<TOrder> {
-  timer: ReturnType<typeof setTimeout>
+  timer: ReturnType<typeof setTimeout> | null
   resolving: boolean
 }
 
 export type ParkTrigger = 'buffer' | 'grace' | 'fill-arrived' | 'overflow'
+
+/** REST attempts (including the first) before falling back to limitPx. */
+const DEFAULT_REST_RETRIES = 3
+/** Base backoff between REST attempts; doubles each attempt. */
+const DEFAULT_REST_RETRY_DELAY_MS = 1000
 
 export interface HyperliquidFillParkOptions<TOrder, TFill, TEvent> {
   /** Max time to wait for fills before falling back to REST. */
@@ -74,8 +88,18 @@ export interface HyperliquidFillParkOptions<TOrder, TFill, TEvent> {
   getBufferedFills: (cloid: string) => TFill[] | undefined
   /** Drop the buffered fills for a cloid once consumed. */
   clearBufferedFills: (cloid: string) => void
-  /** REST fallback: fetch the real fills for a filled order (`[]` if none/unavailable). */
+  /** REST fallback: fetch the real fills for a filled order (`null` if none/unavailable). */
   restLookup: (ctx: ParkContext) => Promise<CommonOrder | null>
+  /**
+   * REST attempts (including the first) before falling back to limitPx.
+   * Defaults to {@link DEFAULT_REST_RETRIES}; values below 1 are clamped to 1.
+   */
+  restRetries?: number
+  /**
+   * Base backoff between REST attempts, doubled each attempt. Defaults to
+   * {@link DEFAULT_REST_RETRY_DELAY_MS}; `0` retries immediately (tests).
+   */
+  restRetryDelayMs?: number
   /** Build the execution-report event from an order + resolved fills (empty ⇒ limitPx). */
   buildEvent: (order: TOrder, fills: TFill[]) => TEvent
   /** Build the execution-report event from an order + resolved commonOrder. */
@@ -138,14 +162,29 @@ export class HyperliquidFillParkResolver<TOrder, TFill, TEvent> {
     }
     if (this.map.size >= this.opts.maxSize) {
       // Bound memory: resolve the oldest parked order now (its buffer→REST→
-      // limitPx path is unchanged and safe to run early).
-      const oldest = this.map.keys().next().value
+      // limitPx path is unchanged and safe to run early). Entries already
+      // mid-resolution can't be force-resolved again — they clear themselves
+      // once their REST retries drain — so evict the oldest one not yet started.
+      let oldest: string | undefined
+      for (const [candidate, entry] of this.map) {
+        if (!entry.resolving) {
+          oldest = candidate
+          break
+        }
+      }
       if (oldest !== undefined) {
         this.opts.log(
           `[hl-park] size cap ${this.opts.maxSize} reached; force-resolving oldest cloid ${oldest}`,
           true,
         )
         void this.resolve(oldest, 'overflow')
+      } else {
+        // Every parked order is draining its REST retries; parking over the cap
+        // is bounded by (arrival rate × retry window) and self-corrects.
+        this.opts.log(
+          `[hl-park] size cap ${this.opts.maxSize} reached but every parked order is mid-resolution; parking ${cloid} over cap`,
+          true,
+        )
       }
     }
     const timer = this.setTimer(
@@ -169,7 +208,7 @@ export class HyperliquidFillParkResolver<TOrder, TFill, TEvent> {
   /** Clear all timers and parked entries (tests / shutdown). */
   clear(): void {
     for (const entry of this.map.values()) {
-      this.clearTimer(entry.timer)
+      if (entry.timer !== null) this.clearTimer(entry.timer)
     }
     this.map.clear()
   }
@@ -177,56 +216,108 @@ export class HyperliquidFillParkResolver<TOrder, TFill, TEvent> {
   private async resolve(cloid: string, trigger: ParkTrigger): Promise<void> {
     const entry = this.map.get(cloid)
     if (!entry || entry.resolving) return
-    // Delete synchronously (before any await) so concurrent resolve() calls
-    // for the same cloid — grace timer vs. fill-arrived vs. overflow — can
-    // only emit once.
+    // Flag synchronously (before any await) so concurrent resolve() calls for
+    // the same cloid — grace timer vs. fill-arrived vs. overflow — only run the
+    // ladder once. The entry stays in the map until `finish()` so it remains
+    // visible to `has()`/`ingestUserFills` across the REST backoff.
     entry.resolving = true
-    this.clearTimer(entry.timer)
-    this.map.delete(cloid)
+    if (entry.timer !== null) {
+      this.clearTimer(entry.timer)
+      entry.timer = null
+    }
 
     // 1. Buffer: fills arrived (live or reconnect snapshot) while parked.
-    const buffered = this.opts.getBufferedFills(cloid)
-    if (buffered && buffered.length) {
-      this.opts.clearBufferedFills(cloid)
-      this.opts.emit(entry.roomId, this.opts.buildEvent(entry.order, buffered))
-      this.opts.log(
-        `[hl-park] resolved cloid ${cloid} from buffer via ${trigger} (${buffered.length} fills)`,
-      )
-      return
+    if (this.emitFromBuffer(entry, trigger)) return
+
+    // 2. REST fallback, retried with exponential backoff so a transient
+    //    balancer/exchange error doesn't cost us the real fill price.
+    const attempts = Math.max(1, this.opts.restRetries ?? DEFAULT_REST_RETRIES)
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      // Fills may have landed while we were backing off — always prefer them.
+      if (attempt > 1 && this.emitFromBuffer(entry, trigger)) return
+      try {
+        const order = await this.opts.restLookup({
+          cloid,
+          roomId: entry.roomId,
+          oid: entry.oid,
+          user: entry.user,
+          statusTimestamp: entry.statusTimestamp,
+          exchange: entry.exchange,
+          key: entry.key,
+        })
+        if (order) {
+          this.finish(entry)
+          this.opts.emit(
+            entry.roomId,
+            this.opts.buildEventFromCommonOrder(entry.order, order),
+          )
+          this.opts.log(
+            `[hl-park] resolved cloid ${cloid} via REST after ${trigger} (attempt ${attempt}/${attempts}, ${order.status} status)`,
+          )
+          return
+        }
+        this.opts.log(
+          `[hl-park] REST returned no order for cloid ${cloid} (oid ${entry.oid}) after ${trigger} (attempt ${attempt}/${attempts})`,
+          true,
+        )
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : `${err}`
+        this.opts.log(
+          `[hl-park] REST lookup failed for cloid ${cloid} (oid ${entry.oid}) (attempt ${attempt}/${attempts}): ${msg}`,
+          true,
+        )
+      }
+      if (attempt < attempts) await this.backoff(attempt)
     }
 
-    // 2. REST fallback: one lookup for the real fills.
-    try {
-      const order = await this.opts.restLookup({
-        cloid,
-        roomId: entry.roomId,
-        oid: entry.oid,
-        user: entry.user,
-        statusTimestamp: entry.statusTimestamp,
-        exchange: entry.exchange,
-        key: entry.key,
-      })
-      if (order) {
-        this.opts.emit(
-          entry.roomId,
-          this.opts.buildEventFromCommonOrder(entry.order, order),
-        )
-        this.opts.log(
-          `[hl-park] resolved cloid ${cloid} via REST after ${trigger} (${order.status} status)`,
-        )
-        return
-      }
-      this.opts.log(
-        `[hl-park] REST returned no order for cloid ${cloid} (oid ${entry.oid}) after ${trigger}; emitting at limitPx (LAST RESORT)`,
-        true,
-      )
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : `${err}`
-      this.opts.log(
-        `[hl-park] REST lookup failed for cloid ${cloid} (oid ${entry.oid}): ${msg}; emitting at limitPx (LAST RESORT)`,
-        true,
-      )
+    // 3. Last resort, only now that every REST attempt is spent: emit at
+    //    limitPx (empty fills ⇒ buildEvent prices at limitPx). A slightly-off
+    //    average beats a permanently frozen deal.
+    if (this.emitFromBuffer(entry, trigger)) return
+    this.finish(entry)
+    this.opts.emit(entry.roomId, this.opts.buildEvent(entry.order, []))
+    this.opts.log(
+      `[hl-park] cloid ${cloid} (oid ${entry.oid}) unresolved after ${attempts} REST attempt(s) via ${trigger}; emitting at limitPx (LAST RESORT)`,
+      true,
+    )
+  }
+
+  /**
+   * Emit from the fill buffer if it holds anything for this entry. Returns
+   * `true` when it emitted (the caller must then stop — one emit per park).
+   */
+  private emitFromBuffer(
+    entry: ParkEntry<TOrder>,
+    trigger: ParkTrigger,
+  ): boolean {
+    const buffered = this.opts.getBufferedFills(entry.cloid)
+    if (!buffered || !buffered.length) return false
+    this.opts.clearBufferedFills(entry.cloid)
+    this.finish(entry)
+    this.opts.emit(entry.roomId, this.opts.buildEvent(entry.order, buffered))
+    this.opts.log(
+      `[hl-park] resolved cloid ${entry.cloid} from buffer via ${trigger} (${buffered.length} fills)`,
+    )
+    return true
+  }
+
+  /** Drop a parked entry from the map, immediately before its single emit. */
+  private finish(entry: ParkEntry<TOrder>): void {
+    if (entry.timer !== null) {
+      this.clearTimer(entry.timer)
+      entry.timer = null
     }
+    this.map.delete(entry.cloid)
+  }
+
+  /** Exponential backoff between REST attempts, via the injectable timer. */
+  private backoff(attempt: number): Promise<void> {
+    const base = this.opts.restRetryDelayMs ?? DEFAULT_REST_RETRY_DELAY_MS
+    const ms = base * 2 ** (attempt - 1)
+    if (ms <= 0) return Promise.resolve()
+    return new Promise((res) => {
+      this.setTimer(() => res(), ms)
+    })
   }
 }
 

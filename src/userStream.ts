@@ -576,6 +576,12 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
 // arrive before falling back to a REST lookup. Size cap bounds the map.
 const HL_FILL_PARK_GRACE_MS = Number(process.env.HL_FILL_PARK_GRACE_MS) || 5000
 const HL_FILL_PARK_MAX_SIZE = Number(process.env.HL_FILL_PARK_MAX_SIZE) || 5000
+// REST attempts (including the first) before a parked fill falls back to
+// limitPx, and the base backoff between them (doubles each attempt). Retrying
+// keeps a transient balancer blip from costing us the real fill price.
+const HL_FILL_REST_RETRIES = Number(process.env.HL_FILL_REST_RETRIES) || 3
+const HL_FILL_REST_RETRY_DELAY_MS =
+  Number(process.env.HL_FILL_REST_RETRY_DELAY_MS) || 1000
 
 const LAST_STREM_EVENT_TIME_KEY = 'stream:lastEventTime'
 
@@ -667,6 +673,8 @@ class UserConnector {
       hyperliquidExpirableMap.delete(cloid)
     },
     restLookup: (ctx) => this.hlRestLookupOrder(ctx),
+    restRetries: HL_FILL_REST_RETRIES,
+    restRetryDelayMs: HL_FILL_REST_RETRY_DELAY_MS,
     buildEvent: (order, fills) =>
       this.buildHyperliquidExecutionReport(order, fills),
     buildEventFromCommonOrder: (order, commonOrder) =>
@@ -3468,18 +3476,17 @@ class UserConnector {
   }
 
   /**
-   * REST fallback for a parked HL fill: fetch the real per-fill px/sz via
-   * `userFillsByTime` and keep only the fills for this cloid. Returns `[]` when
-   * the order can't be found or has no fills (the caller then emits at limitPx
-   * as a last resort). HL info endpoints are public (address-scoped, no auth /
-   * IP-whitelist), so this is a plain HTTPS call — reached only on the rare
-   * dropped-fill path, never in steady state.
+   * REST fallback for a parked HL fill: fetch the settled order (with its real
+   * executed price/qty) by cloid through the exchange balancer. Returns `null`
+   * when the order can't be looked up or isn't found — the resolver then retries
+   * with backoff and only emits at limitPx once every attempt is spent. Reached
+   * only on the rare dropped-fill path, never in steady state.
    */
   private async hlRestLookupOrder(
     ctx: ParkContext,
   ): Promise<CommonOrder | null> {
     const url = exchangeUrl()
-    if (!url || !ctx.key || ctx.exchange) {
+    if (!url || !ctx.key || !ctx.exchange) {
       logger.error(
         `Cannot get order ${ctx.cloid} when not enough data. url=${url} key=${ctx.key} exchange=${ctx.exchange}`,
       )

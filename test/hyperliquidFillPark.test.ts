@@ -4,9 +4,16 @@
  * Run: `npm test` (node:test via ts-node/register, transpile-only).
  *
  * The resolver is generic over order/fill/event, so these tests use tiny local
- * shapes and injected timers/deps — no live HL WS or REST is touched. `buildEvent`
- * simply echoes the fills it was priced with, so each test can assert WHICH fills
- * a resolution used (buffer real px, REST real px, or `[]` = limitPx last resort).
+ * shapes and injected timers/deps — no live HL WS or REST is touched. The two
+ * event builders are stubbed so the emitted event names WHICH rung of the
+ * buffer → REST → limitPx ladder resolved it:
+ *   - buffer  ⇒ `{ fills: [<real fills>] }`      (`buildEvent` echoes its fills)
+ *   - REST    ⇒ `{ fills: [], commonOrder: {…} }` (`buildEventFromCommonOrder`)
+ *   - limitPx ⇒ `{ fills: [] }`, no `commonOrder`  (`buildEvent` with no fills)
+ *
+ * Harnesses run with `restRetryDelayMs: 0` so the retry ladder is a pure
+ * microtask chain that a single `await flush()` drains; production uses a real
+ * backoff via the injected timer.
  */
 
 import test from 'node:test'
@@ -20,9 +27,28 @@ import { CommonOrder } from '../../core/type'
 
 type Order = { id: string }
 type Fill = { cloid?: string; px: string; sz: string }
-type Event = { cloid: string; fills: Fill[] }
+/** `commonOrder` present ⇒ the REST rung built this event. */
+type Event = { cloid: string; fills: Fill[]; commonOrder?: CommonOrder }
 
 const flush = () => new Promise((res) => setImmediate(res))
+
+/** REST attempts every harness makes before falling back to limitPx. */
+const REST_RETRIES = 3
+
+/** A settled HL order as the balancer's `/order` lookup would return it. */
+const restOrder = (over: Partial<CommonOrder> = {}): CommonOrder => ({
+  symbol: 'ETH',
+  clientOrderId: 'Y',
+  price: '50',
+  executedQty: '1',
+  orderId: '1',
+  updateTime: 1000,
+  origQty: '1',
+  status: 'FILLED',
+  type: 'MARKET',
+  side: 'BUY',
+  ...over,
+})
 
 interface Harness {
   resolver: HyperliquidFillParkResolver<Order, Fill, Event>
@@ -41,6 +67,7 @@ function makeHarness(opts?: {
   restLookup?: (cloid: string) => Promise<CommonOrder | null>
   graceMs?: number
   maxSize?: number
+  restRetries?: number
 }): Harness {
   const buffer = new Map<string, Fill[]>()
   const emitted: Array<{ roomId: string; event: Event }> = []
@@ -74,10 +101,14 @@ function makeHarness(opts?: {
       restCalls.push(ctx.cloid)
       return opts?.restLookup ? opts.restLookup(ctx.cloid) : null
     },
+    restRetries: opts?.restRetries ?? REST_RETRIES,
+    // Retry immediately so the whole ladder resolves within one `flush()`.
+    restRetryDelayMs: 0,
     buildEvent: (order, fills) => ({ cloid: order.id, fills }),
-    buildEventFromCommonOrder: (order, _commonOrder) => ({
+    buildEventFromCommonOrder: (order, commonOrder) => ({
       cloid: order.id,
       fills: [],
+      commonOrder,
     }),
     emit: (roomId, event) => emitted.push({ roomId, event }),
     log: () => {},
@@ -137,34 +168,75 @@ test('fill-after-park: resolves from buffer with the real fill price, no REST', 
   assert.equal(h.buffer.has('X'), false, 'consumed fills removed from buffer')
 })
 
-test('grace → REST fallback: no buffered fill, grace expires, REST supplies real fills', async () => {
-  const h = makeHarness({
-    restLookup: async () => ({
-      symbol: '',
-      clientOrderId: 'Y',
-      price: '50',
-      executedQty: '1',
-      orderId: '1',
-      updateTime: Date.now(),
-      origQty: '1',
-      status: 'FILLED',
-      type: 'MARKET',
-      side: 'BUY',
-    }),
-  })
+test('grace → REST fallback: no buffered fill, grace expires, REST supplies the real order', async () => {
+  const h = makeHarness({ restLookup: async () => restOrder() })
   park(h, 'Y')
   h.fireTimers() // grace window elapses
   await flush()
 
-  assert.equal(h.restCalls.length, 1)
+  assert.equal(h.restCalls.length, 1, 'a first-attempt success must not retry')
   assert.equal(h.emitted.length, 1)
-  assert.deepEqual(h.emitted[0].event.fills, [
-    { cloid: 'Y', px: '50', sz: '1' },
-  ])
+  assert.equal(h.emitted[0].roomId, 'room-Y')
+  // REST rung: priced from the CommonOrder, not from limitPx.
+  assert.equal(h.emitted[0].event.commonOrder?.price, '50')
+  assert.equal(h.emitted[0].event.commonOrder?.executedQty, '1')
   assert.equal(h.resolver.size, 0)
 })
 
-test('REST fails → limitPx last resort (empty fills passed to buildEvent)', async () => {
+test('REST fails transiently then succeeds → real price, no limitPx', async () => {
+  let calls = 0
+  const h = makeHarness({
+    restLookup: async () => {
+      calls++
+      if (calls < 3) throw new Error('balancer 502')
+      return restOrder({ clientOrderId: 'R', price: '77' })
+    },
+  })
+  park(h, 'R')
+
+  h.fireTimers()
+  await flush()
+
+  assert.equal(h.restCalls.length, 3, 'retried until the lookup succeeded')
+  assert.equal(h.emitted.length, 1, 'exactly one emit for the parked order')
+  assert.equal(
+    h.emitted[0].event.commonOrder?.price,
+    '77',
+    'transient errors must not cost us the real fill price',
+  )
+  assert.equal(h.resolver.size, 0)
+})
+
+test('fills landing mid-retry win over limitPx (entry stays parked while backing off)', async () => {
+  const h = makeHarness({
+    restLookup: async (cloid) => {
+      // First attempt fails, but the fills land on userFills right then — the
+      // cloid must still be parked so a snapshot fill is accepted.
+      ingestUserFills(
+        { isSnapshot: true, fills: [{ cloid, px: '12', sz: '4' }] },
+        h.bufferDeps,
+      )
+      throw new Error('HL 500')
+    },
+  })
+  park(h, 'M')
+
+  h.fireTimers()
+  await flush()
+
+  assert.equal(h.restCalls.length, 1, 'buffer recheck short-circuits the retry')
+  assert.equal(h.emitted.length, 1)
+  assert.deepEqual(
+    h.emitted[0].event.fills,
+    [{ cloid: 'M', px: '12', sz: '4' }],
+    'resolved from the buffer at the real price',
+  )
+  assert.equal(h.emitted[0].event.commonOrder, undefined)
+  assert.equal(h.buffer.has('M'), false, 'consumed fills removed from buffer')
+  assert.equal(h.resolver.size, 0)
+})
+
+test('REST fails every attempt → limitPx last resort (empty fills passed to buildEvent)', async () => {
   const h = makeHarness({
     restLookup: async () => {
       throw new Error('HL 500')
@@ -175,25 +247,33 @@ test('REST fails → limitPx last resort (empty fills passed to buildEvent)', as
   h.fireTimers()
   await flush()
 
-  assert.equal(h.restCalls.length, 1)
+  assert.equal(h.restCalls.length, REST_RETRIES, 'every attempt was spent')
   assert.equal(h.emitted.length, 1)
   assert.deepEqual(
     h.emitted[0].event.fills,
     [],
     'empty fills => builder prices at limitPx',
   )
+  assert.equal(
+    h.emitted[0].event.commonOrder,
+    undefined,
+    'limitPx rung, not the REST rung',
+  )
   assert.equal(h.resolver.size, 0)
 })
 
-test('REST returns no fills → limitPx last resort', async () => {
+test('REST returns no order on every attempt → limitPx last resort', async () => {
   const h = makeHarness({ restLookup: async () => null })
   park(h, 'E')
 
   h.fireTimers()
   await flush()
 
+  assert.equal(h.restCalls.length, REST_RETRIES)
   assert.equal(h.emitted.length, 1)
   assert.deepEqual(h.emitted[0].event.fills, [])
+  assert.equal(h.emitted[0].event.commonOrder, undefined)
+  assert.equal(h.resolver.size, 0)
 })
 
 test('snapshot fill matches a parked update (and is gated to parked cloids)', async () => {
@@ -247,4 +327,21 @@ test('size cap force-resolves the oldest parked order', async () => {
   assert.equal(h.resolver.has('B'), true)
   assert.equal(h.emitted.length, 1)
   assert.equal(h.emitted[0].roomId, 'room-A', 'oldest (A) was the one resolved')
+  assert.deepEqual(h.emitted[0].event.fills, [])
+})
+
+test('a parked order emits exactly once when every trigger races it', async () => {
+  const h = makeHarness({ restLookup: async () => restOrder() })
+  park(h, 'D')
+
+  // Grace timer, a fill-arrived wake, and an explicit re-park all land on the
+  // same cloid; the resolving guard must collapse them into one emit.
+  h.fireTimers()
+  h.resolver.notifyFillArrived('D')
+  park(h, 'D')
+  await flush()
+
+  assert.equal(h.emitted.length, 1)
+  assert.equal(h.restCalls.length, 1)
+  assert.equal(h.resolver.size, 0)
 })

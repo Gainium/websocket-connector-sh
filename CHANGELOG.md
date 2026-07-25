@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.3] - 2026-07-25
+
+### Fixed
+
+- **Hyperliquid park-and-retry silently resolved to NOTHING — the v1.12.0 missed-fill fix has been inert since v1.12.1.** Two defects introduced together in `96c5d89` (v1.12.1) disabled both fallback rungs of the fill resolver, so any parked FILLED whose `userFills` never reached the buffer was dropped exactly as before v1.12.0: order stays `NEW`, deal silently freezes. Only the buffer rung has been working for two releases.
+  - **REST rung never ran.** `hlRestLookupOrder`'s precondition guard read `if (!url || !ctx.key || ctx.exchange)` — `ctx.exchange` is `'hyperliquid'`, always truthy, so the guard fired on *every* call and returned `null` before issuing the request. The balancer `/order` lookup was dead code. Missing `!`.
+  - **limitPx rung never ran.** v1.12.1 removed the final `emit(buildEvent(order, []))` from `resolve()` (per its "Do not sent raw limitPx" change) but left both log lines still announcing `emitting at limitPx (LAST RESORT)`, the module header documenting step 3, and the tests asserting it. The resolver logged an emit that never happened.
+  - **Now: REST is retried before limitPx is ever reached.** `restLookup` runs up to `HL_FILL_REST_RETRIES` (default 3) times with exponential backoff (`HL_FILL_REST_RETRY_DELAY_MS`, default 1000ms, doubling), so a transient balancer/exchange blip no longer costs us the real fill price. limitPx is emitted only once every attempt is spent (worst case ~8s after the FILLED: 5s grace + 1s + 2s). This deliberately re-introduces a bounded limitPx last resort that v1.12.1 removed — the tradeoff is one slightly-off average price versus a permanently frozen deal, now reached only after the retry ladder rather than on the first REST error. **Revisits Maksym's v1.12.1 price-accuracy call (ClickUp 86ey5zc49 §1) — flag for his review.**
+  - **Parked entries stay in the map for the whole ladder** (previously deleted up front, before the `await`). `has()` therefore keeps reporting `true` across the REST backoff, so reconnect-snapshot `userFills` for that cloid are still accepted instead of being dropped by the snapshot gate — and the buffer is re-checked before every REST attempt and once more immediately before the limitPx emit, so late-arriving fills always win on price. Single-emit is preserved by the `resolving` flag.
+  - **Overflow eviction no longer silently no-ops.** Entries already mid-resolution can't be force-resolved again, so `park()` now evicts the oldest *non-resolving* entry and logs when every entry is draining (bounded overshoot = arrival rate × retry window) instead of leaving the map to grow past `HL_FILL_PARK_MAX_SIZE` unchecked.
+  - New env knobs: `HL_FILL_REST_RETRIES`, `HL_FILL_REST_RETRY_DELAY_MS`. Test coverage grew 7 → 10 in `test/hyperliquidFillPark.test.ts`: the harness's event builders now identify which rung resolved each emit (fills = buffer, commonOrder = REST, neither = limitPx) so a rung can no longer pass by accident — the stale `grace → REST fallback` assertion had been unpassable since v1.12.1 for exactly that reason. Added transient-failure-then-success, fills-landing-mid-retry, and one-emit-under-racing-triggers.
+
 ## [1.13.2] - 2026-07-25
 
 ### Fixed
