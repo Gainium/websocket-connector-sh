@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.13.4] - 2026-07-28
+## [1.13.5] - 2026-07-29
+
+### Fixed
+
+- **Kraken auth-feed subscribe failures retried forever, silently degrading fill delivery (issue #167 / ClickUp 86eyep5au).** Two shapes, both deterministic key problems the retry loop can never fix: `EGeneral:Permission denied` — the WS-token REST call rejected because the API key lacks Kraken's "WebSocket interface" permission (16 users on 07-28; REST verify passes, so the connection looks healthy and nothing upstream ever stops re-requesting the stream) — and `Failed to subscribe to authenticated feed` on Kraken Futures (revoked/disabled keys on status=false connections, where the client library reconnects forever). Affected users got no realtime order updates and fell back to reconcile-sweep-only fills, with no error surfaced anywhere (12 users / 25 open Kraken DCA bots measured). The `exception` handler — which previously only logged — now feeds the existing auth-rejection circuit-breaker: on first sight of either error it closes the client (stopping the library's internal retry loop), arms the shared `authCooldownUntil` cooldown (`USER_STREAM_AUTH_COOLDOWN_MS`, default 30min) that already gates `openStreamCallback` re-requests, and schedules the same single delayed retry the Binance breaker uses, so a key fixed in place (permission enabled on the same key) self-heals without a bot restart. First-sight rather than hits-in-window because Kraken's retry cadence (20min–6h per account, measured on prod) never trips a windowed threshold, and a futures subscribe rejects its 3 topics in one burst — the cooldown check collapses the burst to one arming. Flap-alert suppression and the auto-clear on a genuine `executionReport` come free from reusing the shared maps.
 
 ### Fixed
 

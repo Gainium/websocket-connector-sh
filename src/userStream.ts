@@ -2809,6 +2809,65 @@ class UserConnector {
               `${id} ${userId} Kraken exception ${errorMsg} ${api.provider}`,
               true,
             )
+            // Auth-rejection circuit-breaker (Kraken flavour of the Binance
+            // one above). Two deterministic-fatal shapes:
+            //  - "EGeneral:Permission denied" — the WS-token REST call was
+            //    rejected because the key lacks the "WebSocket interface"
+            //    permission. REST verify passes, so upstream keeps the
+            //    connection marked healthy and re-requests this stream
+            //    forever.
+            //  - "Failed to subscribe to authenticated feed" — Kraken
+            //    Futures rejecting the private feed auth (revoked/disabled
+            //    key); the client library reconnects forever.
+            // Neither heals by retrying, and unlike Binance the retries are
+            // spread out over 20min-6h per account, so a hits-in-window
+            // threshold would never trip — break the circuit on first sight.
+            const isAuthReject =
+              /EGeneral\s*:?\s*Permission denied/i.test(errorMsg) ||
+              /Failed to subscribe to authenticated feed/i.test(errorMsg)
+            if (!isAuthReject) {
+              return
+            }
+            // A futures subscribe rejects each of its 3 topics in one burst;
+            // only the first one gets to arm the breaker.
+            if ((this.authCooldownUntil.get(id) ?? 0) > Date.now()) {
+              return
+            }
+            const cooldownMs = Math.max(
+              60_000,
+              Number(process.env.USER_STREAM_AUTH_COOLDOWN_MS) ||
+                30 * 60 * 1000,
+            )
+            const now = Date.now()
+            this.authCooldownUntil.set(id, now + cooldownMs)
+            try {
+              close()
+            } catch {
+              /* closing a half-open client must never throw */
+            }
+            this.users = this.users.filter((u) => u.id !== id)
+            const subs = this.subscribersMap.get(id)
+            this.subscribersMap.delete(id)
+            this.logger(
+              `${id} ${userId} Kraken auth rejected (${errorMsg}); circuit-broken for ${Math.round(
+                cooldownMs / 1000,
+              )}s — no reconnect, no flap alert ${api.provider}`,
+              true,
+            )
+            // One delayed retry so a key fixed in place (e.g. the "WebSocket
+            // interface" permission enabled on the same key) self-heals
+            // without a bot restart. If it's still rejected, this handler
+            // simply re-arms the cooldown.
+            if (subs) {
+              setTimeout(() => {
+                if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
+                  this.authCooldownUntil.delete(id)
+                  ;[...Array(subs)].forEach(() =>
+                    this.openStreamCallback(msg, uuid),
+                  )
+                }
+              }, cooldownMs)
+            }
           })
 
           /** Save user id and close function in users array */
