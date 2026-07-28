@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.6] - 2026-07-29
+
+### Added
+
+- **Kraken auth-rejection circuit-breaker now tells the user, not just the log.** When the breaker (v1.13.5) trips it additionally publishes a `userStreamAuthReject` event `{exchange, userId, reason}` on the existing `serviceLog` Redis channel — the same channel main-app already consumes for `userStreamFlap` — where main-app ≥2.71.20 turns it into a per-user bot-message warning naming the missing "WebSocket interface" permission (or the revoked-key case). Emit-only: a publish failure never affects the breaker. Older main-app versions ignore the unknown event.
+
 ## [1.13.5] - 2026-07-29
 
 ### Fixed

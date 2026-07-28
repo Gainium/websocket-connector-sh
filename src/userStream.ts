@@ -2854,6 +2854,23 @@ class UserConnector {
               )}s — no reconnect, no flap alert ${api.provider}`,
               true,
             )
+            // Tell main-app (which already consumes serviceLog for
+            // userStreamFlap) so the user gets a bot-message warning —
+            // otherwise the degradation stays invisible to them. Emit-only.
+            try {
+              this.redis?.publish(
+                serviceLogRedis,
+                JSON.stringify({
+                  userStreamAuthReject: {
+                    exchange: api.provider,
+                    userId,
+                    reason: errorMsg,
+                  },
+                }),
+              )
+            } catch {
+              /* emit-only: a publish failure must never affect the breaker */
+            }
             // One delayed retry so a key fixed in place (e.g. the "WebSocket
             // interface" permission enabled on the same key) self-heals
             // without a bot restart. If it's still rejected, this handler
