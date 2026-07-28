@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.4] - 2026-07-28
+
+### Fixed
+
+- **Hyperliquid socket errors always logged as `Hyperliquid error: {}`.** `JSON.stringify` on a WebSocket `ErrorEvent` only serializes enumerable fields — an `ErrorEvent` has none — so every socket failure was logged with its cause erased. The handler now reads `message`/`error.message`/`type` explicitly.
+- **Skipped Hyperliquid candle subscriptions now say *why* translation failed.** The dominant prod case (1,746 log lines since Jun 15) is a producer sending an already-translated wire code (`BTC`, `xyz:GOLD`) where a display pair (`BTC-USDC`) is expected: the subscription is dropped and, since candles publish on display-pair channels, that consumer receives no data. The error now names the resolved display pair so the mismatch is visible in one log line instead of needing a cross-service trace. Root cause fixed on the producer side in main-app core 1.37.8; the diagnostic stays for older/self-hosted producers.
+
 ## [1.13.3] - 2026-07-25
 
 ### Fixed

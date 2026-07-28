@@ -203,9 +203,7 @@ class HyperliquidConnector extends CommonConnector {
       entry.items.set(`${c.coin}-${c.interval}`, c)
       const wsCoin = this.toWsCoin(c.coin, c.isSpot)
       if (!wsCoin) {
-        logger.error(
-          `Failed to translate symbol ${c.coin} for Hyperliquid candle resubscription — skipping`,
-        )
+        this.reportUntranslatableCoin(c.coin, 'resubscription')
         entry.items.delete(`${c.coin}-${c.interval}`)
         continue
       }
@@ -332,7 +330,12 @@ class HyperliquidConnector extends CommonConnector {
       )
     }
     transport.socket.onerror = (event) => {
-      logger.error(`Hyperliquid error: ${JSON.stringify(event)}`)
+      // An ErrorEvent's fields are non-enumerable, so JSON.stringify() always
+      // produced "{}" here and hid every socket failure. Read them explicitly.
+      const err = event as ErrorEvent
+      logger.error(
+        `Hyperliquid error: ${err.message || err.error?.message || event.type || 'unknown error'}`,
+      )
     }
     const client = new hl.SubscriptionClient({
       transport,
@@ -397,6 +400,37 @@ class HyperliquidConnector extends CommonConnector {
     if (this.isCandle || this.isAll) {
       this.reconnectHyperliquidCandleStream()
     }
+  }
+
+  /**
+   * Reports a candle subscription we had to skip because `toWsCoin` could not
+   * translate the symbol. Both branches are errors — the subscription is
+   * dropped either way and that consumer receives no candles.
+   *
+   * The common case is main-app sending a symbol that is ALREADY a Hyperliquid
+   * wire code ("BTC") instead of the display pair ("BTC-USDC"): its indicator
+   * service uses `symbolCode || symbol` for both the `candlesRequests` payload
+   * and the Redis channel it subscribes to, and for HL `symbolCode` is the
+   * wire code. `nameToCode` is keyed by display pair, so the subscription is
+   * skipped here — and even if it were not, we publish on the display-pair
+   * channel (see `hyperliquidCandleCb`), which is not the channel that
+   * consumer is listening on. Naming the resolved pair makes that mismatch
+   * obvious in the log instead of requiring a cross-service trace.
+   */
+  private reportUntranslatableCoin(coin: string, context: string) {
+    const asWireCode = this.symbols.codeToPair(coin)
+    if (asWireCode) {
+      logger.error(
+        `Failed to translate symbol ${coin} for Hyperliquid candle ${context} — skipping. ` +
+          `"${coin}" is already a wire code (display pair "${asWireCode}"); the caller sent a wire code ` +
+          `where a display pair is expected, so this consumer will receive no candles.`,
+      )
+      return
+    }
+    logger.error(
+      `Failed to translate symbol ${coin} for Hyperliquid candle ${context} — skipping. ` +
+        `Unknown symbol: not a display pair and not a known wire code.`,
+    )
   }
 
   /**
@@ -641,9 +675,7 @@ class HyperliquidConnector extends CommonConnector {
           })
           const wsCoin = this.toWsCoin(c.coin, c.isSpot)
           if (!wsCoin) {
-            logger.error(
-              `Failed to translate symbol ${c.coin} for Hyperliquid candle subscription — skipping`,
-            )
+            this.reportUntranslatableCoin(c.coin, 'subscription')
             ownerEntry?.items.delete(`${c.coin}-${c.interval}`)
             continue
           }
