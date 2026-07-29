@@ -42,7 +42,7 @@ process
     if (lock) {
       return
     }
-    logger.error(reason, 'Unhandled Rejection at Promise', p)
+    logger.error((reason as any)?.stack || reason, 'Unhandled Rejection at Promise', p)
     const time = +new Date()
     if (`${reason}`.includes('response: 403')) {
       const sleepSec = (retry + 1) * 30000
@@ -77,7 +77,7 @@ process
     if (lock) {
       return
     }
-    logger.error(err.message, 'Uncaught Exception thrown')
+    logger.error(err.stack || err.message, 'Uncaught Exception thrown')
     if (`${err.message}`.includes('response: 403')) {
       const sleepSec = (retry + 1) * 30000
       logger.error(`Got 403 error. Sleeps ${sleepSec / 1000}s`)
