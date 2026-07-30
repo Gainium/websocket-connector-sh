@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-07-30
+
+### Added
+
+- OKX Europe X-Perp ticker feed: a dedicated, isolated WS client subscribed only to xperp instruments publishes them on the canonical `trade@{pair}@okxLinear` channels (expiry suffix stripped to the `BTC-USD_UM_XPERP` pair id). Optional `OKX_EU_ONLY` mode for EU-only deployments. Contributed by community member discord2020 (forum topic 4925).
+- X-Perp candle streams: candle subscriptions resolve the instFamily to the live expiry-suffixed instId (the WS channel rejects the bare family id).
+
 ## [1.13.7] - 2026-07-30
 
 ### Fixed

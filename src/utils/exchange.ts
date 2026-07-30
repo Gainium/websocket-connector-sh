@@ -524,4 +524,29 @@ export const getKucoinSymbolsByMarket = async () => {
   return result
 }
 
+/**
+ * OKX Europe X-Perps — the EU perpetual contracts (e.g.
+ * `BTC-USD_UM_XPERP-310404`). They live under `instType=FUTURES` with
+ * `ruleType=xperp`, NOT under the global `SWAP` rail, so the global linear
+ * feed never sees them. Verified 2026-07-27: 95 live xperp instruments on
+ * eea.okx.com that do not exist globally.
+ *
+ * Public market data (no keys) and identical on the global and eea hosts, so
+ * this lists them from whichever host `OKXEnv()` points at. The full instId
+ * (with the expiry suffix) is what the ws `tickers` channel subscribes to;
+ * the price publisher's `clearSymbol` trims it back to the gainium pair id.
+ */
+export const getOkxEuPerpInstruments = async (): Promise<string[]> => {
+  const rest = new OKXRESTClient(undefined, OKXEnv())
+  const markets = await rest
+    .getInstruments({ instType: 'FUTURES' })
+    .catch((e) => {
+      logger.warn(`Failed to get okx EU xperp markets ${e}`)
+      return []
+    })
+  return markets
+    .filter((m) => m.ruleType === 'xperp' && m.state === 'live')
+    .map((m) => m.instId)
+}
+
 export default getAllExchangeInfo
