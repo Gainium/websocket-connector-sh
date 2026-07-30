@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.7] - 2026-07-30
+
+### Fixed
+
+- **Price connector's restart announcement never left the process — every restart silently orphaned every candle subscription platform-wide.** `init()` published `{restart:'priceConnector'}` on `serviceLog` with a bare `this.redis?.publish(...)`, but `initRedis()` is fire-and-forget from the constructor and `index.price` calls `init()` synchronously after `new Connector()`, so `this.redis` was *always* still null and `RedisWrapper.publish` returned early without sending. Since candle subscriptions live only in this process's memory, consumers were never told to re-request them: after the nightly 02:00 exit the connector held ~0 candle subscriptions while ~13.5k Redis candle channels still had subscribers. Measured on prod 2026-07-30, 3.5h after the restart: candle publishes came from `bitget` only; `binance` (6.7k subscribed channels), `bybit`, `okx`, `kraken`, `kucoin` and `hyperliquid` were all silent, while `trade@` tickers were healthy. Bug #162's Hyperliquid candle-blindness was one symptom of this. `announceBoot()` now awaits the Redis client before publishing.
+- **Restart recovery no longer depends on a single un-acknowledged pub/sub message.** The connector also publishes a repeating `{priceConnectorAlive:{bootId,role}}` beacon on `serviceLog` every 60s, carrying a per-instance boot id (also added to the one-shot broadcast so consumers can dedupe the two). Consumers on main-app-sh ≥1.37.11 re-request their candle subscriptions when the id changes, so a broadcast lost to a flapping subscription self-heals within a beacon interval instead of persisting until the consumer's own next restart. Deliberately omits `.restart` so pre-beacon consumers ignore it rather than re-requesting every 60s. `stop()` clears the timer so an in-process rebuild doesn't stack beacons.
+
 ## [1.13.6] - 2026-07-29
 
 ### Added

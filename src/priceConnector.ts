@@ -58,6 +58,21 @@ const mutex = new IdMutex()
 const isCandle = priceRole === 'candle'
 const isAll = priceRole === 'all'
 
+/**
+ * How often we re-announce this connector's boot generation on `serviceLog`.
+ * Bounds how long a consumer can stay candle-blind after a connector restart
+ * whose one-shot broadcast it missed.
+ */
+const BEACON_INTERVAL_MS = 60 * 1000
+
+/**
+ * Incremented per Connector instance so an in-process rebuild (the
+ * unhandledRejection/uncaughtException handlers in index.price call
+ * `stop()` then construct a fresh Connector) gets its own boot id — it
+ * terminates every worker, so its candle subscriptions are gone too.
+ */
+let connectorGeneration = 0
+
 const exchanges = (process.env.PRICE_CONNECTOR_EXCHANGES || '')
   .trim()
   .split(',')
@@ -111,6 +126,16 @@ class Connector {
   private rabbit = new RabbitClient()
   private workers: Map<ExchangeEnum, Worker> = new Map()
   private subscribedCandlesMap: Map<ExchangeEnum, Set<string>> = new Map()
+  /**
+   * Identifies this connector instance. Candle subscriptions live ONLY in
+   * this process's memory (`subscribedCandlesMap` + the per-exchange worker
+   * clients), so a new boot id means "every subscription I used to hold is
+   * gone — re-request yours".
+   */
+  private readonly bootId = `${priceRole ?? 'ticker'}-${
+    process.pid
+  }-${+new Date()}-${++connectorGeneration}`
+  private beaconTimer: NodeJS.Timeout | null = null
   /**
    * Is at least one variant in this family enabled?
    *
@@ -310,12 +335,69 @@ class Connector {
     this.workers.set(exchange, worker)
   }
 
+  /**
+   * Tell consumers this connector is new so they re-request their candle
+   * subscriptions.
+   *
+   * Two messages, on purpose:
+   * - the legacy one-shot `{restart:'priceConnector'}`, which every consumer
+   *   (including older self-hosted builds) already understands;
+   * - a repeating `{priceConnectorAlive:{bootId}}` beacon, which consumers on
+   *   current code compare against the last id they acted on. The beacon is
+   *   what makes recovery self-healing: pub/sub has no delivery guarantee, so
+   *   a consumer that was mid-reconnect during the one-shot — or that never
+   *   received it at all — still re-arms within one beacon interval instead of
+   *   staying candle-blind until its own next restart.
+   *
+   * Deliberately does NOT put `restart` on the beacon: pre-beacon consumers
+   * key off `.restart` alone and would re-request every 60s.
+   */
+  private async announceBoot() {
+    // Historically this was a bare `this.redis?.publish(...)` here in init().
+    // `initRedis()` is fire-and-forget from the constructor and index.price
+    // calls `init()` synchronously after `new Connector()`, so `this.redis`
+    // was ALWAYS still null and `RedisWrapper.publish` returned early without
+    // sending anything — silently, since it swallows the not-ready case. The
+    // restart announcement therefore never left the process, and because
+    // subscriptions are in-memory only, every restart (nightly 02:00 exit
+    // included) left this connector publishing nothing on candle channels that
+    // still had subscribers. Await the client before announcing.
+    this.redis = await RedisClient.getInstance()
+    const redis = this.redis
+    // `bootId` rides along so a consumer that acts on this message can skip the
+    // beacon that follows it instead of re-requesting twice.
+    await redis.publish(
+      'serviceLog',
+      JSON.stringify({ restart: 'priceConnector', bootId: this.bootId }),
+    )
+    const beacon = () =>
+      void redis.publish(
+        'serviceLog',
+        JSON.stringify({
+          priceConnectorAlive: {
+            bootId: this.bootId,
+            role: priceRole ?? 'ticker',
+          },
+        }),
+      )
+    beacon()
+    if (this.beaconTimer) {
+      clearInterval(this.beaconTimer)
+    }
+    this.beaconTimer = setInterval(beacon, BEACON_INTERVAL_MS)
+    logger.info(
+      `Announced price connector boot ${this.bootId}; re-announcing every ${
+        BEACON_INTERVAL_MS / 1000
+      }s`,
+    )
+  }
+
   async init() {
     if (isCandle || isAll) {
-      this.redis?.publish(
-        'serviceLog',
-        JSON.stringify({ restart: 'priceConnector' }),
-      )
+      // Fire-and-forget: `announceBoot` awaits a Redis client, and
+      // `RedisClient.getInstance()` retries indefinitely, so awaiting it here
+      // would let a Redis outage block every exchange worker from spawning.
+      void this.announceBoot()
     }
     if (this.isBybit) {
       this.initWorker(ExchangeEnum.bybit)
@@ -345,6 +427,13 @@ class Connector {
 
   stop() {
     logger.info('Closing connector')
+
+    // index.price rebuilds the Connector after a fatal rejection; without this
+    // the dead instance's beacon keeps firing alongside the new one's.
+    if (this.beaconTimer) {
+      clearInterval(this.beaconTimer)
+      this.beaconTimer = null
+    }
 
     const bybitWorker = this.workers.get(ExchangeEnum.bybit)
     const binanceWorker = this.workers.get(ExchangeEnum.binance)
