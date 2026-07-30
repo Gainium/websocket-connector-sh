@@ -30,6 +30,50 @@ const krakenCandleTradeTimeout = 180000
 const spotWsKey = 'spotPublicV2'
 const derivativesWsKey = 'derivativesPublicV1'
 
+// A Kraken venue outage repeats the SAME exception per client until it clears —
+// the derivatives engine answers every connect/subscribe with
+// {"event":"alert","message":"Trading engine unavailable"}, and a failing
+// connect re-emits through parseWsError on each retry. Unthrottled that is
+// ~100 identical lines/min per client, which was 100% of the candle- and
+// price-stream error output during the outage and pushed a full day of
+// unrelated errors out of the pm2 buffer. Collapse identical payloads to one
+// line per window, carrying the hidden count so a storm stays visible as a
+// number rather than as thousands of duplicate lines.
+const logThrottleWindowMs = 30_000
+const maxThrottleKeys = 200
+
+const throttleState = new Map<string, { first: number; hidden: number }>()
+
+/**
+ * Call `emit` at most once per `logThrottleWindowMs` for a given `key`. Repeats
+ * inside the window are counted and reported on the next emission.
+ */
+const logThrottled = (key: string, emit: (suffix: string) => void) => {
+  const now = Date.now()
+  const state = throttleState.get(key)
+
+  if (state && now - state.first < logThrottleWindowMs) {
+    state.hidden++
+    return
+  }
+
+  if (!state && throttleState.size >= maxThrottleKeys) {
+    // Bound memory in case payloads ever vary: drop fully elapsed windows.
+    for (const [k, v] of throttleState) {
+      if (now - v.first >= logThrottleWindowMs) {
+        throttleState.delete(k)
+      }
+    }
+  }
+
+  const hidden = state?.hidden ?? 0
+  throttleState.set(key, { first: now, hidden: 0 })
+  // Count is reported relative to the previous emitted line rather than to a
+  // fixed window: once a storm stops, its trailing remainder is only flushed by
+  // the next occurrence, which can be hours later.
+  emit(hidden ? ` (+${hidden} identical since the previous line)` : '')
+}
+
 // Kraken spot OHLC (WS v2) only accepts these interval values, and only as a
 // JSON *number* — a numeric string ("240") is rejected with "Subscription ohlc
 // interval must be an integer", both on the initial subscribe and on every
@@ -107,6 +151,12 @@ class KrakenConnector extends CommonConnector {
     const client = new KrakenWsClient(
       {
         ...(isFutures && isDemo && { testnet: true }),
+        // Every other connector (binance/bybit/okx/bitget) passes the shared
+        // `wsReconnect` delay; Kraken never did, so it silently ran on the
+        // kraken-api default of 500 ms — 7x more aggressive than the rest of
+        // the platform. During a venue outage that is ~2 reconnect attempts a
+        // second per client, on every node. Use the same knob as the others.
+        reconnectTimeout: this.wsReconnect,
       },
       {
         trace: () => null,
@@ -122,14 +172,16 @@ class KrakenConnector extends CommonConnector {
     })
 
     client.on('reconnected', (data) => {
-      logger.info(
-        `Kraken ${isFutures ? 'futures' : 'spot'} ${type} reconnected ${data?.wsKey}`,
+      const line = `Kraken ${isFutures ? 'futures' : 'spot'} ${type} reconnected ${data?.wsKey}`
+      logThrottled(`reconnected|${line}`, (suffix) =>
+        logger.info(`${line}${suffix}`),
       )
     })
 
     client.on('exception', (data) => {
-      logger.error(
-        `Kraken ${isFutures ? 'futures' : 'spot'} ${type} exception: ${JSON.stringify(data)}`,
+      const line = `Kraken ${isFutures ? 'futures' : 'spot'} ${type} exception: ${JSON.stringify(data)}`
+      logThrottled(`exception|${line}`, (suffix) =>
+        logger.error(`${line}${suffix}`),
       )
     })
 
