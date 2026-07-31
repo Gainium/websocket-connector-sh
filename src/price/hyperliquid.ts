@@ -12,9 +12,42 @@ import type { Ticker, StreamType, SubscribeCandlePayload } from './types'
 const mutex = new IdMutex()
 
 const maxCandlesPerConnection = 1000
-// Hyperliquid enforces a per-IP limit of 10 simultaneous WS connections.
-// Reserve 1 for the ticker client and 1 as a safety buffer.
-const maxCandleClients = 8
+/**
+ * Hyperliquid's documented per-IP cap on simultaneous WS connections
+ * ("Maximum of 10 websocket connections", HL API rate-limits doc). Exposed as
+ * an env override because the venue has been observed rejecting with a higher
+ * number ("Cannot open more than 15 connections.") on some egress IPs — an
+ * operator who can demonstrate a higher allowance for their host can raise it
+ * without a code change. The default stays at the documented value: exceeding
+ * the real cap produces exactly the 1008 close storm that used to feed the
+ * restart loop below.
+ */
+const maxHyperliquidConnections =
+  +(process.env.HYPERLIQUID_MAX_WS_CONNECTIONS ?? '') || 10
+/**
+ * Connection slots kept outside the candle pool: one for the ticker client,
+ * one as headroom for the replacement transport a restart briefly holds open
+ * alongside the socket it is closing.
+ */
+const reservedHyperliquidConnections = 2
+const maxCandleClients = Math.max(
+  1,
+  maxHyperliquidConnections - reservedHyperliquidConnections,
+)
+
+/**
+ * Full-restart pacing (bug #218). A restart tears down and rebuilds *every*
+ * transport, so it is itself a burst of new connections — restarting without a
+ * delay on a persistently-failing subscribe re-trips the very per-IP limit that
+ * caused the failure, and the two feed each other forever. The re-entry runs
+ * entirely through already-settled promises, i.e. as microtasks, so the loop
+ * also starves the macrotask queue and stops `CommonConnector.watchdogFn` and
+ * every other exchange's timers in the same worker.
+ */
+const hyperliquidRestartBaseDelay = 30_000
+const hyperliquidRestartMaxDelay = 300_000
+/** Quiet period after which the backoff returns to the base delay. */
+const hyperliquidRestartResetAfter = 600_000
 
 class HyperliquidConnector extends CommonConnector {
   private unsubscribeMap: Map<StreamType, hl.Subscription[]> = new Map()
@@ -481,6 +514,71 @@ class HyperliquidConnector extends CommonConnector {
     this.reconnectHyperliquidCandleStream()
   }
 
+  private restartTimer: NodeJS.Timeout | null = null
+  private restartBackoffMs = hyperliquidRestartBaseDelay
+  private lastRestartAt = 0
+
+  /**
+   * Single-flight, paced entry point for a full Hyperliquid restart. Every
+   * caller must go through here — calling `hyperliquidRestartCb` directly from
+   * a failure path is what produced bug #218.
+   *
+   * - At most one restart is in flight; further requests coalesce into the
+   *   pending one instead of stacking.
+   * - The delay is `backoff − elapsed`, so a restart following a healthy period
+   *   still fires immediately: a one-off drop recovers exactly as fast as
+   *   before, and only *consecutive* failures get slowed down (30s, doubling to
+   *   a 5 min cap).
+   * - After {@link hyperliquidRestartResetAfter} without a restart the backoff
+   *   returns to the base delay.
+   */
+  private scheduleHyperliquidRestart(reason: string) {
+    if (this.restartTimer) {
+      // Already pending — coalesce. Staying silent here is deliberate: the
+      // failure path can fire thousands of times per second.
+      return
+    }
+    const elapsed =
+      this.lastRestartAt === 0 ? Infinity : Date.now() - this.lastRestartAt
+    const consecutive = elapsed < hyperliquidRestartResetAfter
+    if (!consecutive) {
+      this.restartBackoffMs = hyperliquidRestartBaseDelay
+    }
+    const delay = Math.max(0, this.restartBackoffMs - elapsed)
+    logger.warn(
+      `Hyperliquid restart in ${Math.round(delay / 1000)}s (backoff ${this.restartBackoffMs / 1000}s): ${reason}`,
+    )
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null
+      this.lastRestartAt = Date.now()
+      if (consecutive) {
+        this.restartBackoffMs = Math.min(
+          this.restartBackoffMs * 2,
+          hyperliquidRestartMaxDelay,
+        )
+      }
+      this.hyperliquidRestartCb()
+    }, delay)
+  }
+
+  /**
+   * Hyperliquid never adopted the `handleStall` isolation hook, so a stall
+   * still reached the `throw` in `CommonConnector.watchdogFn` — and a throw
+   * inside a `setInterval` callback is an uncaught exception that kills the
+   * whole price worker, taking every other exchange's feeds with it. A full
+   * Hyperliquid restart rebuilds the ticker *and* the candle clients, so it is
+   * the right recovery for all three stall kinds. `CommonConnector` still
+   * escalates to the full-worker restart after `maxTargetedRestarts`, so a
+   * genuinely dead worker is still replaced.
+   */
+  protected override handleStall(
+    exchange: ExchangeEnum,
+    kind: 'price' | 'candle' | 'connect',
+  ): boolean {
+    this.scheduleHyperliquidRestart(`${kind} stall | ${exchange}`)
+    return true
+  }
+
   private async initHyperliquidWS() {
     try {
       const client = this.hyperliquidClient
@@ -509,8 +607,16 @@ class HyperliquidConnector extends CommonConnector {
         `ticker`,
         subs.filter((s): s is hl.Subscription => s !== null),
       )
-    } catch {
-      this.hyperliquidRestartCb()
+    } catch (e) {
+      // Paced + single-flight. Calling `hyperliquidRestartCb()` straight from
+      // here re-entered this method with no delay and no in-flight guard, so a
+      // persistently-failing `allMids` (i.e. while HL rate-limits our IP) spun
+      // ~5.8k restarts/s (11.6k transports/s) until the process died — and,
+      // being a pure microtask loop, starved every timer in the worker while
+      // it did. See bug #218.
+      this.scheduleHyperliquidRestart(
+        `allMids ticker subscription failed: ${e instanceof Error ? e.message : e}`,
+      )
     }
   }
 
@@ -552,9 +658,9 @@ class HyperliquidConnector extends CommonConnector {
       )
       return find.client
     }
-    // Hard cap: do not open more than maxCandleClients connections.
-    // Hyperliquid allows ≤10 simultaneous WS connections per IP; we reserve
-    // capacity for the ticker and a safety margin.
+    // Hard cap: do not open more than maxCandleClients connections. Derived
+    // from maxHyperliquidConnections (the per-IP simultaneous-connection cap)
+    // minus the slots reserved for the ticker client and restart headroom.
     if (this.hyperliquidClientCandle.length >= maxCandleClients) {
       logger.warn(
         `Hyperliquid candle client cap (${maxCandleClients}) reached — reusing least-busy client`,
@@ -759,6 +865,10 @@ class HyperliquidConnector extends CommonConnector {
     if (this.metaRefreshTimer) {
       clearInterval(this.metaRefreshTimer)
       this.metaRefreshTimer = null
+    }
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer)
+      this.restartTimer = null
     }
     this.stopHyperliquid()
   }
