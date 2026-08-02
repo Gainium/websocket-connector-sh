@@ -623,6 +623,13 @@ class UserConnector {
    *  allowed. While in cooldown we neither reopen the stream nor emit a flap
    *  alert for the room (it's a user credential problem, not dead infra). */
   private authCooldownUntil: Map<string, number> = new Map()
+  /** Log latch for the cooldown skip: room id → how many subscribe attempts
+   *  have been skipped silently since we logged the skip for this cooldown
+   *  period. Presence means "already logged". Callers (main-app's stream
+   *  watchdog, fill-failsafe escalation, per-bot subscribe) re-request a
+   *  circuit-broken room several times a minute with no backoff, so logging
+   *  the skip per attempt drowned every other line in the service log. */
+  private authCooldownSkipsSuppressed: Map<string, number> = new Map()
   private kucoinSymbols: { coinm: KucoinSymbol[]; usdm: KucoinSymbol[] } = {
     coinm: [],
     usdm: [],
@@ -1085,6 +1092,24 @@ class UserConnector {
     return logger.info(msg)
   }
 
+  /**
+   * Drop the once-per-cooldown log latch for a room, reporting how many
+   * subscribe attempts were skipped silently while it was armed. Safe to call
+   * for a room that was never in cooldown — it no-ops.
+   */
+  private releaseAuthCooldownLogLatch(id: string, userId?: string) {
+    const suppressed = this.authCooldownSkipsSuppressed.get(id)
+    if (suppressed === undefined) {
+      return
+    }
+    this.authCooldownSkipsSuppressed.delete(id)
+    if (suppressed > 0) {
+      this.logger(
+        `Auth-rejection cooldown ended for ${userId ?? id} (room ${id}) — ${suppressed} further subscribe attempt(s) were skipped without logging`,
+      )
+    }
+  }
+
   get OKXEnv() {
     return process.env.ENVOKX === 'sandbox' ? 'demo' : 'prod'
   }
@@ -1295,13 +1320,23 @@ class UserConnector {
     // rejected credential and never blocks a fixed key.
     const cooldownUntil = this.authCooldownUntil.get(id) ?? 0
     if (cooldownUntil > Date.now()) {
-      return this.logger(
-        `Skip subscribe for ${userId} (${api.provider}): key in auth-rejection cooldown for ${Math.round(
-          (cooldownUntil - Date.now()) / 1000,
-        )}s`,
-        true,
-      )
+      // Log once per cooldown period, at info: the skip is the breaker working
+      // as designed, not a service error, and the callers re-ask ~5x/min.
+      const suppressed = this.authCooldownSkipsSuppressed.get(id)
+      if (suppressed === undefined) {
+        this.authCooldownSkipsSuppressed.set(id, 0)
+        return this.logger(
+          `Skip subscribe for ${userId} (${api.provider}): key in auth-rejection cooldown for ${Math.round(
+            (cooldownUntil - Date.now()) / 1000,
+          )}s — further skips for this room logged once when the cooldown ends`,
+        )
+      }
+      this.authCooldownSkipsSuppressed.set(id, suppressed + 1)
+      return
     }
+    // Cooldown lapsed (or was never armed): drop the latch so the next cooldown
+    // logs again, and report what the latch swallowed.
+    this.releaseAuthCooldownLogLatch(id, userId)
     let findUser = this.users.find((user) => user.id === id)
     if (!findUser) {
       findUser = {
@@ -1515,6 +1550,8 @@ class UserConnector {
                 30 * 60 * 1000,
             )
             this.authCooldownUntil.set(id, now + cooldownMs)
+            // New cooldown period ⇒ new skip log allowed.
+            this.releaseAuthCooldownLogLatch(id, userId)
             this.binanceAuthErrors.delete(id)
             this.binanceErrors.delete(id)
             await stopMethod()
@@ -2840,6 +2877,8 @@ class UserConnector {
             )
             const now = Date.now()
             this.authCooldownUntil.set(id, now + cooldownMs)
+            // New cooldown period ⇒ new skip log allowed.
+            this.releaseAuthCooldownLogLatch(id, userId)
             try {
               close()
             } catch {
@@ -3177,6 +3216,7 @@ class UserConnector {
     ) {
       if (this.binanceAuthErrors.has(id)) this.binanceAuthErrors.delete(id)
       if (this.authCooldownUntil.has(id)) this.authCooldownUntil.delete(id)
+      this.releaseAuthCooldownLogLatch(id)
     }
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
 
