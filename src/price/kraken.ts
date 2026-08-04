@@ -111,10 +111,29 @@ type KrakenClient = {
   id: number
 }[]
 
+// Kraken spot allows only ONE ohlc interval per symbol per CONNECTION. Asking
+// for a second timeframe on a symbol that already has one is answered with
+// {"error":"Already subscribed to one ohlc interval on this symbol"} and that
+// timeframe then receives no candles at all — silently, because the room was
+// already recorded as subscribed. So spot candle sockets are pooled PER
+// INTERVAL and never shared across intervals, with the usual per-client
+// subscription cap on top (one interval can still hold plenty of symbols).
+type KrakenCandleClient = {
+  client: KrakenWsClient
+  subs: number
+  interval: number
+  // wsnames awaiting a subscribe ack, oldest first. Kraken answers subscribes
+  // in order on a connection and we subscribe one symbol at a time, so the head
+  // of this queue identifies what a rejection refers to — the error payload
+  // itself carries only a req_id, which is why the prod log was 24 identical
+  // unactionable lines.
+  pending: { room: string; wsname: string }[]
+}
+
 class KrakenConnector extends CommonConnector {
   private krakenSpotClients: KrakenClient = []
   private krakenUsdmClients: KrakenClient = []
-  private krakenCandleClient: KrakenWsClient | null = null
+  private krakenSpotCandleClients: KrakenCandleClient[] = []
   private krakenUsdmCandleClient: KrakenWsClient | null = null
   private spotSymbolMaps: KrakenSymbolMap = {
     wsnameToNormalized: new Map(),
@@ -142,6 +161,13 @@ class KrakenConnector extends CommonConnector {
     type: StreamType,
     isFutures: boolean = false,
     current?: KrakenWsClient,
+    // Appended to this client's log lines (e.g. ` interval=240`) so a candle
+    // socket's messages say WHICH timeframe they belong to.
+    label: string = '',
+    // Called for a `method:"subscribe"` failure to resolve the offending
+    // (symbol, interval) — the Kraken payload only carries a req_id. Returns
+    // extra text appended to the single error line.
+    describeSubscribeError?: () => string,
   ) {
     if (current) {
       current.closeAll(true)
@@ -165,21 +191,25 @@ class KrakenConnector extends CommonConnector {
       },
     )
 
+    const tag = `Kraken ${isFutures ? 'futures' : 'spot'} ${type}${label}`
+
     client.on('open', (data) => {
-      logger.info(
-        `Kraken ${isFutures ? 'futures' : 'spot'} ${type} opened ${data.wsKey}`,
-      )
+      logger.info(`${tag} opened ${data.wsKey}`)
     })
 
     client.on('reconnected', (data) => {
-      const line = `Kraken ${isFutures ? 'futures' : 'spot'} ${type} reconnected ${data?.wsKey}`
+      const line = `${tag} reconnected ${data?.wsKey}`
       logThrottled(`reconnected|${line}`, (suffix) =>
         logger.info(`${line}${suffix}`),
       )
     })
 
     client.on('exception', (data) => {
-      const line = `Kraken ${isFutures ? 'futures' : 'spot'} ${type} exception: ${JSON.stringify(data)}`
+      const extra =
+        data?.method === 'subscribe' && describeSubscribeError
+          ? describeSubscribeError()
+          : ''
+      const line = `${tag} exception: ${JSON.stringify(data)}${extra}`
       logThrottled(`exception|${line}`, (suffix) =>
         logger.error(`${line}${suffix}`),
       )
@@ -387,28 +417,82 @@ class KrakenConnector extends CommonConnector {
       return
     }
 
-    if (!this.krakenCandleClient) {
-      this.krakenCandleClient = this.getKrakenClient('candle', false)
-      this.krakenCandleClient.on(
-        'message',
-        this.krakenCandleCb(ExchangeEnum.kraken),
-      )
-    }
-
     // Convert normalized symbol to wsname format for subscription
     const wsnameSymbol =
       this.spotSymbolMaps.normalizedToWsname.get(symbol) || symbol
 
+    // One socket per interval — sharing one across intervals is what Kraken
+    // rejects, leaving the extra timeframes without candles.
+    const entry = this.getSpotCandleClient(krakenInterval)
+
+    entry.pending.push({
+      room: this.getCandleRoomName(symbol, ExchangeEnum.kraken, interval),
+      wsname: wsnameSymbol,
+    })
+    entry.subs++
+
     // Subscribe to ohlc for the symbol (spot only)
-    this.krakenCandleClient.subscribe(
+    entry.client.subscribe(
       [
         {
           topic: 'ohlc',
           payload: { symbol: [wsnameSymbol], interval: krakenInterval },
         },
       ],
-      'spotPublicV2',
+      spotWsKey,
     )
+  }
+
+  /**
+   * Pick (or open) the spot candle socket that owns `interval`. Never returns a
+   * client already carrying a different interval — that is the whole point.
+   */
+  private getSpotCandleClient(interval: number): KrakenCandleClient {
+    const existing = this.krakenSpotCandleClients.find(
+      (c) => c.interval === interval && c.subs < maxSubsPerClient,
+    )
+    if (existing) {
+      return existing
+    }
+
+    const pending: KrakenCandleClient['pending'] = []
+
+    const client = this.getKrakenClient(
+      'candle',
+      false,
+      undefined,
+      ` interval=${interval}`,
+      () => {
+        const failed = pending.shift()
+        if (!failed) {
+          return ''
+        }
+        // A rejected subscribe never delivers a single candle, so stop
+        // remembering the room as subscribed: otherwise it stays "active"
+        // forever while the timeframe is silently dead, and every candle-stall
+        // restart replays it into the same rejection. Dropping it lets
+        // main-app's next `candlesRequests` message re-subscribe it.
+        for (const ex of [ExchangeEnum.kraken, ExchangeEnum.paperKraken]) {
+          this.subscribedCandlesMap.get(ex)?.delete(failed.room)
+        }
+        return ` — rejected ohlc subscribe for ${failed.wsname} at interval ${interval}; dropped from the subscribed set so it is retried`
+      },
+    )
+
+    client.on('message', this.krakenCandleCb(ExchangeEnum.kraken))
+
+    client.on('response', (data) => {
+      if (data?.method !== 'subscribe' || !data?.success || !pending.length) {
+        return
+      }
+      const wsname = data?.result?.symbol
+      const i = pending.findIndex((p) => p.wsname === wsname)
+      pending.splice(i >= 0 ? i : 0, 1)
+    })
+
+    const entry: KrakenCandleClient = { client, subs: 0, interval, pending }
+    this.krakenSpotCandleClients.push(entry)
+    return entry
   }
 
   private connectKrakenFuturesCandleStream(
@@ -656,10 +740,12 @@ class KrakenConnector extends CommonConnector {
         this.krakenUsdmCandleClient.removeAllListeners()
         this.krakenUsdmCandleClient = null
       }
-    } else if (this.krakenCandleClient) {
-      this.krakenCandleClient.closeAll(true)
-      this.krakenCandleClient.removeAllListeners()
-      this.krakenCandleClient = null
+    } else {
+      for (const c of this.krakenSpotCandleClients) {
+        c.client.closeAll(true)
+        c.client.removeAllListeners()
+      }
+      this.krakenSpotCandleClients = []
     }
 
     for (const [ex, symbols] of this.subscribedCandlesMap) {
@@ -700,10 +786,14 @@ class KrakenConnector extends CommonConnector {
   ): boolean {
     const isUsdm = exchange === ExchangeEnum.krakenUsdm
     if (kind === 'candle') {
-      const client = isUsdm
-        ? this.krakenUsdmCandleClient
-        : this.krakenCandleClient
-      return !!client?.isConnected(isUsdm ? derivativesWsKey : spotWsKey)
+      if (isUsdm) {
+        return !!this.krakenUsdmCandleClient?.isConnected(derivativesWsKey)
+      }
+      // Spot candles are spread over one socket per interval; any live socket
+      // means the feed is alive (just quiet on the others).
+      return this.krakenSpotCandleClients.some((c) =>
+        c.client.isConnected(spotWsKey),
+      )
     }
     const clients = isUsdm ? this.krakenUsdmClients : this.krakenSpotClients
     const wsKey = isUsdm ? derivativesWsKey : spotWsKey
@@ -745,10 +835,10 @@ class KrakenConnector extends CommonConnector {
       k.client.closeAll(true)
       k.client.removeAllListeners()
     })
-    if (this.krakenCandleClient) {
-      this.krakenCandleClient.closeAll(true)
-      this.krakenCandleClient.removeAllListeners()
-    }
+    this.krakenSpotCandleClients.forEach((k) => {
+      k.client.closeAll(true)
+      k.client.removeAllListeners()
+    })
     if (this.krakenUsdmCandleClient) {
       this.krakenUsdmCandleClient.closeAll(true)
       this.krakenUsdmCandleClient.removeAllListeners()
