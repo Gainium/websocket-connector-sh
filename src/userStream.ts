@@ -1207,6 +1207,30 @@ class UserConnector {
     this.authRetryTimers.set(id, timer)
   }
 
+  /**
+   * Tell main-app (which already consumes serviceLog for userStreamFlap) that
+   * this account's realtime feed was circuit-broken on a credential problem,
+   * so it can raise the one-per-day "Realtime feed unavailable" bot-message —
+   * otherwise the degradation stays invisible to the user. Emit-only: a
+   * publish failure must never affect the breaker.
+   */
+  private publishAuthRejectNotice(
+    exchange: ExchangeEnum,
+    userId: string | undefined,
+    reason: string,
+  ) {
+    try {
+      this.redis?.publish(
+        serviceLogRedis,
+        JSON.stringify({
+          userStreamAuthReject: { exchange, userId, reason },
+        }),
+      )
+    } catch {
+      /* emit-only */
+    }
+  }
+
   /** Cancel a pending self-heal retry for a room. No-ops if none is armed. */
   private clearAuthRetryTimer(id: string) {
     const timer = this.authRetryTimers.get(id)
@@ -1659,7 +1683,26 @@ class UserConnector {
           // errors, stop and back off instead of resubscribing.
           const wsErr: any = data ?? {}
           const authCode = Number(wsErr?.error?.code ?? wsErr?.code)
+          const authMsg = String(wsErr?.error?.msg ?? wsErr?.msg ?? '')
+          // Deterministic-fatal WS-API flavour: on a `mainWSAPI` connection
+          // `subscribeUserDataStream()` sends an UNSIGNED
+          // `userDataStream.subscribe` and relies on `session.logon` having
+          // authenticated the session. When the key cannot log the session on
+          // (revoked, IP de-whitelisted, or not the Ed25519 key the WS-API
+          // path assumes) EVERY request comes back with this error and a
+          // reconnect changes nothing. It arrives with a non-401 status and an
+          // undocumented error code, so it never matched the numeric list
+          // below and fell through to the generic `binanceErrors >= 2`
+          // restart — stop/sleep(5s)/reopen, forever, with no backoff and no
+          // give-up (bug #294: one room produced ~94% of this service's error
+          // log). Match on the message and, like the Kraken branch further
+          // down, break the circuit on FIRST sight instead of waiting for a
+          // hits-in-window threshold.
+          const isFatalAuthReject = /WebSocket session not authenticated/i.test(
+            authMsg,
+          )
           const isAuthReject =
+            isFatalAuthReject ||
             [-2015, -2014, -2008].includes(authCode) ||
             Number(wsErr?.status) === 401
           if (isAuthReject) {
@@ -1670,11 +1713,19 @@ class UserConnector {
             const threshold =
               Number(process.env.USER_STREAM_AUTH_FAIL_THRESHOLD) || 3
             const now = Date.now()
+            // A single failed subscribe can emit this more than once before
+            // the teardown below lands; only the first arms the breaker.
+            if (
+              isFatalAuthReject &&
+              (this.authCooldownUntil.get(id) ?? 0) > now
+            ) {
+              return
+            }
             const hits = (this.binanceAuthErrors.get(id) ?? []).filter(
               (t) => now - t < windowMs,
             )
             hits.push(now)
-            if (hits.length < threshold) {
+            if (!isFatalAuthReject && hits.length < threshold) {
               this.binanceAuthErrors.set(id, hits)
               return
             }
@@ -1690,12 +1741,18 @@ class UserConnector {
             const subs = this.subscribersMap.get(id)
             this.subscribersMap.delete(id)
             this.logger(
-              `${id} ${userId} Binance key rejected (code ${
-                authCode || 401
+              `${id} ${userId} Binance key rejected (${
+                isFatalAuthReject ? authMsg : `code ${authCode || 401}`
               }); circuit-broken for ${Math.round(
                 cooldownMs / 1000,
               )}s (strike ${strikes}) — no reconnect, no flap alert`,
               true,
+            )
+            // Same user-facing notice the Kraken breaker already emits.
+            this.publishAuthRejectNotice(
+              api.provider,
+              userId,
+              isFatalAuthReject ? authMsg : `code ${authCode || 401}`,
             )
             // One delayed retry after the cooldown so a key fixed in place
             // (e.g. egress IP added to the whitelist without regenerating the
@@ -3007,23 +3064,7 @@ class UserConnector {
               )}s (strike ${strikes}) — no reconnect, no flap alert ${api.provider}`,
               true,
             )
-            // Tell main-app (which already consumes serviceLog for
-            // userStreamFlap) so the user gets a bot-message warning —
-            // otherwise the degradation stays invisible to them. Emit-only.
-            try {
-              this.redis?.publish(
-                serviceLogRedis,
-                JSON.stringify({
-                  userStreamAuthReject: {
-                    exchange: api.provider,
-                    userId,
-                    reason: errorMsg,
-                  },
-                }),
-              )
-            } catch {
-              /* emit-only: a publish failure must never affect the breaker */
-            }
+            this.publishAuthRejectNotice(api.provider, userId, errorMsg)
             // One delayed retry so a key fixed in place (e.g. the "WebSocket
             // interface" permission enabled on the same key) self-heals
             // without a bot restart. If it's still rejected, this handler
