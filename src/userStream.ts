@@ -630,6 +630,23 @@ class UserConnector {
    *  circuit-broken room several times a minute with no backoff, so logging
    *  the skip per attempt drowned every other line in the service log. */
   private authCooldownSkipsSuppressed: Map<string, number> = new Map()
+  /** Consecutive auth-rejection cycles per room id, driving the exponential
+   *  self-heal backoff (see `authCooldownMs`). A flat 30min retry means a
+   *  permanently-revoked key logs a rejection + a circuit-broken line 48x a
+   *  day, forever — across ~20 accounts that was the single largest source of
+   *  error lines in the service log (bug #289). Reset when the key proves
+   *  itself (a genuine account event) or when the room ran clean long enough
+   *  that the last rejection is no longer consecutive. */
+  private authCooldownStrikes: Map<string, number> = new Map()
+  /** Epoch-ms of the last auth rejection per room id. Only used to decide
+   *  whether a new rejection continues the current strike run or starts a
+   *  fresh one. */
+  private authLastRejectAt: Map<string, number> = new Map()
+  /** Pending self-heal retry timer per room id. Tracked so a room that is
+   *  torn down while circuit-broken (the user deleted the connection) can
+   *  have its retry cancelled — otherwise the timer resurrects a stream for a
+   *  credential that no longer exists, forever. */
+  private authRetryTimers: Map<string, NodeJS.Timeout> = new Map()
   private kucoinSymbols: { coinm: KucoinSymbol[]; usdm: KucoinSymbol[] } = {
     coinm: [],
     usdm: [],
@@ -1110,6 +1127,117 @@ class UserConnector {
     }
   }
 
+  /**
+   * Cooldown length for the Nth consecutive auth rejection of a room: the base
+   * (30min) doubled per prior strike, capped at 24h — 30min, 1h, 2h, 4h, 8h,
+   * 16h, 24h, 24h…
+   *
+   * The retry exists so a key fixed in place self-heals; nothing about a
+   * revoked key gets better by asking every 30min. Escalating collapses a
+   * permanently-dead key from 48 rejection cycles a day to 1 without ever
+   * giving up on it, and a key that is genuinely fixed still recovers on the
+   * next retry (and callers re-requesting the room recover it sooner — the
+   * cooldown gate in `openStreamCallback` lets them through the moment it
+   * lapses, independent of this timer).
+   */
+  private authCooldownMs(strikes: number) {
+    const base = Math.max(
+      60_000,
+      Number(process.env.USER_STREAM_AUTH_COOLDOWN_MS) || 30 * 60 * 1000,
+    )
+    const cap = Math.max(
+      base,
+      Number(process.env.USER_STREAM_AUTH_COOLDOWN_MAX_MS) ||
+        24 * 60 * 60 * 1000,
+    )
+    // Clamp the exponent before shifting: strikes is unbounded over a process
+    // lifetime and 2 ** 1024 is Infinity.
+    return Math.min(base * 2 ** Math.min(strikes, 20), cap)
+  }
+
+  /**
+   * Arm (or re-arm) the auth-rejection circuit-breaker for a room and return
+   * the cooldown it earned. Shared by the Binance and Kraken breakers so both
+   * escalate identically.
+   *
+   * A rejection continues the current strike run only if it lands within twice
+   * the cooldown the previous strike earned — i.e. the retry came back
+   * rejected. A room that streamed fine for longer than that and only now
+   * rejects (key revoked later) starts the ladder over at the base cooldown.
+   */
+  private armAuthCooldown(id: string, userId?: string, now = Date.now()) {
+    const prevStrikes = this.authCooldownStrikes.get(id) ?? 0
+    const lastReject = this.authLastRejectAt.get(id) ?? 0
+    const consecutive =
+      prevStrikes > 0 &&
+      now - lastReject <= this.authCooldownMs(prevStrikes - 1) * 2
+    const strikes = consecutive ? prevStrikes : 0
+    const cooldownMs = this.authCooldownMs(strikes)
+    this.authCooldownStrikes.set(id, strikes + 1)
+    this.authLastRejectAt.set(id, now)
+    this.authCooldownUntil.set(id, now + cooldownMs)
+    // New cooldown period ⇒ new skip log allowed.
+    this.releaseAuthCooldownLogLatch(id, userId)
+    return { cooldownMs, strikes: strikes + 1 }
+  }
+
+  /**
+   * Schedule the single post-cooldown self-heal retry for a circuit-broken
+   * room, replacing any retry already pending for it. Tracked in
+   * `authRetryTimers` so `closeStreamCallback` can cancel it.
+   */
+  private scheduleAuthSelfHeal(
+    id: string,
+    subs: number | undefined,
+    msg: OpenStreamInput,
+    uuid: string | undefined,
+    cooldownMs: number,
+  ) {
+    if (!subs) {
+      return
+    }
+    this.clearAuthRetryTimer(id)
+    const timer = setTimeout(() => {
+      this.authRetryTimers.delete(id)
+      if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
+        this.authCooldownUntil.delete(id)
+        ;[...Array(subs)].forEach(() => this.openStreamCallback(msg, uuid))
+      }
+    }, cooldownMs)
+    this.authRetryTimers.set(id, timer)
+  }
+
+  /** Cancel a pending self-heal retry for a room. No-ops if none is armed. */
+  private clearAuthRetryTimer(id: string) {
+    const timer = this.authRetryTimers.get(id)
+    if (timer) {
+      clearTimeout(timer)
+      this.authRetryTimers.delete(id)
+    }
+  }
+
+  /**
+   * Drop the per-room bookkeeping for a room that no longer has any
+   * subscriber, so a removed connection can't be resurrected by a timer and
+   * the maps don't grow with dead credential hashes.
+   *
+   * `authCooldownUntil` is deliberately KEPT: the room may be torn down while
+   * still circuit-broken, and callers re-request a stream several times a
+   * minute — clearing the gate here would reopen the rejected stream on the
+   * next request and undo the breaker. It is dropped in `openStreamCallback`
+   * once it actually lapses.
+   */
+  private forgetSubscription(id: string) {
+    this.clearAuthRetryTimer(id)
+    this.subscribeMsgsMap.delete(id)
+    if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
+      this.authCooldownUntil.delete(id)
+      this.authCooldownStrikes.delete(id)
+      this.authLastRejectAt.delete(id)
+      this.authCooldownSkipsSuppressed.delete(id)
+    }
+  }
+
   get OKXEnv() {
     return process.env.ENVOKX === 'sandbox' ? 'demo' : 'prod'
   }
@@ -1335,7 +1463,13 @@ class UserConnector {
       return
     }
     // Cooldown lapsed (or was never armed): drop the latch so the next cooldown
-    // logs again, and report what the latch swallowed.
+    // logs again, and report what the latch swallowed. Also drop the lapsed
+    // gate entry itself — the self-heal timer used to be the only thing that
+    // cleared it, and it no longer runs for every cooldown (a torn-down room
+    // has its retry cancelled).
+    if (cooldownUntil) {
+      this.authCooldownUntil.delete(id)
+    }
     this.releaseAuthCooldownLogLatch(id, userId)
     let findUser = this.users.find((user) => user.id === id)
     if (!findUser) {
@@ -1544,14 +1678,11 @@ class UserConnector {
               this.binanceAuthErrors.set(id, hits)
               return
             }
-            const cooldownMs = Math.max(
-              60_000,
-              Number(process.env.USER_STREAM_AUTH_COOLDOWN_MS) ||
-                30 * 60 * 1000,
+            const { cooldownMs, strikes } = this.armAuthCooldown(
+              id,
+              userId,
+              now,
             )
-            this.authCooldownUntil.set(id, now + cooldownMs)
-            // New cooldown period ⇒ new skip log allowed.
-            this.releaseAuthCooldownLogLatch(id, userId)
             this.binanceAuthErrors.delete(id)
             this.binanceErrors.delete(id)
             await stopMethod()
@@ -1563,23 +1694,14 @@ class UserConnector {
                 authCode || 401
               }); circuit-broken for ${Math.round(
                 cooldownMs / 1000,
-              )}s — no reconnect, no flap alert`,
+              )}s (strike ${strikes}) — no reconnect, no flap alert`,
               true,
             )
             // One delayed retry after the cooldown so a key fixed in place
             // (e.g. egress IP added to the whitelist without regenerating the
             // key) self-heals without a bot restart. If it's still rejected,
-            // this handler simply re-arms the cooldown.
-            if (subs) {
-              setTimeout(() => {
-                if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
-                  this.authCooldownUntil.delete(id)
-                  ;[...Array(subs)].forEach(() =>
-                    this.openStreamCallback(msg, uuid),
-                  )
-                }
-              }, cooldownMs)
-            }
+            // this handler simply re-arms the cooldown, one step longer.
+            this.scheduleAuthSelfHeal(id, subs, msg, uuid, cooldownMs)
             return
           }
           this.binanceErrors.set(id, (this.binanceErrors.get(id) ?? 0) + 1)
@@ -2870,15 +2992,7 @@ class UserConnector {
             if ((this.authCooldownUntil.get(id) ?? 0) > Date.now()) {
               return
             }
-            const cooldownMs = Math.max(
-              60_000,
-              Number(process.env.USER_STREAM_AUTH_COOLDOWN_MS) ||
-                30 * 60 * 1000,
-            )
-            const now = Date.now()
-            this.authCooldownUntil.set(id, now + cooldownMs)
-            // New cooldown period ⇒ new skip log allowed.
-            this.releaseAuthCooldownLogLatch(id, userId)
+            const { cooldownMs, strikes } = this.armAuthCooldown(id, userId)
             try {
               close()
             } catch {
@@ -2890,7 +3004,7 @@ class UserConnector {
             this.logger(
               `${id} ${userId} Kraken auth rejected (${errorMsg}); circuit-broken for ${Math.round(
                 cooldownMs / 1000,
-              )}s — no reconnect, no flap alert ${api.provider}`,
+              )}s (strike ${strikes}) — no reconnect, no flap alert ${api.provider}`,
               true,
             )
             // Tell main-app (which already consumes serviceLog for
@@ -2913,17 +3027,8 @@ class UserConnector {
             // One delayed retry so a key fixed in place (e.g. the "WebSocket
             // interface" permission enabled on the same key) self-heals
             // without a bot restart. If it's still rejected, this handler
-            // simply re-arms the cooldown.
-            if (subs) {
-              setTimeout(() => {
-                if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
-                  this.authCooldownUntil.delete(id)
-                  ;[...Array(subs)].forEach(() =>
-                    this.openStreamCallback(msg, uuid),
-                  )
-                }
-              }, cooldownMs)
-            }
+            // simply re-arms the cooldown, one step longer.
+            this.scheduleAuthSelfHeal(id, subs, msg, uuid, cooldownMs)
           })
 
           /** Save user id and close function in users array */
@@ -3145,12 +3250,21 @@ class UserConnector {
     if (uuid) {
       const find = this.subscribersMap.get(uuid)
       if (!find) {
+        // A circuit-broken room is exactly this state: the breaker already
+        // deleted its subscriber count and user entry, so an unsubscribe for
+        // it lands here. It still owns a pending self-heal retry and its
+        // subscribe payload — drop both, or a connection the user removed
+        // gets a stream reopened for it after the cooldown, forever.
+        this.forgetSubscription(uuid)
         this.removeAccountFromWatchlist(uuid)
         return this.logger(`${uuid} has no subscribers`, true)
       }
       const left = find - 1
       this.subscribersMap.set(uuid, left)
       if (!left) {
+        // Last subscriber gone: this room is being torn down, so nothing
+        // should be able to reopen it on its own afterwards.
+        this.forgetSubscription(uuid)
         const user = this.users.find((us) => us.id === uuid)
         /** Is user found */
         if (user) {
@@ -3216,6 +3330,11 @@ class UserConnector {
     ) {
       if (this.binanceAuthErrors.has(id)) this.binanceAuthErrors.delete(id)
       if (this.authCooldownUntil.has(id)) this.authCooldownUntil.delete(id)
+      // The key is provably authorized ⇒ the strike run is over. A later
+      // rejection starts again at the base cooldown rather than inheriting a
+      // multi-hour backoff earned before the key was fixed.
+      this.authCooldownStrikes.delete(id)
+      this.authLastRejectAt.delete(id)
       this.releaseAuthCooldownLogLatch(id)
     }
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
