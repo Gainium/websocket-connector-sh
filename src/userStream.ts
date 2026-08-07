@@ -2109,8 +2109,16 @@ class UserConnector {
                 r.retMsg === 'Your api key has expired.' ||
                 r.retMsg.includes('Error sign')
               ) {
+                // The account is identified by `id`/`userId`; the key and
+                // secret were interpolated here verbatim and this message is
+                // logged, which put a live bybit credential pair in the pm2
+                // error log every time a key was rejected. `safeStringify`
+                // cannot help — nothing is serialized, the secret is spliced
+                // straight into the string. The `Request not authorized`
+                // prefix is load-bearing: the `.catch` below and the WS
+                // exception handler both match on it.
                 throw new Error(
-                  `Request not authorized ${api.key} ${api.secret} ${api.provider} ${baseUrl} ${wsUrl}`,
+                  `Request not authorized ${id} ${userId} ${api.provider} ${baseUrl} ${wsUrl}`,
                 )
               }
               return account
