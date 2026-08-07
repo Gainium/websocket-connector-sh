@@ -82,6 +82,10 @@ import {
 } from './utils/exchange'
 import { convertSymbol, convertSymbolToKucoin } from './utils/kucoin'
 import { ExchangeEnum, mapPaperToReal, wsLoggerOptions } from './utils/common'
+// Exchange SDKs staple the signed request / outbound auth frame onto what they
+// hand us on an error path. Everything derived from an SDK error or an SDK
+// logger callback goes through `safeStringify`, never `JSON.stringify`.
+import { safeStringify } from './utils/redact'
 import {
   isAdminConfigEnabled,
   isExchangeEnabled,
@@ -1666,7 +1670,7 @@ class UserConnector {
         client.on('exception', async (data) => {
           let errorMsg = ''
           try {
-            errorMsg = JSON.stringify(data)
+            errorMsg = safeStringify(data)
           } catch {
             errorMsg = `error stringifying errorMsg ${data}`
           }
@@ -1813,7 +1817,7 @@ class UserConnector {
           findUser = { ...findUser, pending: false }
           this.saveUser(findUser)
           return this.logger(
-            `${id} ${userId} ${(err as Error).message || JSON.stringify(err)} ${api.provider}`,
+            `${id} ${userId} ${(err as Error).message || safeStringify(err)} ${api.provider}`,
             true,
           )
         }
@@ -2157,7 +2161,7 @@ class UserConnector {
             const message = typeof error !== 'string' ? error.message : error
             let m = `${message}`
             try {
-              m = message ?? JSON.stringify(error)
+              m = message ?? safeStringify(error)
               this.logger(
                 `${id} ${userId} bybit error ${m} ${api.provider} ${api.bybitHost} ${wsUrl}`,
                 true,
@@ -2354,7 +2358,7 @@ class UserConnector {
               try {
                 this.logger(
                   `${id} ${userId} okx error ${
-                    message ?? JSON.stringify(error)
+                    message ?? safeStringify(error)
                   } ${api.provider}`,
                   true,
                 )
@@ -2573,15 +2577,20 @@ class UserConnector {
             },
             {
               silly: () => null,
+              // Unlike the `msg?.[0]` adapters below, these two serialize every
+              // argument — including the `{ wsMessage, wsKey, exception }`
+              // context the SDK passes on a send failure. Bitget does not call
+              // these levels today, but the shape is the one that leaks, so
+              // redact rather than rely on that staying true across a bump.
               debug: (...msg) =>
                 this.logger(
-                  `${id} ${userId} bitget debug log ${JSON.stringify({
+                  `${id} ${userId} bitget debug log ${safeStringify({
                     msg,
                   })} ${api.provider}`,
                 ),
               notice: (...msg) =>
                 this.logger(
-                  `${id} ${userId} bitget notice log ${JSON.stringify({
+                  `${id} ${userId} bitget notice log ${safeStringify({
                     msg,
                   })} ${api.provider}`,
                 ),
@@ -2671,7 +2680,7 @@ class UserConnector {
             try {
               this.logger(
                 `${id} ${userId} bitget error ${
-                  message ?? JSON.stringify(error)
+                  message ?? safeStringify(error)
                 } ${api.provider}`,
                 true,
               )
@@ -2909,13 +2918,22 @@ class UserConnector {
             },
             {
               trace: () => null,
+              // These two are the only SDK logger adapters in this file that
+              // serialize *every* argument the library passes, and the Kraken
+              // client is the one that reaches them with credentials: its
+              // `tryWsSend()` catch logs `{ wsMessage, wsKey, exception }`
+              // where `wsMessage` is the serialized private frame (WS auth
+              // token), and its connect/`parseWsError` paths log the
+              // `parseException` object, which carries the signed REST headers.
+              // `safeStringify` strips both, including inside the serialized
+              // frame; see `utils/redact.ts`.
               info: (...args) =>
                 this.logger(
-                  `${id} Kraken info: ${JSON.stringify(args)} ${api.provider}`,
+                  `${id} Kraken info: ${safeStringify(args)} ${api.provider}`,
                 ),
               error: (...args) =>
                 this.logger(
-                  `${id} Kraken error: ${JSON.stringify(args)} ${api.provider}`,
+                  `${id} Kraken error: ${safeStringify(args)} ${api.provider}`,
                   true,
                 ),
             },
@@ -3020,7 +3038,7 @@ class UserConnector {
                 ? error
                 : error?.message ||
                   error?.body?.error?.join?.(',') ||
-                  JSON.stringify(error)
+                  safeStringify(error)
             this.logger(
               `${id} ${userId} Kraken exception ${errorMsg} ${api.provider}`,
               true,
