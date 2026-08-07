@@ -19,10 +19,14 @@ export default class ExpirableMap<K, V> extends Map<K, V> {
           this.delete(key)
         }
       }, this.expiresAfter)
+      // An eviction timer must never be a reason to keep the process running —
+      // with a multi-hour TTL it otherwise holds the event loop open long after
+      // there is nothing left to do (and hangs `npm test`).
+      this.timer.unref?.()
     }
     setTimeout(() => {
       this.delete(key)
-    }, this.expiresAfter)
+    }, this.expiresAfter).unref?.()
     return super.set(key, value)
   }
 }

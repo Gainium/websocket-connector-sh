@@ -575,6 +575,15 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
   true,
 )
 
+// Running per-order fill totals for Kraken futures, keyed by exchange order id.
+// The `fills` feed is incremental; the ExecutionReport contract is cumulative.
+// See prepareKrakenOrderMsg. Entries expire on their own so an order whose last
+// fill we never see cannot leak.
+const krakenFillTotals = new ExpirableMap<
+  string,
+  { qty: number; cost: number; fillIds: Set<string> }
+>(60 * 60 * 1000)
+
 // Park-and-retry for the HL two-channel fill join (see hyperliquidFillPark.ts).
 // Grace window: how long a FILLED orderUpdate waits for its `userFills` to
 // arrive before falling back to a REST lookup. Size cap bounds the map.
@@ -4053,6 +4062,32 @@ class UserConnector {
       return msg.fills.map((fill: any) => {
         const symbol =
           maps.wsnameToNormalized.get(fill.instrument) || fill.instrument || ''
+        // Kraken's `fills` feed reports THIS fill only (`qty`/`price`), but
+        // ExecutionReport.totalTradeQuantity is the contract's CUMULATIVE
+        // executed quantity — main-app assigns it straight to
+        // `order.executedQty`. An order that filled in two chunks therefore
+        // arrived as PARTIALLY_FILLED 0.037 then FILLED 0.033: the deal booked
+        // 0.033 of a 0.07 close, kept a phantom 0.037 residual, and chased it
+        // forever with reduce-only orders Kraken rejects as
+        // `wouldNotReducePosition`. Accumulate per order id (deduped by
+        // fill_id, so a redelivered fill cannot double-count) and emit the
+        // running totals.
+        const orderKey = `${fill.order_id || fill.cli_ord_id || ''}`
+        const fillQty = +fill.qty || 0
+        const fillPrice = +fill.price || 0
+        const remaining = +fill.remaining_order_qty || 0
+        const totals = krakenFillTotals.get(orderKey) ?? {
+          qty: 0,
+          cost: 0,
+          fillIds: new Set<string>(),
+        }
+        const fillId = `${fill.fill_id ?? fill.seq ?? ''}`
+        if (!totals.fillIds.has(fillId)) {
+          totals.fillIds.add(fillId)
+          totals.qty += fillQty
+          totals.cost += fillQty * fillPrice
+        }
+        krakenFillTotals.set(orderKey, totals)
         return {
           creationTime: fill.time || Date.now(),
           eventTime: fill.time || Date.now(),
@@ -4064,12 +4099,12 @@ class UserConnector {
             fill.remaining_order_qty === 0 ? 'FILLED' : 'PARTIALLY_FILLED',
           orderType: fill.order_type === 'limit' ? 'LIMIT' : 'MARKET',
           originalClientOrderId: fill.cli_ord_id || fill.order_id || '',
-          price: `${fill.price || 0}`,
-          quantity: `${fill.qty || 0}`,
+          price: `${fillPrice}`,
+          quantity: `${totals.qty + remaining}`,
           side: fill.buy ? 'BUY' : 'SELL',
           symbol,
-          totalQuoteTradeQuantity: `${(fill.price || 0) * (fill.qty || 0)}`,
-          totalTradeQuantity: `${fill.qty || 0}`,
+          totalQuoteTradeQuantity: `${totals.cost}`,
+          totalTradeQuantity: `${totals.qty}`,
           uniqueMessageId: `kraken${channel}${JSON.stringify(fill)}`,
           liquidation: false,
         }
