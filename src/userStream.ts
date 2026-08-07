@@ -1169,6 +1169,35 @@ class UserConnector {
   }
 
   /**
+   * Classify a Kraken `exception` payload as a deterministically-fatal
+   * credential rejection. Three shapes, none of which heals by retrying:
+   *  - "EGeneral:Permission denied" — the WS-token REST call was rejected
+   *    because the key lacks the "WebSocket interface" permission. REST verify
+   *    passes, so upstream keeps the connection marked healthy and re-requests
+   *    this stream forever.
+   *  - "Failed to subscribe to authenticated feed" — Kraken Futures rejecting
+   *    the private feed auth (revoked/disabled key); the client library
+   *    reconnects forever.
+   *  - "EAPI:Invalid key" — Kraken spot rejecting the key itself on the
+   *    GetWebSocketsToken REST call (key deleted or revoked at the exchange).
+   *    Same class as the two above, but it was not matched, so two accounts
+   *    re-subscribed for 4+ days straight with no backoff and no user notice
+   *    (bug #340).
+   *
+   * Deliberately does NOT match the sibling "EAPI:Invalid nonce" — that is a
+   * transient clock/ordering fault which does heal on retry, and it occurs in
+   * prod alongside the invalid-key lines; breaking the circuit on it would
+   * park a healthy account for 30min-24h.
+   */
+  private isKrakenAuthReject(errorMsg: string) {
+    return (
+      /EGeneral\s*:?\s*Permission denied/i.test(errorMsg) ||
+      /Failed to subscribe to authenticated feed/i.test(errorMsg) ||
+      /EAPI\s*:?\s*Invalid key/i.test(errorMsg)
+    )
+  }
+
+  /**
    * Arm (or re-arm) the auth-rejection circuit-breaker for a room and return
    * the cooldown it earned. Shared by the Binance and Kraken breakers so both
    * escalate identically.
@@ -3061,21 +3090,11 @@ class UserConnector {
               true,
             )
             // Auth-rejection circuit-breaker (Kraken flavour of the Binance
-            // one above). Two deterministic-fatal shapes:
-            //  - "EGeneral:Permission denied" — the WS-token REST call was
-            //    rejected because the key lacks the "WebSocket interface"
-            //    permission. REST verify passes, so upstream keeps the
-            //    connection marked healthy and re-requests this stream
-            //    forever.
-            //  - "Failed to subscribe to authenticated feed" — Kraken
-            //    Futures rejecting the private feed auth (revoked/disabled
-            //    key); the client library reconnects forever.
-            // Neither heals by retrying, and unlike Binance the retries are
-            // spread out over 20min-6h per account, so a hits-in-window
+            // one above). See `isKrakenAuthReject` for the shapes and why the
+            // transient nonce error is excluded. Unlike Binance the retries
+            // are spread out over 20min-6h per account, so a hits-in-window
             // threshold would never trip — break the circuit on first sight.
-            const isAuthReject =
-              /EGeneral\s*:?\s*Permission denied/i.test(errorMsg) ||
-              /Failed to subscribe to authenticated feed/i.test(errorMsg)
+            const isAuthReject = this.isKrakenAuthReject(errorMsg)
             if (!isAuthReject) {
               return
             }

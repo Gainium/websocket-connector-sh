@@ -193,6 +193,72 @@ test('closing a circuit-broken room cancels its pending self-heal retry', async 
   assert.ok(fake.authCooldownStrikes.has(id))
 })
 
+/**
+ * Bug #340: the Kraken breaker's predicate matched only the two shapes it was
+ * written for, so "EAPI:Invalid key" — Kraken spot rejecting the key itself on
+ * the WS-token REST call — fell through the `if (!isAuthReject) return` and
+ * never armed the breaker. Two accounts re-subscribed for 4+ days with no
+ * backoff and no user notice, while the same breaker armed 1569x for the
+ * matched shapes over one window.
+ *
+ * The predicate was inline in the Kraken `exception` handler (a closure over
+ * the client, not reachable without a live WS); it is now `isKrakenAuthReject`
+ * so this test can drive the REAL implementation off the prototype rather than
+ * a copy of the regexes, which would pass even if the fix were reverted.
+ */
+const isKrakenAuthReject: (errorMsg: string) => boolean = (
+  UserConnector.prototype as any
+).isKrakenAuthReject
+
+test('a permanently invalid Kraken key is classified as an auth rejection', () => {
+  // The exact string prod logs, 105x across 4 days for two accounts.
+  assert.equal(isKrakenAuthReject('EAPI:Invalid key'), true)
+  // Shape tolerance: the message is sometimes unwrapped from an error body.
+  assert.equal(isKrakenAuthReject('EAPI: Invalid key'), true)
+  assert.equal(isKrakenAuthReject('eapi:invalid key'), true)
+  assert.equal(
+    isKrakenAuthReject('Kraken exception EAPI:Invalid key kraken'),
+    true,
+  )
+  // Still matches what it always did.
+  assert.equal(isKrakenAuthReject('EGeneral:Permission denied'), true)
+  assert.equal(
+    isKrakenAuthReject('Failed to subscribe to authenticated feed'),
+    true,
+  )
+})
+
+test('a transient Kraken nonce error must NOT break the circuit', () => {
+  // "EAPI:Invalid nonce" is a clock/ordering fault that heals on retry, and it
+  // occurs in prod alongside the invalid-key lines. Breaking the circuit on it
+  // would park a HEALTHY account for 30min-24h.
+  assert.equal(isKrakenAuthReject('EAPI:Invalid nonce'), false)
+  assert.equal(isKrakenAuthReject('EAPI:Invalid signature'), false)
+  assert.equal(isKrakenAuthReject('EAPI:Rate limit exceeded'), false)
+  // The overwhelmingly most common exception shape in this service's log
+  // (1430x/window) is a bare wsKey object — a transport hiccup, not auth.
+  assert.equal(isKrakenAuthReject('{"wsKey":"spotPrivateV2"}'), false)
+  assert.equal(isKrakenAuthReject('{"wsKey":"derivativesPrivateV1"}'), false)
+  assert.equal(isKrakenAuthReject(''), false)
+})
+
+test('an invalid key rides the same escalating ladder, not a flat retry', () => {
+  const { fake } = makeHarness()
+  const id = 'room-invalid-key'
+  assert.equal(isKrakenAuthReject('EAPI:Invalid key'), true)
+
+  // Before the fix this room armed nothing at all: 105 rejections, zero
+  // cooldowns. It must now converge like any other dead key.
+  let now = 1_000_000
+  const earned: number[] = []
+  for (let i = 0; i < 4; i++) {
+    const { cooldownMs } = fake.armAuthCooldown(id, 'user-1', now)
+    earned.push(cooldownMs)
+    now += cooldownMs + 5_000
+  }
+  assert.deepEqual(earned, [30 * MIN, 1 * HOUR, 2 * HOUR, 4 * HOUR])
+})
+
 test('the last unsubscribe drops the subscribe payload and breaker state', () => {
   const { fake } = makeHarness()
   const id = 'room-normal'
