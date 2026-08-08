@@ -198,6 +198,21 @@ export interface AssetBalance {
   asset: string
   free: string
   locked: string
+  /**
+   * The venue's OWN figure for how much of this asset is currently spendable,
+   * when it publishes one. Optional and additive: every producer that has no
+   * such figure simply omits it, and a consumer that does not know the field
+   * keeps working unchanged.
+   *
+   * This exists because `free`/`locked` cannot describe a pooled
+   * cross-collateral account. On Kraken Futures' flex account every currency
+   * margins every contract, so there is no per-currency reservation to report
+   * and `free` carries the wallet quantity with `locked` at 0. The difference
+   * `free - venueAvailable` is then the margin the venue has actually
+   * committed — the only figure that reveals a position the engine is not
+   * tracking, which is otherwise invisible until an order is rejected.
+   */
+  venueAvailable?: string
 }
 
 export interface OutboundAccountPosition {
@@ -4282,12 +4297,26 @@ class UserConnector {
       // Report the wallet quantity and leave `locked` at 0, matching that REST
       // writer. The figure the venue actually enforces is `flex.availableMargin`,
       // which main-app reads through `getMarginAvailableUsd`.
+      //
+      // Kraken's per-currency `available` is still carried, as `venueAvailable`,
+      // because it is the venue's own view of what is spendable and nothing else
+      // reports it continuously. `free - venueAvailable` is the margin Kraken has
+      // actually committed, so a position the engine is not tracking shows up as
+      // committed margin with no deal behind it — otherwise invisible until an
+      // order is rejected. Deliberately NOT folded back into `locked`: that field
+      // has one meaning shared with the REST writer, which cannot produce this.
       balances = Object.entries(data.flex_futures.currencies).map(
-        ([currency, info]) => ({
-          asset: maps.assetNameMap.get(currency) || currency,
-          free: `${(info as any).quantity}`,
-          locked: '0',
-        }),
+        ([currency, info]) => {
+          const available = (info as any).available
+          return {
+            asset: maps.assetNameMap.get(currency) || currency,
+            free: `${(info as any).quantity}`,
+            locked: '0',
+            ...(typeof available === 'number' && isFinite(available)
+              ? { venueAvailable: `${available}` }
+              : {}),
+          }
+        },
       )
     }
 
