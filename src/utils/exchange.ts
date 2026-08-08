@@ -116,6 +116,26 @@ export type FuturesContractConfig = {
   maintainTime: string
 }
 
+/**
+ * How long to wait for the exchange service before falling back to the venue's
+ * own REST list below.
+ *
+ * This lookup gates every price/candle connector's `init()` — no socket opens
+ * until it settles — while `CommonConnector`'s watchdog destroys and rebuilds a
+ * connector that has received no data 50s after construction. Without a
+ * timeout, axios waits forever, so a `/exchange/all` request that *hangs*
+ * (rather than erroring — the balancer does produce socket hang ups) stops
+ * `init()` from ever reaching `subscribeV5`: the watchdog throws at 50s, the
+ * connector is rebuilt, and the rebuild issues another hanging request. That
+ * loop makes no progress, never ends, and logs nothing but the watchdog error,
+ * because the `.catch()` below never fires on a hang. It left bybit ticker
+ * streams dead for 4h+ on 2026-08-08 with no indication of the cause.
+ *
+ * Bounded well inside the 50s connect budget so a hung exchange service now
+ * fails fast and loudly, and init continues on the venue's own REST path.
+ */
+const EXCHANGE_INFO_TIMEOUT = 10_000
+
 const getAllExchangeInfo = async (
   exchange: ExchangeEnum,
 ): Promise<string[]> => {
@@ -128,6 +148,7 @@ const getAllExchangeInfo = async (
     const data = await axios
       .get<BaseReturn<(ExchangeInfo & { pair: string })[]>>(
         `${url}/exchange/all?exchange=${exchange}`,
+        { timeout: EXCHANGE_INFO_TIMEOUT },
       )
       .then((r) => r.data)
       .catch((e) => {
