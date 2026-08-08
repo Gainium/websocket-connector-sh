@@ -4265,12 +4265,28 @@ class UserConnector {
         locked: '0',
       }))
     } else if (typeof data === 'object' && 'flex_futures' in data) {
-      // Handle object format: { BTC: { balance: '1.0', hold_balance: '0.1' }, ... }
+      // Kraken Futures' flex account pools EVERY collateral currency into one
+      // cross-margin pool, so there is no per-currency reservation to report:
+      // margin is committed against the portfolio, never against a currency.
+      //
+      // `locked` used to be derived here as `quantity - available`. That is not
+      // the reservation it looks like. `available` is absent from Kraken's own
+      // REST schema for a flex currency summary (`{quantity, value,
+      // collateral}`) and was read through `as any`, so the mapping was never
+      // type-checked; on prod it produced a `locked` between 1.8x and 93x the
+      // account's actual open exposure, including on accounts with no open
+      // positions at all, and it fought the REST writer of the same `balances`
+      // doc — which reports the wallet quantity as fully free — so the stored
+      // balance meant whichever write landed last.
+      //
+      // Report the wallet quantity and leave `locked` at 0, matching that REST
+      // writer. The figure the venue actually enforces is `flex.availableMargin`,
+      // which main-app reads through `getMarginAvailableUsd`.
       balances = Object.entries(data.flex_futures.currencies).map(
         ([currency, info]) => ({
           asset: maps.assetNameMap.get(currency) || currency,
-          free: `${(info as any).available}`,
-          locked: `${(info as any).quantity - (info as any).available}`,
+          free: `${(info as any).quantity}`,
+          locked: '0',
         }),
       )
     }
