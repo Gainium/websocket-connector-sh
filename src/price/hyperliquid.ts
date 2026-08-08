@@ -1,4 +1,5 @@
 import * as hl from '@nktkas/hyperliquid'
+import { subscribe } from 'diagnostics_channel'
 import { setMaxListeners } from 'events'
 
 import { ExchangeEnum, mapPaperToReal } from '../utils/common'
@@ -10,6 +11,65 @@ import CommonConnector from './common'
 import type { Ticker, StreamType, SubscribeCandlePayload } from './types'
 
 const mutex = new IdMutex()
+
+/**
+ * Last rejected Hyperliquid WebSocket upgrade, used to explain socket errors.
+ *
+ * `@nktkas/hyperliquid` builds its sockets from `globalThis.WebSocket`. Only
+ * the HL user-stream worker replaces that global (with a `ws` subclass, via
+ * `installHyperliquidIpRotation`); the candle and price streams leave it as
+ * Node 24's built-in undici implementation. undici's ErrorEvent is
+ * deliberately detail-free — `message` is `''` and `error` is a bare
+ * `TypeError` with no message and no `cause` — because WHATWG requires the
+ * failure reason to stay hidden from the socket's error event. So `onerror`
+ * has nothing to unwrap, and during the 2026-08-08 08:34Z Hyperliquid
+ * blackout every candle/price line read "Hyperliquid error: error" while the
+ * user-stream worker, on `ws`, logged "Unexpected server response: 502".
+ *
+ * undici does publish the upgrade response on a diagnostics channel, so
+ * capture the HTTP status there. That is the one place the venue's actual
+ * answer is still visible from this process.
+ */
+let lastHandshakeFailure: {
+  status: number
+  statusText: string
+  at: number
+} | null = null
+let handshakeWatchInstalled = false
+
+function watchHyperliquidHandshake(): void {
+  if (handshakeWatchInstalled) return
+  handshakeWatchInstalled = true
+  try {
+    subscribe('undici:request:headers', (message) => {
+      const { request, response } = message as {
+        request?: { origin?: unknown; headers?: unknown }
+        response?: { statusCode?: number; statusText?: string }
+      }
+      const status = response?.statusCode
+      // 101 means the upgrade was accepted — only a non-101 status is a
+      // failure, and skipping 101 keeps a healthy connect from overwriting
+      // the record that explains a later error.
+      if (!status || status === 101) return
+      if (!String(request?.origin ?? '').includes('hyperliquid')) return
+      // Only the upgrade request carries `sec-websocket-key`. Without this
+      // check an unrelated REST call to the same host (e.g. a 429 on the
+      // info endpoint) would be reported as the socket's failure.
+      const headers = request?.headers
+      const isUpgrade = Array.isArray(headers)
+        ? headers.some((h) => String(h).toLowerCase() === 'sec-websocket-key')
+        : /sec-websocket-key/i.test(String(headers ?? ''))
+      if (!isUpgrade) return
+      lastHandshakeFailure = {
+        status,
+        statusText: response?.statusText ?? '',
+        at: Date.now(),
+      }
+    })
+  } catch {
+    // Best-effort diagnostics: never let this break the stream.
+  }
+}
 
 const maxCandlesPerConnection = 1000
 /**
@@ -312,6 +372,8 @@ class HyperliquidConnector extends CommonConnector {
       }
     }
 
+    watchHyperliquidHandshake()
+
     // Track rapid close/open cycles so the circuit breaker below can fire.
     // A "rapid close" is a connection that opened but was closed by the server
     // in under 10 s — a sign we are hitting Hyperliquid's 30 new connections/min
@@ -365,10 +427,29 @@ class HyperliquidConnector extends CommonConnector {
     transport.socket.onerror = (event) => {
       // An ErrorEvent's fields are non-enumerable, so JSON.stringify() always
       // produced "{}" here and hid every socket failure. Read them explicitly.
+      // Under undici these are empty too (see watchHyperliquidHandshake), so
+      // fall back to the handshake status / connection state rather than to
+      // `event.type`, which is the constant string "error" and reads like a
+      // reason without being one.
       const err = event as ErrorEvent
-      logger.error(
-        `Hyperliquid error: ${err.message || err.error?.message || event.type || 'unknown error'}`,
-      )
+      const detail = err.message || err.error?.message
+      const failure = lastHandshakeFailure
+      let reason: string
+      if (detail) {
+        reason = detail
+      } else if (failure && Date.now() - failure.at < 10_000) {
+        reason = `handshake rejected: HTTP ${failure.status}${
+          failure.statusText ? ` ${failure.statusText}` : ''
+        }`
+      } else if (lastOpenMs > 0) {
+        reason = `established connection dropped after ${(
+          (Date.now() - lastOpenMs) /
+          1000
+        ).toFixed(1)}s (socket gave no detail)`
+      } else {
+        reason = 'connection failed before open (socket gave no detail)'
+      }
+      logger.error(`Hyperliquid error: ${reason}`)
     }
     const client = new hl.SubscriptionClient({
       transport,
