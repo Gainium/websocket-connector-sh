@@ -145,6 +145,59 @@ class KrakenConnector extends CommonConnector {
     normalizedToWsname: new Map(),
     assetNameMap: new Map(),
   }
+  // In-flight symbol-map load, so a burst of candle subscribes at boot triggers
+  // one REST round trip instead of one per symbol.
+  private symbolMapsReady: Promise<void> | null = null
+
+  /**
+   * Resolve the symbol maps before anything reads them.
+   *
+   * `init()` loads the maps, but it is fire-and-forget (`service.ts` calls
+   * `str.init()` without awaiting) while the constructor already subscribes to
+   * `subscribeCandle` messages from main-app. Candle requests therefore land
+   * while the maps are still the empty ones from the field initializer — a
+   * ~0.2-2.0s window that prod hits on every restart.
+   */
+  private async ensureSymbolMaps(): Promise<void> {
+    if (
+      this.spotSymbolMaps.normalizedToWsname.size &&
+      this.usdmSymbolMaps.normalizedToWsname.size
+    ) {
+      return
+    }
+    if (!this.symbolMapsReady) {
+      // Cleared on settle so a failed load (Kraken REST blip) is retried by the
+      // next subscribe rather than poisoning every later lookup.
+      this.symbolMapsReady = this.loadSymbolMaps().finally(() => {
+        this.symbolMapsReady = null
+      })
+    }
+    await this.symbolMapsReady
+  }
+
+  private async loadSymbolMaps(): Promise<void> {
+    logger.info('Kraken Worker | Loading symbol maps...')
+    this.spotSymbolMaps = await getKrakenSymbolMaps(ExchangeEnum.kraken)
+    this.usdmSymbolMaps = await getKrakenSymbolMaps(ExchangeEnum.krakenUsdm)
+    logger.info(
+      `Kraken Worker | Symbol maps loaded: ${this.spotSymbolMaps.wsnameToNormalized.size} spot, ${this.usdmSymbolMaps.wsnameToNormalized.size} usdm`,
+    )
+  }
+
+  /**
+   * Forget a candle room so main-app's next `candlesRequests` message
+   * re-subscribes it — same reasoning as the rejected-subscribe handler in
+   * `getSpotCandleClient`: a room left in the set is "active" forever while the
+   * timeframe is silently dead.
+   */
+  private dropCandleRoom(room: string, futures = false) {
+    const exchanges = futures
+      ? [ExchangeEnum.krakenUsdm, ExchangeEnum.paperKrakenUsdm]
+      : [ExchangeEnum.kraken, ExchangeEnum.paperKraken]
+    for (const ex of exchanges) {
+      this.subscribedCandlesMap.get(ex)?.delete(room)
+    }
+  }
 
   constructor(
     private subscribedCandlesMap: Map<ExchangeEnum, Set<string>> = new Map(),
@@ -390,7 +443,14 @@ class KrakenConnector extends CommonConnector {
     if (process) {
       if ([ExchangeEnum.kraken, ExchangeEnum.paperKraken].includes(exchange)) {
         // Spot: use OHLC WebSocket channel
-        this.connectKrakenCandleStream(symbol, interval)
+        this.connectKrakenCandleStream(symbol, interval).catch((e) => {
+          // The symbol-map load failed; drop the room so the next
+          // `candlesRequests` retries instead of it sitting silently dead.
+          this.dropCandleRoom(data)
+          logger.error(
+            `Kraken spot candle subscribe failed for ${symbol} at interval ${interval}: ${(e as Error)?.message ?? e}`,
+          )
+        })
       } else if (
         [ExchangeEnum.krakenUsdm, ExchangeEnum.paperKrakenUsdm].includes(
           exchange,
@@ -401,12 +461,17 @@ class KrakenConnector extends CommonConnector {
           symbol,
           interval,
           ExchangeEnum.krakenUsdm,
-        )
+        ).catch((e) => {
+          this.dropCandleRoom(data, true)
+          logger.error(
+            `Kraken futures candle subscribe failed for ${symbol} at interval ${interval}: ${(e as Error)?.message ?? e}`,
+          )
+        })
       }
     }
   }
 
-  private connectKrakenCandleStream(symbol: string, interval: string) {
+  private async connectKrakenCandleStream(symbol: string, interval: string) {
     // Kraken rejects non-integer intervals; an invalid value would also be
     // replayed (and re-rejected) on every reconnect, so drop it up front.
     const krakenInterval = toKrakenSpotInterval(interval)
@@ -417,9 +482,20 @@ class KrakenConnector extends CommonConnector {
       return
     }
 
-    // Convert normalized symbol to wsname format for subscription
-    const wsnameSymbol =
-      this.spotSymbolMaps.normalizedToWsname.get(symbol) || symbol
+    // Convert normalized symbol to wsname format for subscription. The maps
+    // must be loaded first: falling back to the normalized symbol sends Kraken
+    // a dash pair, which it always rejects with "Currency pair not in ISO
+    // 4217-A3 format BTC-USD". The ws client caches the subscribe and replays
+    // it on every reconnect, so a single miss at boot leaves that timeframe
+    // permanently candle-less.
+    await this.ensureSymbolMaps()
+    const wsnameSymbol = this.spotSymbolMaps.normalizedToWsname.get(symbol)
+    if (!wsnameSymbol) {
+      logger.warn(
+        `Kraken spot candle: no wsname for "${symbol}" at interval ${interval}, skipping OHLC subscribe`,
+      )
+      return
+    }
 
     // One socket per interval — sharing one across intervals is what Kraken
     // rejects, leaving the extra timeframes without candles.
@@ -472,9 +548,7 @@ class KrakenConnector extends CommonConnector {
         // forever while the timeframe is silently dead, and every candle-stall
         // restart replays it into the same rejection. Dropping it lets
         // main-app's next `candlesRequests` message re-subscribe it.
-        for (const ex of [ExchangeEnum.kraken, ExchangeEnum.paperKraken]) {
-          this.subscribedCandlesMap.get(ex)?.delete(failed.room)
-        }
+        this.dropCandleRoom(failed.room)
         return ` — rejected ohlc subscribe for ${failed.wsname} at interval ${interval}; dropped from the subscribed set so it is retried`
       },
     )
@@ -495,12 +569,24 @@ class KrakenConnector extends CommonConnector {
     return entry
   }
 
-  private connectKrakenFuturesCandleStream(
+  private async connectKrakenFuturesCandleStream(
     symbol: string,
     interval: string,
     exchange: ExchangeEnum.krakenUsdm,
   ) {
-    const symbolMaps = this.usdmSymbolMaps
+    // Convert normalized symbol to wsname format (e.g., BTC-USD -> PF_XBTUSD).
+    // Resolved before opening the socket, and never falls back to the raw
+    // symbol: Kraken answers an unmapped product with "Couldn't subscribe to
+    // invalid product SOL-USD".
+    await this.ensureSymbolMaps()
+    const wsnameSymbol = this.usdmSymbolMaps.normalizedToWsname.get(symbol)
+    if (!wsnameSymbol) {
+      logger.warn(
+        `Kraken futures candle: no product id for "${symbol}" at interval ${interval}, skipping candles_trade subscribe`,
+      )
+      return
+    }
+
     const client = this.krakenUsdmCandleClient
 
     if (!client) {
@@ -509,9 +595,6 @@ class KrakenConnector extends CommonConnector {
 
       this.krakenUsdmCandleClient = newClient
     }
-
-    // Convert normalized symbol to wsname format (e.g., BTCUSD -> PF_XBTUSD)
-    const wsnameSymbol = symbolMaps.normalizedToWsname.get(symbol) || symbol
 
     // Subscribe to candles_trade feed
     const feed = `candles_trade_${interval}`
@@ -534,13 +617,9 @@ class KrakenConnector extends CommonConnector {
   @IdMute(mutex, () => 'initKrakenWS')
   async init() {
     try {
-      // Load symbol maps before initializing websocket connections
-      logger.info('Kraken Worker | Loading symbol maps...')
-      this.spotSymbolMaps = await getKrakenSymbolMaps(ExchangeEnum.kraken)
-      this.usdmSymbolMaps = await getKrakenSymbolMaps(ExchangeEnum.krakenUsdm)
-      logger.info(
-        `Kraken Worker | Symbol maps loaded: ${this.spotSymbolMaps.wsnameToNormalized.size} spot, ${this.usdmSymbolMaps.wsnameToNormalized.size} usdm`,
-      )
+      // Load symbol maps before initializing websocket connections. Shares the
+      // in-flight load with any candle subscribe that raced ahead of init().
+      await this.ensureSymbolMaps()
 
       if (!this.isCandle || this.isAll) {
         await this.initKrakenSpotWS()
@@ -554,7 +633,7 @@ class KrakenConnector extends CommonConnector {
           ) {
             for (const data of symbols) {
               const [symbol, interval] = this.splitCandleRoomName(data)
-              this.connectKrakenCandleStream(symbol, interval)
+              await this.connectKrakenCandleStream(symbol, interval)
             }
           } else if (
             [ExchangeEnum.krakenUsdm, ExchangeEnum.paperKrakenUsdm].includes(
@@ -563,7 +642,7 @@ class KrakenConnector extends CommonConnector {
           ) {
             for (const data of symbols) {
               const [symbol, interval] = this.splitCandleRoomName(data)
-              this.connectKrakenFuturesCandleStream(
+              await this.connectKrakenFuturesCandleStream(
                 symbol,
                 interval,
                 ExchangeEnum.krakenUsdm,
