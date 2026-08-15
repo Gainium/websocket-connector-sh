@@ -1657,10 +1657,23 @@ class UserConnector {
               await wsAPI.subscribeUserDataStream('mainWSAPI')
             }
             stopMethod = async () => {
-              wsAPI.unsubscribeUserDataStream('mainWSAPI')
               //@ts-ignore
               client.respawnUserDataStream = (...args: unknown[]) =>
                 new Promise((resolve) => resolve)
+              // Actually close the socket, like every other provider's
+              // stopMethod does. `unsubscribeUserDataStream()` only sends a
+              // `userDataStream.unsubscribe` WS-API request: it leaves the
+              // `mainWSAPI` connection in the SDK's WsStore with auto-reconnect
+              // armed, and — because it awaits the connection — it re-opens the
+              // socket if it is already down. A torn-down room therefore kept
+              // reconnecting to Binance for hours with this room's
+              // `reconnected` listener still attached, so `noteReconnect()`
+              // counted phantom reconnects for a stream that no longer existed
+              // and raised `stream_flap` (bug #433). Closing the connection IS
+              // the unsubscribe here: a WS-API user data stream is bound to its
+              // connection, and `close()` marks the socket CLOSING so the SDK
+              // neither reconnects nor resubscribes.
+              client.closeAll(false)
             }
           } else {
             client = new WebsocketClient(
@@ -1835,10 +1848,16 @@ class UserConnector {
           }
         })
         /** Open stream and set callback  */
+        let opened = false
         try {
           let connectTimer: NodeJS.Timeout | undefined
+          const started = startMethod()
+          // The race's loser can still settle later — a subscribe that fails
+          // after the connect timeout already won would otherwise surface as
+          // an unhandled rejection. The race still sees the real rejection.
+          started.catch(() => null)
           await Promise.race([
-            startMethod(),
+            started,
             new Promise<void>((_, reject) => {
               connectTimer = setTimeout(() => {
                 this.logger(
@@ -1851,6 +1870,7 @@ class UserConnector {
           ]).finally(() => {
             if (connectTimer) clearTimeout(connectTimer)
           })
+          opened = true
 
           /** Save user id and close function in users array */
           findUser = { ...findUser, close: stopMethod }
@@ -1867,6 +1887,19 @@ class UserConnector {
           )
           await this.paceAfterOpen(api.provider)
         } catch (err) {
+          // The client was created and this room's listeners are attached, but
+          // the subscribe never completed, so the room is not registered in
+          // `users`/`subscribersMap` and the next request builds a *new*
+          // client. Close this one, or it stays in the SDK's WsStore
+          // auto-reconnecting forever and keeps firing this room's
+          // `reconnected` handler → `noteReconnect()` → `stream_flap` alerts
+          // for a room with no stream (bug #433: a Binance key rejected with
+          // -2015 leaked one such client per failed attempt). Guarded on
+          // `opened` so a throw from the post-open bookkeeping can never close
+          // a stream that is already registered and serving the room.
+          if (!opened) {
+            await stopMethod().catch(() => null)
+          }
           findUser = { ...findUser, pending: false }
           this.saveUser(findUser)
           return this.logger(
