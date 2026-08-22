@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.6] - 2026-08-22
+
+### Fixed
+
+- **The Kraken Futures `open_orders` feed reported a partial execution as FILLED.** On that feed `order.qty` is the quantity still open, not the size placed; the mapping read it as the total and compared `filled >= qty`, so a 16-lot order with 11 executed arrived as `{qty: 5, filled: 11}` → FILLED at 11. The bot engine, told an order had "fully" filled 5 short of what it placed, sent a market remainder for the 5 — and the original order then filled to 16 on its own. The venue held 21, the deal booked 11, and the extra 5 sat on the exchange with no take-profit and no stop-loss. Observed live on 2026-08-22; 40 such duplicate remainders across 26 accounts in the two weeks before. Status now comes from what remains open (`FILLED` only at `qty == 0`) and the reported quantity is the original size (`filled + qty`), so `executedQty < origQty` means what the consumer thinks it means. The `fills` feed had the same defect and was fixed on 2026-08-07 (`krakenFillTotals`); this is the other half. Pinned by `src/utils/krakenOpenOrders.spec.ts`.
+- `open_orders` removals with `reason: 'full_fill'` are no longer relayed as CANCELED. Kraken removes a fully filled order from the book with `is_cancel: true`; the fill itself arrives on the `fills` feed with quantity and price, and a CANCELED on top of it is the exact shape that has marked filled orders dead before.
+
 ## [Unreleased]
 
 ### Added

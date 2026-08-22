@@ -1,4 +1,8 @@
 import { convert, convertFutures } from './utils/binance'
+import {
+  krakenOpenOrderFill,
+  krakenOpenOrdersRemovalIsFill,
+} from './utils/krakenOpenOrders'
 import { WebsocketAPIClient, WebsocketClient } from 'binance'
 import * as hl from '@nktkas/hyperliquid'
 import KucoinApi from '@gainium/kucoin-api'
@@ -4180,7 +4184,14 @@ class UserConnector {
 
     // Kraken futures open_orders format
     if (channel === 'open_orders') {
-      // Cancellation: { feed: 'open_orders', order_id, cli_ord_id, is_cancel: true, reason: 'cancelled_by_user' }
+      // Removal: { feed: 'open_orders', order_id, cli_ord_id, is_cancel: true, reason: 'cancelled_by_user' }
+      // `is_cancel` also marks a FULLY FILLED order leaving the book
+      // (`reason: 'full_fill'`). The fill itself arrives on the `fills` feed
+      // with quantity and price; relaying this as CANCELED would mark a filled
+      // order dead — the exact shape that has cost untracked positions before.
+      if (msg.is_cancel === true && krakenOpenOrdersRemovalIsFill(msg.reason)) {
+        return []
+      }
       if (msg.is_cancel === true) {
         const symbol = '' // Symbol not provided in cancellation message
         return [
@@ -4213,6 +4224,12 @@ class UserConnector {
           maps.wsnameToNormalized.get(order.instrument) ||
           order.instrument ||
           ''
+        // `order.qty` here is the quantity STILL OPEN, not the size placed.
+        // Read as the total it turned a partial execution into FILLED at the
+        // partial amount (`filled >= qty`), and the engine answered with a
+        // market remainder that the original order then doubled up on. See
+        // utils/krakenOpenOrders.ts.
+        const fill = krakenOpenOrderFill(order)
         return [
           {
             creationTime: order.time || Date.now(),
@@ -4221,20 +4238,15 @@ class UserConnector {
             newClientOrderId: order.cli_ord_id || order.order_id || '',
             orderId: order.order_id || '',
             orderTime: order.last_update_time || Date.now(),
-            orderStatus:
-              order.filled > 0
-                ? order.filled >= order.qty
-                  ? 'FILLED'
-                  : 'PARTIALLY_FILLED'
-                : 'NEW',
+            orderStatus: fill.status,
             orderType: order.type === 'limit' ? 'LIMIT' : 'MARKET',
             originalClientOrderId: order.cli_ord_id || order.order_id || '',
             price: `${order.limit_price || order.stop_price || 0}`,
-            quantity: `${order.qty || 0}`,
+            quantity: `${fill.total}`,
             side: order.direction === 1 ? 'BUY' : 'SELL',
             symbol,
             totalQuoteTradeQuantity: '0',
-            totalTradeQuantity: `${order.filled || 0}`,
+            totalTradeQuantity: `${fill.filled}`,
             uniqueMessageId: `kraken${channel}${JSON.stringify(order)}`,
             liquidation: false,
           },
