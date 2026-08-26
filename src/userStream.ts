@@ -3630,10 +3630,20 @@ class UserConnector {
               newClientOrderId: order.client_order_id,
               orderId: order.order_id,
               orderTime: updateTime,
+              // Coinbase has no PARTIALLY_FILLED status: a resting order that
+              // has taken some size stays OPEN and reports the progress in
+              // `cumulative_quantity`. Mapping OPEN straight to NEW means we
+              // never emit PARTIALLY_FILLED for this venue at all, so a
+              // consumer that books partial fills (a TP that fills part way
+              // before being resized) never hears about the executed part and
+              // keeps counting base the account no longer holds. The bybit and
+              // bitget mappers below both make this distinction explicitly.
               orderStatus:
                 order.status === OrderStatus.PENDING ||
                 order.status === OrderStatus.OPEN
-                  ? ('NEW' as const)
+                  ? +order.cumulative_quantity > 0
+                    ? ('PARTIALLY_FILLED' as const)
+                    : ('NEW' as const)
                   : order.status === OrderStatus.FILLED
                     ? ('FILLED' as const)
                     : ('CANCELED' as const),
