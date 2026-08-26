@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.7] - 2026-08-26
+
+### Fixed
+
+- Coinbase now reports partial fills. Coinbase Advanced Trade has no PARTIALLY_FILLED order status: a resting order that has taken some size stays `OPEN` and reports the progress in `cumulative_quantity`, and only the terminal states change `status`. The mapper collapsed `OPEN` to `NEW` unconditionally, so this venue never emitted a single PARTIALLY_FILLED report — the bybit and bitget mappers alongside it both make the distinction — and a consumer that books partial fills never heard about the executed part. Terminal states are untouched, and a non-numeric cumulative quantity still maps to `NEW`.
+
 ## [1.14.6] - 2026-08-22
 
 ### Fixed
