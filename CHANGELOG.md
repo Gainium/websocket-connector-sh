@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.8] - 2026-08-29
+
+### Fixed
+
+- Kraken and Binance user streams now tell an account's bots to reconcile after a websocket reconnect, the way the bybit and bitget handlers already did. Both `reconnected` handlers only bumped the flap counter, so an in-place SDK reconnect published nothing on `userStreamInfo{exchangeUUID}` and the bots never re-checked their orders — any `executions` / `executionReport` message the venue emitted while the socket was down was lost until the next *process* restart, in practice the nightly one. A Kraken ETH/EUR safety order filled at 16:15 UTC on 2026-08-28 was booked 15h38m later for exactly this reason; that account's socket had reconnected at 15:53, 21 minutes before the fill. Kraken alone reconnects ~1,088 times a day across the fleet, so this was a wide hole. The signal is scoped to the one account's room, so it wakes a handful of bots rather than the fleet.
+
 ## [1.14.7] - 2026-08-26
 
 ### Fixed

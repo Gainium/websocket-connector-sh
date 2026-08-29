@@ -1842,6 +1842,11 @@ class UserConnector {
         }) // receive notification that a reconnection completed successfully (e.g use REST to check for missing data)
         client.on('reconnected', (data) => {
           this.logger(`${id} ws has reconnected ${data.wsKey}  ${api.provider}`)
+          // Same reconcile signal bybit/bitget publish, and for the same
+          // reason: a reconnect means we may have missed an executionReport
+          // while the socket was down, and only the bots can find out. Scoped
+          // to this one account's room.
+          this.redis?.publish(`userStreamInfo${id}`, `Subscribed to user ${id}`)
           this.noteReconnect(id, api.provider)
         })
         client.on('close', (data) => {
@@ -3255,6 +3260,25 @@ class UserConnector {
 
           client.on('reconnected', () => {
             this.logger(`${id} Kraken ws has reconnected ${api.provider}`)
+            // Tell this account's bots to reconcile, exactly as the bybit and
+            // bitget reconnect handlers already do. Without it the ONLY thing a
+            // reconnect did was bump the flap counter, and any `executions`
+            // message the venue emitted while the socket was down was gone for
+            // good: bots then discovered the fill on the next PROCESS restart,
+            // which in practice meant the nightly one.
+            //
+            // That is how a Kraken ETH/EUR safety order filled at 16:15 UTC on
+            // 2026-08-28 was not booked until 07:52 the next morning — 15h38m
+            // of a deal carrying twice the position the engine thought it held,
+            // with its take-profit priced off the stale average. The socket had
+            // reconnected at 15:53, 21 minutes before the fill.
+            //
+            // Scope is one account (`id` is the exchangeUUID), so this wakes a
+            // handful of bots, not the fleet.
+            this.redis?.publish(
+              `userStreamInfo${id}`,
+              `Subscribed to user ${id}`,
+            )
             this.noteReconnect(id, api.provider)
           })
 
