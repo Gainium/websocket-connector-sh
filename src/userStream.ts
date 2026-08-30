@@ -681,6 +681,12 @@ class UserConnector {
    *  whether a new rejection continues the current strike run or starts a
    *  fresh one. */
   private authLastRejectAt: Map<string, number> = new Map()
+  /** Room id → sha1 fingerprint of the credential that armed the cooldown.
+   *  Bot-driven rooms are keyed by the account uuid, which SURVIVES a key
+   *  swap — so without this, a user who fixes their rejected key would still
+   *  wait out a cooldown earned by the old one (up to 24h). The gate compares
+   *  fingerprints and lets a changed credential through immediately. */
+  private authCooldownCredFp: Map<string, string> = new Map()
   /** Pending self-heal retry timer per room id. Tracked so a room that is
    *  torn down while circuit-broken (the user deleted the connection) can
    *  have its retry cancelled — otherwise the timer resurrects a stream for a
@@ -1336,7 +1342,12 @@ class UserConnector {
    * rejected. A room that streamed fine for longer than that and only now
    * rejects (key revoked later) starts the ladder over at the base cooldown.
    */
-  private armAuthCooldown(id: string, userId?: string, now = Date.now()) {
+  private armAuthCooldown(
+    id: string,
+    userId?: string,
+    now = Date.now(),
+    credFp?: string,
+  ) {
     const prevStrikes = this.authCooldownStrikes.get(id) ?? 0
     const lastReject = this.authLastRejectAt.get(id) ?? 0
     const consecutive =
@@ -1347,9 +1358,25 @@ class UserConnector {
     this.authCooldownStrikes.set(id, strikes + 1)
     this.authLastRejectAt.set(id, now)
     this.authCooldownUntil.set(id, now + cooldownMs)
+    if (credFp) {
+      this.authCooldownCredFp.set(id, credFp)
+    }
     // New cooldown period ⇒ new skip log allowed.
     this.releaseAuthCooldownLogLatch(id, userId)
     return { cooldownMs, strikes: strikes + 1 }
+  }
+
+  /** Fingerprint of the credential material a subscribe request carries.
+   *  Compared against `authCooldownCredFp` by the cooldown gate. */
+  private credFingerprint(api: OpenStreamInput['api']) {
+    return crypto
+      .createHash('sha1')
+      .update(
+        `${api.key ?? ''}|${api.secret ?? ''}|${api.passphrase ?? ''}|${
+          api.keysType ?? ''
+        }`,
+      )
+      .digest('hex')
   }
 
   /**
@@ -1389,12 +1416,25 @@ class UserConnector {
     exchange: ExchangeEnum,
     userId: string | undefined,
     reason: string,
+    exchangeUUID?: string,
+    kind: 'authReject' | 'legacyKey' = 'authReject',
   ) {
     try {
       this.redis?.publish(
         serviceLogRedis,
         JSON.stringify({
-          userStreamAuthReject: { exchange, userId, reason },
+          // `exchangeUUID` is the room id — for bot-driven rooms that is the
+          // account uuid, which is what main-app persists so the admin
+          // user-stream-health page and the fill-failsafe escalation know
+          // WHICH account is auth-dead (and why: kind 'legacyKey' means the
+          // key type can never stream and self-healing is pointless).
+          userStreamAuthReject: {
+            exchange,
+            userId,
+            reason,
+            exchangeUUID,
+            kind,
+          },
         }),
       )
     } catch {
@@ -1429,6 +1469,7 @@ class UserConnector {
       this.authCooldownUntil.delete(id)
       this.authCooldownStrikes.delete(id)
       this.authLastRejectAt.delete(id)
+      this.authCooldownCredFp.delete(id)
       this.authCooldownSkipsSuppressed.delete(id)
       this.transportFailures.delete(id)
       this.transportStrikes.delete(id)
@@ -1644,7 +1685,25 @@ class UserConnector {
     // regenerated key hashes to a different `id`, so this only gates the exact
     // rejected credential and never blocks a fixed key.
     const cooldownUntil = this.authCooldownUntil.get(id) ?? 0
-    if (cooldownUntil > Date.now()) {
+    const armedCredFp = this.authCooldownCredFp.get(id)
+    if (
+      cooldownUntil > Date.now() &&
+      armedCredFp &&
+      armedCredFp !== this.credFingerprint(api)
+    ) {
+      // The request carries a DIFFERENT credential than the one that was
+      // rejected — the user replaced the key under the same account uuid.
+      // Waiting out a cooldown the old key earned would block the fix for up
+      // to 24h; drop the breaker and let the new key prove itself.
+      this.authCooldownUntil.delete(id)
+      this.authCooldownStrikes.delete(id)
+      this.authLastRejectAt.delete(id)
+      this.authCooldownCredFp.delete(id)
+      this.releaseAuthCooldownLogLatch(id, userId)
+      this.logger(
+        `Auth-rejection cooldown for ${userId} (room ${id}) lifted: credentials changed since the rejection`,
+      )
+    } else if (cooldownUntil > Date.now()) {
       // Log once per cooldown period, at info: the skip is the breaker working
       // as designed, not a service error, and the callers re-ask ~5x/min.
       const suppressed = this.authCooldownSkipsSuppressed.get(id)
@@ -1658,16 +1717,18 @@ class UserConnector {
       }
       this.authCooldownSkipsSuppressed.set(id, suppressed + 1)
       return
+    } else {
+      // Cooldown lapsed (or was never armed): drop the latch so the next
+      // cooldown logs again, and report what the latch swallowed. Also drop
+      // the lapsed gate entry itself — the self-heal timer used to be the only
+      // thing that cleared it, and it no longer runs for every cooldown (a
+      // torn-down room has its retry cancelled).
+      if (cooldownUntil) {
+        this.authCooldownUntil.delete(id)
+        this.authCooldownCredFp.delete(id)
+      }
+      this.releaseAuthCooldownLogLatch(id, userId)
     }
-    // Cooldown lapsed (or was never armed): drop the latch so the next cooldown
-    // logs again, and report what the latch swallowed. Also drop the lapsed
-    // gate entry itself — the self-heal timer used to be the only thing that
-    // cleared it, and it no longer runs for every cooldown (a torn-down room
-    // has its retry cancelled).
-    if (cooldownUntil) {
-      this.authCooldownUntil.delete(id)
-    }
-    this.releaseAuthCooldownLogLatch(id, userId)
     let findUser = this.users.find((user) => user.id === id)
     if (!findUser) {
       findUser = {
@@ -1709,6 +1770,39 @@ class UserConnector {
           api.provider === ExchangeEnum.binance &&
           api.secret.includes('PRIVATE KEY') &&
           !api.secret.includes('RSA PRIVATE KEY')
+        if (!useWebsocketAPI && api.provider === ExchangeEnum.binance) {
+          // Binance spot dropped the legacy listenKey user stream: an HMAC or
+          // RSA key can NEVER subscribe, so the old throw-per-attempt here was
+          // pure churn — 123 accounts retrying every few minutes (~3.5k error
+          // lines in 100min on 2026-08-30), every fill on them detected only
+          // by the reconcile sweep, and no user-facing signal from this path.
+          // Treat it exactly like a -1193/-2015 auth reject: arm the
+          // escalating circuit-breaker (30min → 24h), tell the user the
+          // precise fix, and let the cooldown gate absorb the re-requests. A
+          // key replaced under the same account uuid bypasses the gate via
+          // the credential fingerprint, so the fix takes effect immediately.
+          const { cooldownMs, strikes } = this.armAuthCooldown(
+            id,
+            userId,
+            Date.now(),
+            this.credFingerprint(api),
+          )
+          this.publishAuthRejectNotice(
+            api.provider,
+            userId,
+            'Binance spot realtime updates require an Ed25519 API key. Create an Ed25519 key on Binance and update this exchange connection in Gainium — until then, order fills are detected with a delay.',
+            id,
+            'legacyKey',
+          )
+          findUser = { ...findUser, pending: false }
+          this.saveUser(findUser)
+          return this.logger(
+            `${id} ${userId} Binance spot key is legacy (HMAC/RSA) — user stream unsupported; circuit-broken for ${Math.round(
+              cooldownMs / 1000,
+            )}s (strike ${strikes}), user notified ${api.provider}`,
+            true,
+          )
+        }
         /** New exchange instance */
         let client: WebsocketClient
         let startMethod: () => Promise<void> = async () => {
@@ -1801,13 +1895,8 @@ class UserConnector {
             )
           }
         }
-        if (!useWebsocketAPI && api.provider === ExchangeEnum.binance) {
-          startMethod = async () => {
-            throw new Error(
-              `Support of legacy subscribed is dropped for binance, please use websocket API key to avoid connection issues`,
-            )
-          }
-        }
+        // (Legacy HMAC/RSA binance-spot keys never get here — they are
+        // circuit-broken above, before a client is even constructed.)
 
         client.removeAllListeners('open')
         client.removeAllListeners('reconnecting')
@@ -1924,6 +2013,7 @@ class UserConnector {
               id,
               userId,
               now,
+              this.credFingerprint(api),
             )
             this.binanceAuthErrors.delete(id)
             this.binanceErrors.delete(id)
@@ -1944,6 +2034,7 @@ class UserConnector {
               api.provider,
               userId,
               isFatalAuthReject ? authMsg : `code ${authCode || 401}`,
+              id,
             )
             // One delayed retry after the cooldown so a key fixed in place
             // (e.g. egress IP added to the whitelist without regenerating the
@@ -3371,7 +3462,12 @@ class UserConnector {
             if ((this.authCooldownUntil.get(id) ?? 0) > Date.now()) {
               return
             }
-            const { cooldownMs, strikes } = this.armAuthCooldown(id, userId)
+            const { cooldownMs, strikes } = this.armAuthCooldown(
+              id,
+              userId,
+              Date.now(),
+              this.credFingerprint(api),
+            )
             try {
               close()
             } catch {
@@ -3386,7 +3482,7 @@ class UserConnector {
               )}s (strike ${strikes}) — no reconnect, no flap alert ${api.provider}`,
               true,
             )
-            this.publishAuthRejectNotice(api.provider, userId, errorMsg)
+            this.publishAuthRejectNotice(api.provider, userId, errorMsg, id)
             // One delayed retry so a key fixed in place (e.g. the "WebSocket
             // interface" permission enabled on the same key) self-heals
             // without a bot restart. If it's still rejected, this handler
@@ -3691,6 +3787,11 @@ class UserConnector {
       authOkEvent === 'ACCOUNT_UPDATE' ||
       authOkEvent === 'ACCOUNT_CONFIG_UPDATE'
     ) {
+      // A room that was circuit-broken and now delivers genuine account
+      // events has recovered — tell main-app so it can clear the account's
+      // dead-stream record (admin health page + fill-failsafe escalation).
+      const wasCircuitBroken =
+        this.authCooldownUntil.has(id) || this.authCooldownStrikes.has(id)
       if (this.binanceAuthErrors.has(id)) this.binanceAuthErrors.delete(id)
       if (this.authCooldownUntil.has(id)) this.authCooldownUntil.delete(id)
       // The key is provably authorized ⇒ the strike run is over. A later
@@ -3698,10 +3799,21 @@ class UserConnector {
       // multi-hour backoff earned before the key was fixed.
       this.authCooldownStrikes.delete(id)
       this.authLastRejectAt.delete(id)
+      this.authCooldownCredFp.delete(id)
       // A real account event also proves the transport is up end-to-end.
       this.transportFailures.delete(id)
       this.transportStrikes.delete(id)
       this.releaseAuthCooldownLogLatch(id)
+      if (wasCircuitBroken) {
+        try {
+          this.redis?.publish(
+            serviceLogRedis,
+            JSON.stringify({ userStreamAuthRecovered: { exchangeUUID: id } }),
+          )
+        } catch {
+          /* emit-only */
+        }
+      }
     }
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
 

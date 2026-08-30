@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.9] - 2026-08-30
+
+### Fixed
+
+- **A legacy (HMAC/RSA) Binance spot key is now circuit-broken like any other auth reject instead of retrying forever.** Binance spot dropped the legacy listenKey user stream, so those keys can never subscribe — but the old path just threw per attempt, and the bots re-request rooms every few minutes with no backoff: 123 accounts produced ~3.5k error lines in 100 minutes on 2026-08-30, had no user stream at all (every fill on them was detected only by the reconcile sweep, minutes late), and the user was never told. The path now arms the same escalating cooldown (30min → 24h) as a `-1193`/`-2015` reject and emits the `userStreamAuthReject` notice with the precise fix (create an Ed25519 key), so main-app raises the daily "Realtime feed unavailable" bot-message.
+- **A replaced key no longer waits out the cooldown its predecessor earned.** Bot-driven rooms are keyed by the account uuid, which survives a key swap, so the auth-rejection gate blocked the *fixed* credential for up to 24h (the "regenerated key hashes to a different id" assumption only holds for hash-keyed rooms). The breaker now records a fingerprint of the rejected credential and the gate lifts the cooldown the moment a request carries different key material.
+
+### Added
+
+- `userStreamAuthReject` now carries `exchangeUUID` (the room id) and `kind` (`authReject` | `legacyKey`), and a circuit-broken room that delivers a genuine account event again emits `userStreamAuthRecovered {exchangeUUID}` — so main-app can keep a per-account dead-stream record for the admin user-stream-health page and the fill-failsafe escalation (self-healing an auth-dead stream is pointless; those accounts should be informed, not restarted).
+
 ## [1.14.8] - 2026-08-29
 
 ### Fixed

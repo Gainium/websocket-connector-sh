@@ -49,6 +49,9 @@ function makeHarness() {
     authCooldownSkipsSuppressed: new Map<string, number>(),
     authCooldownStrikes: new Map<string, number>(),
     authLastRejectAt: new Map<string, number>(),
+    authCooldownCredFp: new Map<string, string>(),
+    transportFailures: new Map<string, number>(),
+    transportStrikes: new Map<string, number>(),
     authRetryTimers: new Map<string, NodeJS.Timeout>(),
     subscribeMsgsMap: new Map<string, any>(),
     subscribersMap: new Map<string, number>(),
@@ -240,6 +243,30 @@ test('a transient Kraken nonce error must NOT break the circuit', () => {
   assert.equal(isKrakenAuthReject('{"wsKey":"spotPrivateV2"}'), false)
   assert.equal(isKrakenAuthReject('{"wsKey":"derivativesPrivateV1"}'), false)
   assert.equal(isKrakenAuthReject(''), false)
+})
+
+test('arming with a credential fingerprint records it; changed material yields a different fingerprint', () => {
+  const { fake } = makeHarness()
+  const proto = UserConnector.prototype as any
+  const id = 'room-fp'
+
+  const fpOld = proto.credFingerprint.call(fake, {
+    key: 'k1',
+    secret: 'legacy-hmac-secret',
+  })
+  const fpNew = proto.credFingerprint.call(fake, {
+    key: 'k1',
+    secret: '-----BEGIN PRIVATE KEY----- abc -----END PRIVATE KEY-----',
+  })
+  // The bypass in the cooldown gate rests on exactly this inequality: a
+  // replaced key must not be mistaken for the one that armed the breaker.
+  assert.notEqual(fpOld, fpNew)
+
+  fake.armAuthCooldown(id, 'user-1', 1_000_000, fpOld)
+  assert.equal(fake.authCooldownCredFp.get(id), fpOld)
+  // Arming without a fingerprint must not clobber breaker state elsewhere.
+  fake.armAuthCooldown('room-no-fp', 'user-1', 1_000_000)
+  assert.equal(fake.authCooldownCredFp.has('room-no-fp'), false)
 })
 
 test('an invalid key rides the same escalating ladder, not a flat retry', () => {
