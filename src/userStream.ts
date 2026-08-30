@@ -1367,12 +1367,21 @@ class UserConnector {
   }
 
   /** Fingerprint of the credential material a subscribe request carries.
-   *  Compared against `authCooldownCredFp` by the cooldown gate. */
+   *  Compared against `authCooldownCredFp` by the cooldown gate.
+   *
+   *  Whitespace is stripped before hashing: the binance branch MUTATES
+   *  `api.secret` in place (PRIVATE-KEY space→newline normalization) before
+   *  the exception handler arms the breaker, while the gate sees the raw
+   *  secret of the NEXT request — with whitespace significant, the armed
+   *  fingerprint never matched and the "credentials changed" bypass re-lifted
+   *  the cooldown on every re-request, turning a circuit-broken -1193 room
+   *  into a ~1/sec reject loop (observed live on the 2026-08-30 deploy). */
   private credFingerprint(api: OpenStreamInput['api']) {
+    const strip = (v?: string) => (v ?? '').replace(/\s+/g, '')
     return crypto
       .createHash('sha1')
       .update(
-        `${api.key ?? ''}|${api.secret ?? ''}|${api.passphrase ?? ''}|${
+        `${strip(api.key)}|${strip(api.secret)}|${strip(api.passphrase)}|${
           api.keysType ?? ''
         }`,
       )

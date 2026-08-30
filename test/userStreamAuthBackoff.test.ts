@@ -262,6 +262,17 @@ test('arming with a credential fingerprint records it; changed material yields a
   // replaced key must not be mistaken for the one that armed the breaker.
   assert.notEqual(fpOld, fpNew)
 
+  // …and the converse: the binance branch mutates api.secret in place
+  // (PRIVATE-KEY space→newline normalization) before the breaker arms, so a
+  // whitespace-only difference is the SAME credential. Treating it as changed
+  // re-lifted the cooldown on every re-request and turned a circuit-broken
+  // -1193 room into a ~1/sec reject loop (2026-08-30).
+  const fpNormalized = proto.credFingerprint.call(fake, {
+    key: 'k1',
+    secret: '-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----',
+  })
+  assert.equal(fpNew, fpNormalized)
+
   fake.armAuthCooldown(id, 'user-1', 1_000_000, fpOld)
   assert.equal(fake.authCooldownCredFp.get(id), fpOld)
   // Arming without a fingerprint must not clobber breaker state elsewhere.
