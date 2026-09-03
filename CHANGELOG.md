@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.11] - 2026-09-03
+
+### Fixed
+
+- **Kraken spot accounts never received a live balance update.** The private `balances` channel on Kraken WebSocket v2 delivers `{channel, type, data:[…]}`; `prepareKrakenBalanceMsg` only understood a bare array, the futures `holding` object and `flex_futures`, so every spot message fell through, returned undefined and nothing was published — dashboards showed the 00:45 daily REST snapshot all day (2026-09-03: 24 Kraken spot accounts, 0 balance rows updated in 30 min while every other venue was fresh; a user saw 13.5 ETH with 1.53 on Kraken). Spot v2 snapshots and updates are now converted with `free = balance` and **no `locked` field**: Kraken reports the total with no hold figure, so emitting `locked:'0'` would overstate "available" on every event; main-app ≥ 2.88.4 leaves `locked` untouched when the field is absent. Futures messages are unchanged. Tests: `test/krakenSpotBalances.test.ts`.
+
 ## [1.14.10] - 2026-08-30
 
 ### Fixed

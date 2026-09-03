@@ -201,7 +201,8 @@ export const bybitHostAPIMap: Record<BybitHost, string> = {
 export interface AssetBalance {
   asset: string
   free: string
-  locked: string
+  /** Absent when the venue reports no hold figure (Kraken spot v2). */
+  locked?: string
   /**
    * The venue's OWN figure for how much of this asset is currently spendable,
    * when it publishes one. Optional and additive: every producer that has no
@@ -3328,7 +3329,7 @@ class UserConnector {
                   // Update stored balances
                   const newBalances = new Map<
                     string,
-                    { free: string; locked: string }
+                    { free: string; locked?: string }
                   >()
                   balance.balances.forEach((b) => {
                     newBalances.set(b.asset, { free: b.free, locked: b.locked })
@@ -4655,9 +4656,44 @@ class UserConnector {
 
     // Kraken balances can come as an object with currency keys
     // or as an array of balance objects
-    let balances: { asset: string; free: string; locked: string }[] = []
+    let balances: {
+      asset: string
+      free: string
+      /**
+       * Absent for Kraken spot v2: the `balances` channel reports the TOTAL
+       * balance and no hold figure, so writing `locked: '0'` would overstate
+       * "available" on every event. main-app leaves `locked` untouched when
+       * the field is absent and the REST refresh keeps it correct.
+       */
+      locked?: string
+    }[] = []
     const maps = await this.getKrakenMaps(exchange)
-    if (Array.isArray(data)) {
+    if (
+      data &&
+      typeof data === 'object' &&
+      !Array.isArray(data) &&
+      Array.isArray((data as { data?: unknown }).data)
+    ) {
+      // Kraken SPOT WebSocket v2 `balances` channel — the message is
+      // `{channel:'balances', type:'snapshot'|'update', data:[…]}`; snapshot
+      // items carry `{asset, balance, wallets}`, update items carry
+      // `{asset, amount, balance, …}` where `balance` is the new total. Until
+      // this branch existed the whole message fell through every shape below,
+      // returned undefined, and Kraken spot accounts got NO balance updates at
+      // all: their dashboard rows only moved on the daily REST refresh
+      // (2026-09-03, 24 accounts, 0 rows updated in 30 min while every other
+      // venue was fresh).
+      balances = ((data as { data: any[] }).data as any[])
+        .filter((b) => b && (b.asset || b.currency))
+        .map((b) => ({
+          asset:
+            maps.assetNameMap.get(b.asset || b.currency || '') ||
+            b.asset ||
+            b.currency ||
+            '',
+          free: `${b.balance ?? b.available ?? 0}`,
+        }))
+    } else if (Array.isArray(data)) {
       balances = data.map((b: any) => ({
         asset:
           maps.assetNameMap.get(b.currency || b.asset || '') ||
