@@ -22,8 +22,8 @@ import {
   HyperliquidFillParkResolver,
   ingestUserFills,
 } from '../src/utils/hyperliquidFillPark'
-import { ExchangeEnum } from '../../core/src/utils/common'
-import { CommonOrder } from '../../core/type'
+import { ExchangeEnum } from '../src/utils/common'
+import { CommonOrder } from '../type'
 
 type Order = { id: string }
 type Fill = { cloid?: string; px: string; sz: string }
