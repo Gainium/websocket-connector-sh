@@ -118,6 +118,8 @@ import {
   type ParkContext,
 } from './utils/hyperliquidFillPark'
 import { exchangeUrl } from './utils/env'
+import { fetchWhitebitWsToken, whitebitSideToOrderSide } from './utils/whitebit'
+import WhitebitWsClient from './utils/whitebitWsClient'
 import axios from 'axios'
 
 const mutex = new IdMutex()
@@ -145,6 +147,8 @@ export type PaperExchangeType =
   | ExchangeEnum.paperHyperliquidLinear
   | ExchangeEnum.paperKraken
   | ExchangeEnum.paperKrakenUsdm
+  | ExchangeEnum.paperWhitebit
+  | ExchangeEnum.paperWhitebitUsdm
 
 export const paperExchanges = [
   ExchangeEnum.paperFtx,
@@ -169,6 +173,8 @@ export const paperExchanges = [
   ExchangeEnum.paperHyperliquidLinear,
   ExchangeEnum.paperKraken,
   ExchangeEnum.paperKrakenUsdm,
+  ExchangeEnum.paperWhitebit,
+  ExchangeEnum.paperWhitebitUsdm,
 ]
 
 export enum BybitHost {
@@ -708,6 +714,14 @@ class UserConnector {
   }
   /** Kraken last balance quantities to filter price-only updates */
   private krakenLastBalances: Map<string, number> = new Map()
+  /**
+   * WhiteBit `positionsMargin_update` is a FULL SNAPSHOT of every open
+   * position, pushed once a second — not incremental deltas. Room id →
+   * position id → a fingerprint of that position's last-seen state, so the
+   * normalizer can tell a real open/close/resize from the periodic repeat and
+   * stay silent on the repeats (spec §2.4).
+   */
+  private whitebitPositions: Map<string, Map<string, string>> = new Map()
   private subscribeMsgsMap: Map<string, OpenStreamInput> = new Map()
   /** Process role. Three states:
    *    - `worker`   : HL-only listener bound to `usersStream:worker:<id>`
@@ -3523,6 +3537,120 @@ class UserConnector {
           )
         }
       }
+      if (
+        [ExchangeEnum.whitebit, ExchangeEnum.whitebitUsdm].includes(
+          api.provider,
+        )
+      ) {
+        /**
+         * WhiteBit private stream (spec §2.4). Hand-rolled on the same raw-`ws`
+         * pattern as the public connector — there is no SDK to hand credentials
+         * to — with one piece of plumbing no other branch in this file needs: a
+         * correlated request/response, because `authorize` is the one call
+         * whose answer must be awaited. It lives in `WhitebitWsClient`
+         * (`pending: Map<id, {resolve,reject}>`); `ping` and every
+         * `*_subscribe` are fire-and-forget.
+         *
+         * Auth is NOT signed over the socket: an authenticated REST call mints
+         * a token, and the token is what `authorize` carries.
+         */
+        let whitebitClient: WhitebitWsClient | null = null
+        try {
+          const isUsdm = api.provider === ExchangeEnum.whitebitUsdm
+          let everOpened = false
+          const client: WhitebitWsClient = new WhitebitWsClient({
+            tag: `${id} whitebit`,
+            onOpen: async () => {
+              // TODO §3.6: the REST token's lifetime, whether it is single-use
+              // and whether it survives a reconnect are unconfirmed, so a
+              // fresh one is minted on EVERY connect and reconnect — the safe
+              // default. Once confirmed this can reuse a still-valid token and
+              // save a signed REST round trip per reconnect.
+              const token = await fetchWhitebitWsToken(api.key, api.secret)
+              const result = (await client.request('authorize', [
+                token,
+                'public',
+              ])) as { status?: string } | null
+              if (result?.status !== 'success') {
+                throw new Error(
+                  `WhiteBit authorize did not succeed: ${JSON.stringify(result)}`,
+                )
+              }
+              this.logger(`${id} WhiteBit ws authorized ${api.provider}`)
+              // `_subscribe` replaces the channel's previous subscription, so
+              // the full set is re-sent on every open.
+              client.notify('balanceSpot_subscribe', [])
+              // `[markets, filter]`; empty markets = every market, filter 0 =
+              // limit + market orders.
+              client.notify('ordersExecuted_subscribe', [[], 0])
+              if (isUsdm) {
+                client.notify('positionsMargin_subscribe', [])
+              }
+              if (everOpened) {
+                // A reconnect loses everything the venue pushed while the
+                // socket was down — tell this account's bots to reconcile,
+                // exactly as the Kraken/bybit/bitget reconnect handlers do.
+                this.redis?.publish(
+                  `userStreamInfo${id}`,
+                  `Subscribed to user ${id}`,
+                )
+                this.noteReconnect(id, api.provider)
+              }
+              everOpened = true
+            },
+            onPush: (method, params) => this.onWhitebitPush(id, method, params),
+            onError: (err) =>
+              this.logger(
+                `${id} ${userId} WhiteBit ws error ${
+                  (err as Error)?.message ?? err
+                } ${api.provider}`,
+                true,
+              ),
+            onClose: ({ code, reason }) =>
+              this.logger(
+                `${id} WhiteBit ws closed ${code ?? ''} ${reason ?? ''} ${api.provider}`,
+              ),
+          })
+
+          whitebitClient = client
+          await client.start(20_000)
+
+          const close = () => {
+            client.close()
+            this.whitebitPositions.delete(id)
+          }
+
+          /** Save user id and close function in users array */
+          findUser = { ...findUser, close }
+
+          this.subscribersMap.set(id, (this.subscribersMap.get(id) ?? 0) + 1)
+
+          /** Log stream created for user */
+          this.logger(
+            `Stream for ${userId} room ${id} was successfully created ${api.provider}`,
+          )
+          /** Log bot subscribed to the user */
+          this.logger(
+            `Was subscribed to the user ${userId} room ${id} ${api.provider}`,
+          )
+          await this.paceAfterOpen(api.provider)
+        } catch (err) {
+          // A failed handshake leaves the client's own backoff reconnecting in
+          // the background; nothing holds a reference to it any more, so close
+          // it here rather than leaking a socket per failed subscribe attempt.
+          try {
+            whitebitClient?.close()
+          } catch {
+            /* closing a half-open client must never throw */
+          }
+          findUser = { ...findUser, pending: false }
+          this.saveUser(findUser)
+          return this.logger(
+            `${(err as Error)?.message ?? err} ${api.provider}`,
+            true,
+          )
+        }
+      }
       if (paperExchanges.includes(api.provider)) {
         const exchange = mapPaperToReal(api.provider as PaperExchangeType)
         if (!exchange) {
@@ -4762,6 +4890,209 @@ class UserConnector {
       lastAccountUpdate: 0,
       uniqueMessageId: `outboundAccountPosition${userId}${JSON.stringify(balances)}kraken`,
     }
+  }
+
+  /**
+   * Route one WhiteBit private push into the normalizers. Only the three
+   * channels confirmed in detail (spec §2.4) are handled; the other private
+   * channels WhiteBit documents (balanceMargin, ordersPending, deals, borrows,
+   * marginPositionsEvents) are deliberately not subscribed — these three
+   * already cover every `UserDataStreamEvent` case this repo normalizes into,
+   * and their payload shapes were never read (spec §3.4).
+   */
+  private onWhitebitPush(id: string, method: string, params: unknown) {
+    if (method === 'balanceSpot_update') {
+      const balance = this.prepareWhitebitBalanceMsg(params, Date.now(), id)
+      if (balance) {
+        this.userStreamEvent(id, balance)
+      }
+      return
+    }
+    if (method === 'ordersExecuted_update') {
+      for (const order of this.prepareWhitebitOrderMsg(params)) {
+        this.userStreamEvent(id, order)
+      }
+      return
+    }
+    if (method === 'positionsMargin_update') {
+      this.handleWhitebitPositions(id, params)
+    }
+  }
+
+  /**
+   * Pull the order objects out of a WhiteBit push's `params`, which nest them
+   * one level deep in some channels and pass them bare in others. Anything
+   * without a `market` is not an order and is ignored rather than guessed at.
+   */
+  private whitebitObjectsFromParams(params: unknown): Record<string, any>[] {
+    const out: Record<string, any>[] = []
+    const visit = (value: unknown, depth: number) => {
+      if (!value || depth > 2) return
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item, depth + 1)
+        return
+      }
+      if (typeof value === 'object') {
+        out.push(value as Record<string, any>)
+      }
+    }
+    visit(params, 0)
+    return out
+  }
+
+  /** WhiteBit timestamps are float seconds; this repo's events are ms. */
+  private whitebitTimeToMs(value: unknown, fallback: number): number {
+    const seconds = Number(value)
+    return isFinite(seconds) && seconds > 0
+      ? Math.round(seconds * 1000)
+      : fallback
+  }
+
+  private mapWhitebitOrderStatus(order: Record<string, any>): OrderStatus_LT {
+    const raw = `${order.status ?? ''}`.toUpperCase().replace(/\s+/g, '_')
+    if (raw === 'FILLED') return 'FILLED'
+    if (raw === 'PARTIALLY_FILLED') return 'PARTIALLY_FILLED'
+    if (raw === 'CANCELED' || raw === 'CANCELLED') return 'CANCELED'
+    if (raw === 'EXPIRED') return 'EXPIRED'
+    if (raw === 'REJECTED') return 'REJECTED'
+    if (raw === 'NEW' || raw === 'OPEN' || raw === 'ACTIVE') return 'NEW'
+    // No usable `status`: derive from what is left on the book. `left` is the
+    // unexecuted remainder and `deal_stock` the executed base amount.
+    const left = Number(order.left)
+    const dealStock = Number(order.deal_stock)
+    if (isFinite(left) && left === 0 && dealStock > 0) return 'FILLED'
+    if (dealStock > 0) return 'PARTIALLY_FILLED'
+    return 'NEW'
+  }
+
+  /**
+   * `ordersExecuted_update` → `executionReport`.
+   *
+   * `side` is NUMERIC here (1 = sell, 2 = buy) — see
+   * `whitebitSideToOrderSide`, which documents why it must not be copied from
+   * the one other numeric-side venue in this file (Kraken Futures' `direction`,
+   * whose polarity is the opposite).
+   */
+  private prepareWhitebitOrderMsg(params: unknown): ExecutionReport[] {
+    const now = Date.now()
+    return this.whitebitObjectsFromParams(params)
+      .filter((o) => o && o.market)
+      .map((order) => {
+        const dealStock = Number(order.deal_stock) || 0
+        const dealMoney = Number(order.deal_money) || 0
+        const limitPrice = Number(order.price) || 0
+        // A market order reports no price; the executed average is the only
+        // price it ever has.
+        const price =
+          limitPrice > 0
+            ? `${order.price}`
+            : dealStock > 0
+              ? `${dealMoney / dealStock}`
+              : '0'
+        const type = `${order.type ?? ''}`.toLowerCase()
+        return {
+          creationTime: this.whitebitTimeToMs(order.ctime, now),
+          eventTime: this.whitebitTimeToMs(order.mtime ?? order.ctime, now),
+          eventType: 'executionReport' as const,
+          newClientOrderId: `${order.client_order_id || order.id || ''}`,
+          orderId: order.id ?? '',
+          orderTime: this.whitebitTimeToMs(order.mtime ?? order.ctime, now),
+          orderStatus: this.mapWhitebitOrderStatus(order),
+          orderType: (type.includes('market')
+            ? 'MARKET'
+            : type.includes('limit')
+              ? 'LIMIT'
+              : limitPrice > 0
+                ? 'LIMIT'
+                : 'MARKET') as FuturesOrderType_LT,
+          originalClientOrderId: `${order.client_order_id || order.id || ''}`,
+          price,
+          quantity: `${order.amount ?? 0}`,
+          side: whitebitSideToOrderSide(order.side),
+          symbol: `${order.market}`,
+          totalQuoteTradeQuantity: `${dealMoney}`,
+          totalTradeQuantity: `${dealStock}`,
+          uniqueMessageId: `whitebitordersExecuted${JSON.stringify(order)}`,
+          liquidation: false,
+        }
+      })
+  }
+
+  /**
+   * `balanceSpot_update` → `outboundAccountPosition`. The push is a per-asset
+   * map, `{ASSET: {available, freeze}}`, throttled by the venue to 1/sec while
+   * balances are moving.
+   */
+  private prepareWhitebitBalanceMsg(
+    params: unknown,
+    time: number,
+    userId: string,
+  ): OutboundAccountPosition | undefined {
+    const balances: AssetBalance[] = []
+    for (const entry of this.whitebitObjectsFromParams(params)) {
+      for (const [asset, info] of Object.entries(entry)) {
+        if (!info || typeof info !== 'object') continue
+        const v = info as { available?: unknown; freeze?: unknown }
+        if (v.available === undefined && v.freeze === undefined) continue
+        balances.push({
+          asset,
+          free: `${v.available ?? 0}`,
+          locked: `${v.freeze ?? 0}`,
+        })
+      }
+    }
+    if (!balances.length) {
+      return undefined
+    }
+    return {
+      balances,
+      eventTime: time,
+      eventType: 'outboundAccountPosition',
+      lastAccountUpdate: 0,
+      uniqueMessageId: `outboundAccountPosition${userId}${JSON.stringify(balances)}whitebit`,
+    }
+  }
+
+  /**
+   * `positionsMargin_update` carries a full snapshot every second. The
+   * `UserDataStreamEvent` union has no position event, so this does not
+   * fabricate one: it diffs the snapshot against the last one seen for the room
+   * and, only when a position actually opened, closed or changed size, publishes
+   * the existing per-account reconcile signal (`userStreamInfo{exchangeUUID}`)
+   * that the reconnect handlers already use. That wakes this account's bots to
+   * re-check their state and nothing else — the periodic repeats stay silent.
+   */
+  private handleWhitebitPositions(id: string, params: unknown) {
+    const seen = new Map<string, string>()
+    for (const position of this.whitebitObjectsFromParams(params)) {
+      const positionId = `${position.position_id ?? position.id ?? ''}`
+      if (!positionId) continue
+      // Amount + entry price is enough to notice a resize; the rest of the
+      // snapshot (unrealised pnl, liquidation price) moves with the mark price
+      // every second and would make every push look like a change.
+      seen.set(
+        positionId,
+        `${position.market ?? ''}|${position.amount ?? ''}|${position.base_price ?? position.entry_price ?? ''}`,
+      )
+    }
+    const previous = this.whitebitPositions.get(id) ?? new Map<string, string>()
+    let changed = seen.size !== previous.size
+    if (!changed) {
+      for (const [positionId, fingerprint] of seen) {
+        if (previous.get(positionId) !== fingerprint) {
+          changed = true
+          break
+        }
+      }
+    }
+    this.whitebitPositions.set(id, seen)
+    if (!changed || !previous.size) {
+      // `!previous.size` also skips the very first snapshot: it is the initial
+      // state, not an event.
+      return
+    }
+    this.logger(`${id} WhiteBit positions changed — asking bots to reconcile`)
+    this.redis?.publish(`userStreamInfo${id}`, `Subscribed to user ${id}`)
   }
 }
 

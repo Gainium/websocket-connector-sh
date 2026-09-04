@@ -21,6 +21,7 @@ import {
   SpotClient as KrakenSpotClient,
   DerivativesClient as KrakenDerivativesClient,
 } from '@siebly/kraken-api'
+import { WHITEBIT_REST_URL } from './whitebit'
 
 export type ExchangeInfo = {
   baseAsset: {
@@ -143,7 +144,12 @@ const getAllExchangeInfo = async (
   if (
     url &&
     exchange !== ExchangeEnum.kraken &&
-    exchange !== ExchangeEnum.krakenUsdm
+    exchange !== ExchangeEnum.krakenUsdm &&
+    // WhiteBit is excluded from the generic proxy the same way Kraken is: it
+    // has its own public all-markets endpoint (spec §2.5), and the market name
+    // it returns is the exact string the WS channels subscribe by.
+    exchange !== ExchangeEnum.whitebit &&
+    exchange !== ExchangeEnum.whitebitUsdm
   ) {
     const data = await axios
       .get<BaseReturn<(ExchangeInfo & { pair: string })[]>>(
@@ -328,7 +334,52 @@ const getAllExchangeInfo = async (
     const maps = await getKrakenSymbolMaps(exchange)
     return [...maps.normalizedToWsname.keys()]
   }
+  if (
+    exchange === ExchangeEnum.whitebit ||
+    exchange === ExchangeEnum.whitebitUsdm
+  ) {
+    return await getWhitebitMarkets(exchange)
+  }
   return []
+}
+
+type WhitebitMarket = {
+  name: string
+  type?: string
+  tradesEnabled?: boolean
+}
+
+/**
+ * WhiteBit's public all-markets list. Bespoke REST branch (Kraken pattern,
+ * spec §2.5) rather than the generic internal proxy.
+ *
+ * Spot and USDⓈ-M perps come back from the same endpoint in one list; the perp
+ * contracts are the `*_PERP` names (`type: 'futures'`), so the split is done
+ * here rather than by two calls.
+ */
+export const getWhitebitMarkets = async (
+  exchange: ExchangeEnum.whitebit | ExchangeEnum.whitebitUsdm,
+): Promise<string[]> => {
+  const wantPerps = exchange === ExchangeEnum.whitebitUsdm
+  const markets = await axios
+    .get<WhitebitMarket[]>(`${WHITEBIT_REST_URL}/api/v4/public/markets`, {
+      timeout: EXCHANGE_INFO_TIMEOUT,
+    })
+    .then((r) => (Array.isArray(r.data) ? r.data : []))
+    .catch((e) => {
+      logger.warn(`Failed to get whitebit markets ${e}`)
+      return [] as WhitebitMarket[]
+    })
+  return markets
+    .filter((m) => m?.name && m.tradesEnabled !== false)
+    .filter((m) => {
+      // Match on the name suffix first: it is the string the WS channels are
+      // keyed by, so it cannot disagree with what we subscribe to even if the
+      // venue renames the `type` values.
+      const isPerp = /_PERP$/i.test(m.name) || m.type === 'futures'
+      return isPerp === wantPerps
+    })
+    .map((m) => m.name)
 }
 
 export type KrakenSymbolMap = {

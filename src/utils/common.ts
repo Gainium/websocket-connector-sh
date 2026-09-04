@@ -45,6 +45,13 @@ export enum ExchangeEnum {
   krakenUsdm = 'krakenUsdm',
   paperKraken = 'paperKraken',
   paperKrakenUsdm = 'paperKrakenUsdm',
+  // Spec 003 §2.1. These four strings are a cross-repo contract with
+  // exchange-connector-sh spec 002 §2.1 — they must stay character-identical
+  // there, in app-sh and in paper-trading-sh.
+  whitebit = 'whitebit',
+  whitebitUsdm = 'whitebitUsdm',
+  paperWhitebit = 'paperWhitebit',
+  paperWhitebitUsdm = 'paperWhitebitUsdm',
 }
 
 export const mapPaperToReal = (exchange: ExchangeEnum, warn = true) => {
@@ -93,6 +100,10 @@ export const mapPaperToReal = (exchange: ExchangeEnum, warn = true) => {
       return ExchangeEnum.kraken
     case ExchangeEnum.paperKrakenUsdm:
       return ExchangeEnum.krakenUsdm
+    case ExchangeEnum.paperWhitebit:
+      return ExchangeEnum.whitebit
+    case ExchangeEnum.paperWhitebitUsdm:
+      return ExchangeEnum.whitebitUsdm
     default:
       if (warn) {
         console.warn(new Date(), ` | ${exchange} is not found as paper`)
