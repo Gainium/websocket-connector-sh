@@ -8,6 +8,7 @@ import CoinbaseConnector from './coinbase'
 import BitgetConnector from './bitget'
 import HyperliquidConnector from './hyperliquid'
 import KrakenConnector from './kraken'
+import WhitebitConnector from './whitebit'
 import logger from '../utils/logger'
 import sleep from '../utils/sleep'
 import { skipReason } from '../../type'
@@ -23,6 +24,7 @@ type ConnectorType =
   | ExchangeEnum.mexc
   | ExchangeEnum.hyperliquid
   | ExchangeEnum.kraken
+  | ExchangeEnum.whitebit
 
 type Payload = {
   subscribedCandlesMap: Map<ExchangeEnum, Set<string>>
@@ -60,6 +62,10 @@ const createConnector = (
   }
   if (exchange === ExchangeEnum.kraken) {
     return new KrakenConnector(payload.subscribedCandlesMap)
+  }
+  if (exchange === ExchangeEnum.whitebit) {
+    // One connector serves both `whitebit` and `whitebitUsdm` (spec §2.3).
+    return new WhitebitConnector(payload.subscribedCandlesMap)
   }
 }
 

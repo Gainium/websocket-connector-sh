@@ -106,6 +106,7 @@ const FAMILY_VARIANTS: Record<string, ExchangeEnum[]> = {
   ],
   hyperliquid: [ExchangeEnum.hyperliquid, ExchangeEnum.hyperliquidLinear],
   kraken: [ExchangeEnum.kraken, ExchangeEnum.krakenUsdm],
+  whitebit: [ExchangeEnum.whitebit, ExchangeEnum.whitebitUsdm],
   coinbase: [ExchangeEnum.coinbase],
 }
 
@@ -196,6 +197,9 @@ class Connector {
   }
   get isKraken() {
     return this.isFamilyNeeded('kraken')
+  }
+  get isWhitebit() {
+    return this.isFamilyNeeded('whitebit')
   }
 
   constructor() {
@@ -423,6 +427,9 @@ class Connector {
     if (this.isKraken) {
       this.initWorker(ExchangeEnum.kraken)
     }
+    if (this.isWhitebit) {
+      this.initWorker(ExchangeEnum.whitebit)
+    }
   }
 
   stop() {
@@ -443,6 +450,7 @@ class Connector {
     const bitgetWorker = this.workers.get(ExchangeEnum.bitget)
     const hyperliquidWorker = this.workers.get(ExchangeEnum.hyperliquid)
     const krakenWorker = this.workers.get(ExchangeEnum.kraken)
+    const whitebitWorker = this.workers.get(ExchangeEnum.whitebit)
     bybitWorker?.on('exit', () => null)
     bybitWorker?.terminate()
     binanceWorker?.on('exit', () => null)
@@ -459,6 +467,8 @@ class Connector {
     hyperliquidWorker?.terminate()
     krakenWorker?.on('exit', () => null)
     krakenWorker?.terminate()
+    whitebitWorker?.on('exit', () => null)
+    whitebitWorker?.terminate()
   }
 }
 

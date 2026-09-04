@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] - 2026-09-04
+
+### Added
+
+- **WhiteBit streams (spot `whitebit` + USDⓈ-M perps `whitebitUsdm`) — draft.** WhiteBit ships no npm SDK, so both the public and the private side are hand-rolled raw-`ws` clients on the Hyperliquid pattern, sharing one JSON-RPC client (`src/utils/whitebitWsClient.ts`) that owns the connection, the ~50s `ping` the venue requires (it drops connections idle for 60s), reconnect backoff and — new to this repo — request/response correlation by JSON-RPC `id`, which `authorize` is the only call to need. `src/price/whitebit.ts` republishes `trades_update` and `candles_update` through the existing `cbWs`/`cbWsTrade`/`getCandleRoomName` base-class methods, so the Redis channel names are unchanged. One connector class serves both variants: the product family is readable off the market name (`BTC_USDT` vs `BTC_PERP`). `userStream.ts` gains the private branch — the WS token is minted by a signed `POST /api/v4/profile/websocket_token` (HMAC-SHA512), never over the socket, and `balanceSpot`/`ordersExecuted`/`positionsMargin` are normalized into the existing `UserDataStreamEvent` union. `getAllExchangeInfo` gets a bespoke WhiteBit REST branch (Kraken pattern), and the enum gains `whitebit`/`whitebitUsdm` plus their paper twins.
+- Two WhiteBit column/unit conventions are pinned by tests because a copy from any other venue here is silently wrong: `candles_update` sends **open and close BEFORE high and low**, and `trades_update`'s `time` is a **float number of seconds** while the candle channel's is integer seconds. `ordersExecuted_update`'s `side` is numeric with **1 = sell, 2 = buy** — the opposite polarity to Kraken Futures' numeric `direction`, the only other numeric side in `userStream.ts`. Tests: `test/whitebitCandleParsing.test.ts`, `test/whitebitUserStreamAuth.test.ts`.
+- Known gaps, marked in-tree: `// TODO §3.5` (the interval table covers every documented WhiteBit interval and every `ExchangeIntervals` member, but the full accepted set was never confirmed live — unmapped intervals are skipped, not guessed), `// TODO §3.6` (the REST token's lifetime/reuse is unconfirmed, so a fresh token is minted on every connect and reconnect) and one open question beyond spec §3: whether a single connection can hold more than one `candles_subscribe` (one socket per candle room is the safe reading). The four unconfirmed minor private channels (margin balance, pending orders, deals, borrows) are deliberately not subscribed. Nothing here is live until `websocket-connector` bumps this repo as `core/` and a WhiteBit account exists, so no existing exchange's behaviour changes.
+
 ## [1.14.11] - 2026-09-03
 
 ### Fixed
