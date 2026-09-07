@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.13] - 2026-09-07
+
+### Changed
+
+- **The price connector now says which exchange families it streams and which it does not, and stops discarding candle subscriptions in silence.** A family excluded from the enabled set (`PRICE_CONNECTOR_EXCHANGES`, or the admin-config set when that is authoritative) produced no worker and therefore no log line at all: no `trade@<symbol>@<family>` ticks for consumers, and every `candlesRequests` message for it dropped by an unlogged early return — thousands per boot, since the backend re-requests every subscription after a connector restart. Consumers then fall back to REST polling and evaluate price-triggered logic on that cadence instead of per tick, which looks from their side like a quiet market. Boot now logs the enabled/disabled families and where the decision came from, an unknown family name in the env allow-list is warned about, and a dropped candle request warns once per exchange (repeating at most every 30 minutes, carrying the running count). Diagnostic only: no change to which families are streamed. Claus #617.
+
 ## [1.14.12] - 2026-09-07
 
 ### Changed
