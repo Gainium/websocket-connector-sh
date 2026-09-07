@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.12] - 2026-09-07
+
+### Changed
+
+- **Kraken subscribe logging now matches what is actually subscribed, and records the venue's per-feed answer.** The `Kraken subscribing to topics:` line was written out separately from the `client.subscribe(...)` call and had drifted: it claimed `["open_orders","balances"]` while the futures client subscribes to three feeds including `fills`. Both now come from one array. In addition, the SDK sends one subscribe frame per topic, and Kraken's failure answer is a bare `{event:'alert', message:'Failed to subscribe to authenticated feed'}` carrying no feed name — so when the auth breaker tears the room down on the first alert, the logs could not say whether the venue refused every private feed for that key or only one of them. Kraken's `subscribed`/`unsubscribed` acknowledgements are now logged per feed. Diagnostic only: no change to the breaker, the backoff or the user-facing notice. Claus #586.
+
 ## [1.14.11] - 2026-09-03
 
 ### Fixed
