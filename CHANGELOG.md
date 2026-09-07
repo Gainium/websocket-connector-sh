@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.13] - 2026-09-07
+
+### Changed
+
+- **The price connector now says which exchange families it streams and which it does not, and stops discarding candle subscriptions in silence.** A family excluded from the enabled set (`PRICE_CONNECTOR_EXCHANGES`, or the admin-config set when that is authoritative) produced no worker and therefore no log line at all: no `trade@<symbol>@<family>` ticks for consumers, and every `candlesRequests` message for it dropped by an unlogged early return — thousands per boot, since the backend re-requests every subscription after a connector restart. Consumers then fall back to REST polling and evaluate price-triggered logic on that cadence instead of per tick, which looks from their side like a quiet market. Boot now logs the enabled/disabled families and where the decision came from, an unknown family name in the env allow-list is warned about, and a dropped candle request warns once per exchange (repeating at most every 30 minutes, carrying the running count). Diagnostic only: no change to which families are streamed. Claus #617.
+
+## [1.14.12] - 2026-09-07
+
+### Changed
+
+- **Kraken subscribe logging now matches what is actually subscribed, and records the venue's per-feed answer.** The `Kraken subscribing to topics:` line was written out separately from the `client.subscribe(...)` call and had drifted: it claimed `["open_orders","balances"]` while the futures client subscribes to three feeds including `fills`. Both now come from one array. In addition, the SDK sends one subscribe frame per topic, and Kraken's failure answer is a bare `{event:'alert', message:'Failed to subscribe to authenticated feed'}` carrying no feed name — so when the auth breaker tears the room down on the first alert, the logs could not say whether the venue refused every private feed for that key or only one of them. Kraken's `subscribed`/`unsubscribed` acknowledgements are now logged per feed. Diagnostic only: no change to the breaker, the backoff or the user-facing notice. Claus #586.
+
 ## [1.14.11] - 2026-09-03
 
 ### Fixed

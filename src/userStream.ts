@@ -3293,16 +3293,22 @@ class UserConnector {
           // Subscribe to appropriate topics based on market type
           const wsKey = isFutures ? 'derivativesPrivateV1' : 'spotPrivateV2'
 
+          // ONE array, used for both the log line and the actual subscribe.
+          // They used to be written out twice and had drifted: the log claimed
+          // `["open_orders","balances"]` while the client subscribed to three
+          // feeds including `fills`. Reading prod logs during the Claus #586
+          // investigation that reads as "we never subscribed to fills", which
+          // is wrong — and it is exactly the kind of log a later reader treats
+          // as ground truth.
+          const krakenTopics: Parameters<typeof client.subscribe>[0] = isFutures
+            ? ['open_orders', 'balances', 'fills']
+            : ['executions', 'balances']
+
           this.logger(
-            `${id} Kraken subscribing to topics: ${JSON.stringify(isFutures ? ['open_orders', 'balances'] : ['executions', 'balances'])} on ${wsKey}`,
+            `${id} Kraken subscribing to topics: ${JSON.stringify(krakenTopics)} on ${wsKey}`,
           )
 
-          client.subscribe(
-            isFutures
-              ? ['open_orders', 'balances', 'fills']
-              : ['executions', 'balances'],
-            wsKey,
-          )
+          client.subscribe(krakenTopics, wsKey)
 
           client.on('message', async (msg: any) => {
             const ref = isFutures ? msg.feed : msg.channel
@@ -3376,6 +3382,27 @@ class UserConnector {
             this.logger(`${id} Kraken ws authenticated ${api.provider}`)
           })
 
+          // Per-feed subscribe acknowledgements. The SDK sends ONE subscribe
+          // frame per topic (`getMaxTopicsPerSubscribeEvent()` returns 1), so
+          // Kraken answers each of the three futures feeds separately — but
+          // the venue's failure answer is a bare
+          // `{event:'alert', message:'Failed to subscribe to authenticated
+          // feed'}` with NO feed name, and the `exception` handler below tears
+          // the whole room down on the first one. The result (Claus #586) is
+          // that prod logs cannot say whether Kraken refused every private
+          // feed for that key or only one of them — the distinction between
+          // "this key cannot stream at all" and "we threw away a working
+          // order feed". Logging the acks costs a handful of lines per
+          // connection and settles it from the archived logs next time.
+          client.on('response', (evt: any) => {
+            const feed = evt?.feed ?? evt?.channel
+            const event = evt?.event ?? evt?.method
+            if (!feed || !/^(un)?subscribed?$/i.test(`${event}`)) {
+              return
+            }
+            this.logger(`${id} Kraken ws ${event} feed=${feed} ${api.provider}`)
+          })
+
           client.on('reconnected', () => {
             this.logger(`${id} Kraken ws has reconnected ${api.provider}`)
             // Tell this account's bots to reconcile, exactly as the bybit and
@@ -3405,6 +3432,7 @@ class UserConnector {
             client.removeAllListeners('message')
             client.removeAllListeners('open')
             client.removeAllListeners('authenticated')
+            client.removeAllListeners('response')
             client.removeAllListeners('reconnected')
             client.removeAllListeners('exception')
             // Clean up stored balances
