@@ -4087,45 +4087,67 @@ class UserConnector {
   }
 
   private prepareBitgetOrderMsg(msg: BitgetSpotOrder[]): ExecutionReport[] {
-    return msg.map((data) => ({
-      creationTime: parseInt(data.cTime),
-      eventTime: parseInt(data.uTime),
-      eventType: 'executionReport',
-      newClientOrderId: data.clientOid,
-      orderId: data.orderId,
-      orderTime: parseInt(data.uTime),
-      orderStatus: (() => {
-        const { status } = data
-        if (['live'].includes(status)) {
-          return 'NEW'
-        }
-        if (status === 'partially_filled') {
-          return 'PARTIALLY_FILLED'
-        }
-        if (status === 'filled') {
-          return 'FILLED'
-        }
-        return 'CANCELED'
-      })(),
-      orderType: data.orderType === 'limit' ? 'LIMIT' : 'MARKET',
-      originalClientOrderId: data.clientOid,
-      price: `${+data.priceAvg || +data.price}`,
-      quantity: data.baseVolume,
-      side: data.side === 'buy' ? 'BUY' : 'SELL',
-      symbol: data.instId,
-      totalQuoteTradeQuantity:
-        +data.accBaseVolume && +data.priceAvg
-          ? `${+data.accBaseVolume * +data.priceAvg}`
-          : '0',
-      totalTradeQuantity: data.accBaseVolume,
-      uniqueMessageId: `BitgetexecutionReport${Object.entries(data)
-        .map(([k, v]) => `${k}:${v}`)
-        .join(',')}`,
-      feeBreakdown: data.feeDetail?.map((d) => ({
-        asset: d.feeCoin,
-        amount: d.fee,
-      })),
-    }))
+    return msg.map((data) => {
+      // Every other venue's normalizer emits feePaid/feeAsset as a single
+      // value alongside whatever else it carries — Bitget was the one
+      // exception, feeBreakdown only. feeBreakdown stays (a genuine
+      // multi-leg fee is real, per §3.2 — a fee-currency-balance-exhausted
+      // fill can charge two currencies at once), but a consumer that only
+      // reads feePaid/feeAsset (the single-value shape every other venue
+      // guarantees) still gets a value. When feeDetail has more than one
+      // leg, prefer whichever one is base- or quote-denominated — the
+      // instId is BASEQUOTE with no separator, so match on prefix/suffix —
+      // over a third-asset leg, falling back to the first leg reported when
+      // nothing matches either side.
+      const primaryFeeLeg = data.feeDetail?.length
+        ? (data.feeDetail.find(
+            (d) =>
+              data.instId.startsWith(d.feeCoin) ||
+              data.instId.endsWith(d.feeCoin),
+          ) ?? data.feeDetail[0])
+        : undefined
+      return {
+        creationTime: parseInt(data.cTime),
+        eventTime: parseInt(data.uTime),
+        eventType: 'executionReport',
+        newClientOrderId: data.clientOid,
+        orderId: data.orderId,
+        orderTime: parseInt(data.uTime),
+        orderStatus: (() => {
+          const { status } = data
+          if (['live'].includes(status)) {
+            return 'NEW'
+          }
+          if (status === 'partially_filled') {
+            return 'PARTIALLY_FILLED'
+          }
+          if (status === 'filled') {
+            return 'FILLED'
+          }
+          return 'CANCELED'
+        })(),
+        orderType: data.orderType === 'limit' ? 'LIMIT' : 'MARKET',
+        originalClientOrderId: data.clientOid,
+        price: `${+data.priceAvg || +data.price}`,
+        quantity: data.baseVolume,
+        side: data.side === 'buy' ? 'BUY' : 'SELL',
+        symbol: data.instId,
+        totalQuoteTradeQuantity:
+          +data.accBaseVolume && +data.priceAvg
+            ? `${+data.accBaseVolume * +data.priceAvg}`
+            : '0',
+        totalTradeQuantity: data.accBaseVolume,
+        uniqueMessageId: `BitgetexecutionReport${Object.entries(data)
+          .map(([k, v]) => `${k}:${v}`)
+          .join(',')}`,
+        feeBreakdown: data.feeDetail?.map((d) => ({
+          asset: d.feeCoin,
+          amount: d.fee,
+        })),
+        feePaid: primaryFeeLeg?.fee,
+        feeAsset: primaryFeeLeg?.feeCoin,
+      }
+    })
   }
 
   private preparePaperOrderMsg(msg: PaperOrderMessage): ExecutionReport {

@@ -155,6 +155,74 @@ test('Bitget: feeDetail (cumulative, multi-leg) reaches the outgoing report as f
   assert.deepEqual((report as any).feeBreakdown, [
     { asset: 'USDT', amount: '-0.05' },
   ])
+  // feePaid/feeAsset alongside feeBreakdown — the single-value shape every
+  // other venue's normalizer already guarantees.
+  assert.equal((report as any).feePaid, '-0.05')
+  assert.equal((report as any).feeAsset, 'USDT')
+})
+
+test('Bitget: a multi-leg fee prefers the base/quote-denominated leg for feePaid/feeAsset', () => {
+  const uc = connector()
+  const base = (feeDetail: { feeCoin: string; fee: string }[]) => [
+    {
+      instId: 'BTCUSDT',
+      orderId: 'o1',
+      clientOid: 'c1',
+      size: '0.01',
+      newSize: '0.01',
+      notional: '500',
+      orderType: 'limit',
+      force: 'gtc',
+      side: 'buy',
+      fillPrice: '50000',
+      tradeId: 't1',
+      baseVolume: '0.01',
+      fillTime: '2000',
+      fillFee: '-0.00001',
+      fillFeeCoin: 'BTC',
+      tradeScope: 'taker',
+      accBaseVolume: '0.01',
+      priceAvg: '50000',
+      price: '50000',
+      status: 'filled',
+      cTime: '1000',
+      uTime: '2000',
+      stpMode: '',
+      feeDetail,
+      enterPointSource: '',
+    },
+  ]
+
+  // BGB (off-pair, listed first) + USDT (quote) — quote wins regardless of
+  // list order.
+  const [withOffPairFirst] = uc.prepareBitgetOrderMsg(
+    base([
+      { feeCoin: 'BGB', fee: '-0.001' },
+      { feeCoin: 'USDT', fee: '-0.03' },
+    ]),
+  )
+  assert.equal((withOffPairFirst as any).feePaid, '-0.03')
+  assert.equal((withOffPairFirst as any).feeAsset, 'USDT')
+
+  // BTC (base) + BGB (off-pair) — base wins.
+  const [withBaseLeg] = uc.prepareBitgetOrderMsg(
+    base([
+      { feeCoin: 'BGB', fee: '-0.001' },
+      { feeCoin: 'BTC', fee: '-0.00001' },
+    ]),
+  )
+  assert.equal((withBaseLeg as any).feePaid, '-0.00001')
+  assert.equal((withBaseLeg as any).feeAsset, 'BTC')
+
+  // Neither leg matches base or quote — falls back to the first reported.
+  const [withNeitherMatching] = uc.prepareBitgetOrderMsg(
+    base([
+      { feeCoin: 'BGB', fee: '-0.001' },
+      { feeCoin: 'KCS', fee: '-0.002' },
+    ]),
+  )
+  assert.equal((withNeitherMatching as any).feePaid, '-0.001')
+  assert.equal((withNeitherMatching as any).feeAsset, 'BGB')
 })
 
 test('Coinbase: total_fees reaches the outgoing report', () => {
