@@ -4077,6 +4077,10 @@ class UserConnector {
           category === 'inverse' ? data.cumExecValue : data.cumExecQty,
         uniqueMessageId: `${data.category}executionReport${data.updatedTime}${data.symbol}${data.orderStatus}${data.qty}${data.price}${data.cumExecQty}${data.orderType}${data.orderLinkId}${data.createType}`,
         liquidation: data.createType === 'CreateByTakeOver_PassThrough',
+        // Both fields are marked DEPRECATED by Bybit for linear/spot in
+        // favor of `cumFeeDetail`/per-fill `execFee` (spec 003 §3.2) — still
+        // populated today, but this is a follow-up: capture `cumFeeDetail`'s
+        // shape and migrate before Bybit stops filling the old fields.
         feePaid: data.cumExecFee,
         feeAsset: data.feeCurrency,
       }))
