@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.15] - 2026-09-08
+
+### Added
+
+- **The paper-trading order bridge now also forwards `feeAsset`.** `PaperOrderMessage` gained the field and `preparePaperOrderMsg` copies it onto the outgoing `ExecutionReport`, present-if-present — paper-trading can now report a configured symbol's fee as paid in a third asset (`paper-trading-sh` spec 004), for testing the platform's BNB/BGB/KCS-style discount-asset path without a real account that has one. Spec 006.
+
+## [1.14.14] - 2026-09-08
+
+### Fixed
+
+- **The paper-trading order bridge now forwards `feePaid`/`feeSide`.** `PaperOrderMessage` gained the fields (paper-trading now reports them on its socket.io `order` push, spec 003) and `preparePaperOrderMsg` copies them onto the outgoing `ExecutionReport`, present-if-present — the same rule the five real-venue fee normalizers already follow. `ExecutionReport` itself also gained `feeSide` alongside its existing `feeAsset`. Spec 005.
+
 ## [1.14.13] - 2026-09-07
 
 ### Changed

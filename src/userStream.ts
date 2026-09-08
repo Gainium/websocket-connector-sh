@@ -276,14 +276,20 @@ export interface ExecutionReport {
   liquidation?: boolean
   feePaid?: string
   feeAsset?: string
+  /**
+   * WHICH side of the pair the fee came out of. Only paper-trading sets this
+   * today — it always knows the side deterministically and never sets
+   * `feeAsset` (spec 003) — but it lives on the shared `ExecutionReport`
+   * shape, not a paper-only type, the same way `feeAsset` does for every
+   * real venue.
+   */
+  feeSide?: 'base' | 'quote'
   feeBreakdown?: { asset: string; amount: string }[]
   feePaidUsd?: string
 }
 
 export type UserDataStreamEvent =
-  | OutboundAccountPosition
-  | ExecutionReport
-  | BalanceUpdate
+  OutboundAccountPosition | ExecutionReport | BalanceUpdate
 
 export enum CoinbaseKeysType {
   legacy = 'legacy',
@@ -434,6 +440,15 @@ export type PaperOrderMessage = {
   side: string
   quoteAmount: number
   exchange: string
+  // Reported by paper-trading's UserGateway.sendOrderToClient since spec 003
+  // (`paperOrderFee`) — absent means no fee was charged, never a claim of
+  // zero (mirrors every real venue's convention).
+  feePaid?: string
+  feeSide?: 'base' | 'quote'
+  // A symbol configured for third-asset fee testing (paper-trading spec
+  // 004) reports this instead of `feeSide` — never both, same as a real
+  // venue's `feeAsset`/`feeSide` (spec 006).
+  feeAsset?: string
 }
 
 export type OKXAccountMsg = {
@@ -4196,6 +4211,11 @@ class UserConnector {
       totalQuoteTradeQuantity: `${msg.filledQuoteAmount}`,
       totalTradeQuantity: `${msg.filledAmount}`,
       uniqueMessageId: `executionReport${msg.updatedAt}${msg.symbol}${msg.status}${msg.amount}${msg.price}${msg.externalId}`,
+      // Absent means "no fee observed", never a claim of zero (spec 003) —
+      // only forward what paper-trading actually reported.
+      ...(msg.feePaid !== undefined ? { feePaid: msg.feePaid } : {}),
+      ...(msg.feeSide !== undefined ? { feeSide: msg.feeSide } : {}),
+      ...(msg.feeAsset !== undefined ? { feeAsset: msg.feeAsset } : {}),
       liquidation: msg.externalId.startsWith('liquidation_'),
     }
   }
