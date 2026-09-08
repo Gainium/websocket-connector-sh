@@ -4,6 +4,7 @@ import {
   krakenOpenOrdersRemovalIsFill,
 } from './utils/krakenOpenOrders'
 import { WebsocketAPIClient, WebsocketClient } from 'binance'
+import { withLosslessOrderIds } from './binance-custom'
 import * as hl from '@nktkas/hyperliquid'
 import KucoinApi from '@gainium/kucoin-api'
 import Coinbase, {
@@ -1850,25 +1851,30 @@ class UserConnector {
             '-----BEGIN PRIVATE KEY-----\n',
           )
           .replace(/ -----END PRIVATE KEY-----/g, '\n-----END PRIVATE KEY-----')
+        // `withLosslessOrderIds` on every Binance client below: the vendor SDK
+        // parses each frame with a bare `JSON.parse`, which rounds a >2^53 order
+        // id to the nearest double before any of our code sees it — 19-digit USDM
+        // ids arrived with their low digits replaced by zeros, so different orders
+        // shared one id. See specs/004.
         if (api.provider === ExchangeEnum.binanceUS) {
           client = new WebsocketClient(
-            {
+            withLosslessOrderIds({
               api_key: api.key,
               api_secret: api.secret,
               restOptions: {
                 baseUrl: 'https://api.binance.us',
               },
               wsUrl: 'wss://stream.binance.us:9443/ws',
-            },
+            }),
             wsLoggerOptions,
           )
         } else {
           if (useWebsocketAPI) {
             const wsAPI = new WebsocketAPIClient(
-              {
+              withLosslessOrderIds({
                 api_key: api.key,
                 api_secret: api.secret,
-              },
+              }),
               wsLoggerOptions,
             )
 
@@ -1897,10 +1903,10 @@ class UserConnector {
             }
           } else {
             client = new WebsocketClient(
-              {
+              withLosslessOrderIds({
                 api_key: api.key,
                 api_secret: api.secret,
-              },
+              }),
               wsLoggerOptions,
             )
           }

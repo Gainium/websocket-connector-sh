@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.14] - 2026-09-08
+
+### Fixed
+
+- **Binance order numbers arriving on the user stream are now recorded exactly as the exchange issued them.** Binance USDM order numbers have grown past the largest whole number JavaScript can hold precisely, and the exchange sends them as plain numbers, so the last few digits were rounded off every order update the connector received — before any of its own code read the message. Because rounding is not reversible, several genuinely different orders ended up filed under the same number: fills, fees and profit could be attributed to the wrong order, and a later cancel or lookup addressed by that number could reach an order the platform never meant to touch. Order updates are now read without losing any digits. Order numbers small enough to be held precisely are handled exactly as before, and no other message on the stream is affected. This is the user-stream counterpart to the same fix already made on the REST side. Tests: `test/binanceUserStreamOrderId.test.ts`.
+
 ## [1.14.13] - 2026-09-07
 
 ### Changed
