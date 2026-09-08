@@ -275,12 +275,22 @@ export interface ExecutionReport {
   totalTradeQuantity: string // Cumulative filled quantity
   uniqueMessageId?: string
   liquidation?: boolean
+  feePaid?: string
+  feeAsset?: string
+  /**
+   * WHICH side of the pair the fee came out of. Only paper-trading sets this
+   * today — it always knows the side deterministically and never sets
+   * `feeAsset` (spec 003) — but it lives on the shared `ExecutionReport`
+   * shape, not a paper-only type, the same way `feeAsset` does for every
+   * real venue.
+   */
+  feeSide?: 'base' | 'quote'
+  feeBreakdown?: { asset: string; amount: string }[]
+  feePaidUsd?: string
 }
 
 export type UserDataStreamEvent =
-  | OutboundAccountPosition
-  | ExecutionReport
-  | BalanceUpdate
+  OutboundAccountPosition | ExecutionReport | BalanceUpdate
 
 export enum CoinbaseKeysType {
   legacy = 'legacy',
@@ -431,6 +441,15 @@ export type PaperOrderMessage = {
   side: string
   quoteAmount: number
   exchange: string
+  // Reported by paper-trading's UserGateway.sendOrderToClient since spec 003
+  // (`paperOrderFee`) — absent means no fee was charged, never a claim of
+  // zero (mirrors every real venue's convention).
+  feePaid?: string
+  feeSide?: 'base' | 'quote'
+  // A symbol configured for third-asset fee testing (paper-trading spec
+  // 004) reports this instead of `feeSide` — never both, same as a real
+  // venue's `feeAsset`/`feeSide` (spec 006).
+  feeAsset?: string
 }
 
 export type OKXAccountMsg = {
@@ -603,6 +622,19 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
 const krakenFillTotals = new ExpirableMap<
   string,
   { qty: number; cost: number; fillIds: Set<string> }
+>(60 * 60 * 1000)
+
+// Running per-order fee totals for Kraken spot, keyed by exchange order id.
+// The v2 `executions` channel's `fees[]` is treated as per-fill (spec 003
+// §2.1/§3.1 — the docs don't say whether it accumulates, so under-forwarding
+// is the conservative default), so it's summed here the same way
+// `krakenFillTotals` sums futures fill quantity — deduped by `exec_id` so a
+// redelivered event cannot double-count. `fee_usd_equiv` is NOT summed here:
+// it's documented as already an order-level running total and is forwarded
+// as-is at the call site.
+const krakenSpotFeeTotals = new ExpirableMap<
+  string,
+  { amounts: Record<string, number>; execIds: Set<string> }
 >(60 * 60 * 1000)
 
 // Park-and-retry for the HL two-channel fill join (see hyperliquidFillPark.ts).
@@ -3982,6 +4014,8 @@ class UserConnector {
           totalTradeQuantity: data.accFillSz,
           uniqueMessageId: `${data.instId}executionReport${data.uTime}${symbol}${data.state}${data.sz}${data.px}${data.accFillSz}${data.ordType}${data.clOrdId}${data.category}`,
           liquidation: data.category === 'full_liquidation',
+          feePaid: data.fee,
+          feeAsset: data.feeCcy,
         }
       })
   }
@@ -4039,6 +4073,7 @@ class UserConnector {
               uniqueMessageId: `${Object.entries(order)
                 .map(([k, v]) => `${k}:${v}`)
                 .join(',')}`,
+              feePaid: order.total_fees,
             }
           }),
       )
@@ -4091,45 +4126,77 @@ class UserConnector {
           category === 'inverse' ? data.cumExecValue : data.cumExecQty,
         uniqueMessageId: `${data.category}executionReport${data.updatedTime}${data.symbol}${data.orderStatus}${data.qty}${data.price}${data.cumExecQty}${data.orderType}${data.orderLinkId}${data.createType}`,
         liquidation: data.createType === 'CreateByTakeOver_PassThrough',
+        // Both fields are marked DEPRECATED by Bybit for linear/spot in
+        // favor of `cumFeeDetail`/per-fill `execFee` (spec 003 §3.2) — still
+        // populated today, but this is a follow-up: capture `cumFeeDetail`'s
+        // shape and migrate before Bybit stops filling the old fields.
+        feePaid: data.cumExecFee,
+        feeAsset: data.feeCurrency,
       }))
   }
 
   private prepareBitgetOrderMsg(msg: BitgetSpotOrder[]): ExecutionReport[] {
-    return msg.map((data) => ({
-      creationTime: parseInt(data.cTime),
-      eventTime: parseInt(data.uTime),
-      eventType: 'executionReport',
-      newClientOrderId: data.clientOid,
-      orderId: data.orderId,
-      orderTime: parseInt(data.uTime),
-      orderStatus: (() => {
-        const { status } = data
-        if (['live'].includes(status)) {
-          return 'NEW'
-        }
-        if (status === 'partially_filled') {
-          return 'PARTIALLY_FILLED'
-        }
-        if (status === 'filled') {
-          return 'FILLED'
-        }
-        return 'CANCELED'
-      })(),
-      orderType: data.orderType === 'limit' ? 'LIMIT' : 'MARKET',
-      originalClientOrderId: data.clientOid,
-      price: `${+data.priceAvg || +data.price}`,
-      quantity: data.baseVolume,
-      side: data.side === 'buy' ? 'BUY' : 'SELL',
-      symbol: data.instId,
-      totalQuoteTradeQuantity:
-        +data.accBaseVolume && +data.priceAvg
-          ? `${+data.accBaseVolume * +data.priceAvg}`
-          : '0',
-      totalTradeQuantity: data.accBaseVolume,
-      uniqueMessageId: `BitgetexecutionReport${Object.entries(data)
-        .map(([k, v]) => `${k}:${v}`)
-        .join(',')}`,
-    }))
+    return msg.map((data) => {
+      // Every other venue's normalizer emits feePaid/feeAsset as a single
+      // value alongside whatever else it carries — Bitget was the one
+      // exception, feeBreakdown only. feeBreakdown stays (a genuine
+      // multi-leg fee is real, per §3.2 — a fee-currency-balance-exhausted
+      // fill can charge two currencies at once), but a consumer that only
+      // reads feePaid/feeAsset (the single-value shape every other venue
+      // guarantees) still gets a value. When feeDetail has more than one
+      // leg, prefer whichever one is base- or quote-denominated — the
+      // instId is BASEQUOTE with no separator, so match on prefix/suffix —
+      // over a third-asset leg, falling back to the first leg reported when
+      // nothing matches either side.
+      const primaryFeeLeg = data.feeDetail?.length
+        ? (data.feeDetail.find(
+            (d) =>
+              data.instId.startsWith(d.feeCoin) ||
+              data.instId.endsWith(d.feeCoin),
+          ) ?? data.feeDetail[0])
+        : undefined
+      return {
+        creationTime: parseInt(data.cTime),
+        eventTime: parseInt(data.uTime),
+        eventType: 'executionReport',
+        newClientOrderId: data.clientOid,
+        orderId: data.orderId,
+        orderTime: parseInt(data.uTime),
+        orderStatus: (() => {
+          const { status } = data
+          if (['live'].includes(status)) {
+            return 'NEW'
+          }
+          if (status === 'partially_filled') {
+            return 'PARTIALLY_FILLED'
+          }
+          if (status === 'filled') {
+            return 'FILLED'
+          }
+          return 'CANCELED'
+        })(),
+        orderType: data.orderType === 'limit' ? 'LIMIT' : 'MARKET',
+        originalClientOrderId: data.clientOid,
+        price: `${+data.priceAvg || +data.price}`,
+        quantity: data.baseVolume,
+        side: data.side === 'buy' ? 'BUY' : 'SELL',
+        symbol: data.instId,
+        totalQuoteTradeQuantity:
+          +data.accBaseVolume && +data.priceAvg
+            ? `${+data.accBaseVolume * +data.priceAvg}`
+            : '0',
+        totalTradeQuantity: data.accBaseVolume,
+        uniqueMessageId: `BitgetexecutionReport${Object.entries(data)
+          .map(([k, v]) => `${k}:${v}`)
+          .join(',')}`,
+        feeBreakdown: data.feeDetail?.map((d) => ({
+          asset: d.feeCoin,
+          amount: d.fee,
+        })),
+        feePaid: primaryFeeLeg?.fee,
+        feeAsset: primaryFeeLeg?.feeCoin,
+      }
+    })
   }
 
   private preparePaperOrderMsg(msg: PaperOrderMessage): ExecutionReport {
@@ -4150,6 +4217,11 @@ class UserConnector {
       totalQuoteTradeQuantity: `${msg.filledQuoteAmount}`,
       totalTradeQuantity: `${msg.filledAmount}`,
       uniqueMessageId: `executionReport${msg.updatedAt}${msg.symbol}${msg.status}${msg.amount}${msg.price}${msg.externalId}`,
+      // Absent means "no fee observed", never a claim of zero (spec 003) —
+      // only forward what paper-trading actually reported.
+      ...(msg.feePaid !== undefined ? { feePaid: msg.feePaid } : {}),
+      ...(msg.feeSide !== undefined ? { feeSide: msg.feeSide } : {}),
+      ...(msg.feeAsset !== undefined ? { feeAsset: msg.feeAsset } : {}),
       liquidation: msg.externalId.startsWith('liquidation_'),
     }
   }
@@ -4182,6 +4254,10 @@ class UserConnector {
         price = `${(filledSize ? quote / filledSize : +order.order.limitPx).toFixed(pricePrecision)}`
       }
     }
+    // fee/feeToken are per-fill (spec 003 §2.1) — sum across the same buffered
+    // fills used for filledSize/quote above, not a separate accumulator.
+    const feePaid = get ? `${get.reduce((a, c) => a + +c.fee, 0)}` : undefined
+    const feeAsset = get ? get[get.length - 1].feeToken : undefined
     if (
       isFilled &&
       (filledSize < +order.order.origSz || filledSize > +order.order.origSz)
@@ -4214,6 +4290,8 @@ class UserConnector {
       totalTradeQuantity: `${filledSize}`,
       uniqueMessageId: `executionReport${JSON.stringify(order)},fills:${JSON.stringify(get || [])}`,
       liquidation: false,
+      feePaid,
+      feeAsset,
     }
   }
 
@@ -4491,6 +4569,45 @@ class UserConnector {
       return msg.data.map((order: any) => {
         const symbol =
           maps.wsnameToNormalized.get(order.symbol) || order.symbol || ''
+
+        const orderKey = `${order.order_id || order.cl_ord_id || ''}`
+        const execId = `${order.exec_id ?? ''}`
+        const feeTotals = krakenSpotFeeTotals.get(orderKey) ?? {
+          amounts: {} as Record<string, number>,
+          execIds: new Set<string>(),
+        }
+        if (
+          execId &&
+          !feeTotals.execIds.has(execId) &&
+          Array.isArray(order.fees)
+        ) {
+          feeTotals.execIds.add(execId)
+          for (const leg of order.fees) {
+            feeTotals.amounts[leg.asset] =
+              (feeTotals.amounts[leg.asset] ?? 0) + (+leg.qty || 0)
+          }
+        }
+        krakenSpotFeeTotals.set(orderKey, feeTotals)
+        const feeAssets = Object.keys(feeTotals.amounts)
+        const feePaid =
+          feeAssets.length === 1
+            ? `${feeTotals.amounts[feeAssets[0]]}`
+            : undefined
+        const feeAsset = feeAssets.length === 1 ? feeAssets[0] : undefined
+        const feeBreakdown =
+          feeAssets.length > 1
+            ? feeAssets.map((asset) => ({
+                asset,
+                amount: `${feeTotals.amounts[asset]}`,
+              }))
+            : undefined
+        // `fee_usd_equiv` is Kraken's own running total (§2.1) — passed
+        // through directly, never summed.
+        const feePaidUsd =
+          order.fee_usd_equiv !== undefined
+            ? `${order.fee_usd_equiv}`
+            : undefined
+
         return {
           creationTime: Date.parse(order.timestamp) || Date.now(),
           eventTime: Date.parse(order.timestamp) || Date.now(),
@@ -4509,6 +4626,10 @@ class UserConnector {
           totalTradeQuantity: order.cum_qty || order.vol_exec || '0',
           uniqueMessageId: `kraken${channel}${JSON.stringify(order)}`,
           liquidation: false,
+          feePaid,
+          feeAsset,
+          feeBreakdown,
+          feePaidUsd,
         }
       })
     }
