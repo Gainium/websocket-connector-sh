@@ -637,6 +637,23 @@ const krakenSpotFeeTotals = new ExpirableMap<
   { amounts: Record<string, number>; execIds: Set<string> }
 >(60 * 60 * 1000)
 
+// Last known symbol per Kraken spot order, keyed by exchange order id.
+// Kraken's v2 `executions` channel only names the pair on the DETAIL frames
+// (`pending_new`, `trade`, and the snapshot). The summary frames that announce
+// the terminal state — `exec_type` `filled`/`canceled`/`amended` — carry ids
+// and totals only, so without this the report that books the fill went out
+// with `symbol: ''`; app-sh then missed `getExchangeInfo` and priced the fill
+// through MathHelper.round's 2-decimal default (spec 007 §1.2b).
+// TTL is 24h rather than the 1h its two neighbours above use: those track a
+// fill/fee run, this has to outlive an order RESTING on the book — a GTC grid
+// order cancelled hours after placement never sends a second symbol-bearing
+// frame. One short string per entry, self-evicting.
+const KRAKEN_SPOT_SYMBOL_TTL_MS =
+  Number(process.env.KRAKEN_SPOT_SYMBOL_TTL_MS) || 24 * 60 * 60 * 1000
+const krakenSpotOrderSymbols = new ExpirableMap<string, string>(
+  KRAKEN_SPOT_SYMBOL_TTL_MS,
+)
+
 // Park-and-retry for the HL two-channel fill join (see hyperliquidFillPark.ts).
 // Grace window: how long a FILLED orderUpdate waits for its `userFills` to
 // arrive before falling back to a REST lookup. Size cap bounds the map.
@@ -4566,11 +4583,28 @@ class UserConnector {
 
     // Kraken spot executions format - has data array
     if (channel === 'executions' && msg.data && Array.isArray(msg.data)) {
+      // Learn every symbol this frame states BEFORE mapping any of it, so a
+      // frame that batches an order's detail and its terminal summary resolves
+      // whichever order they arrive in (spec 007 §5.3). Across frames the map
+      // does the same job over time: the detail frames come first for 90 of
+      // the 96 orders that produce both.
+      for (const entry of msg.data) {
+        const key = `${entry.order_id || entry.cl_ord_id || ''}`
+        if (key && entry.symbol) {
+          krakenSpotOrderSymbols.set(
+            key,
+            maps.wsnameToNormalized.get(entry.symbol) || entry.symbol,
+          )
+        }
+      }
       return msg.data.map((order: any) => {
-        const symbol =
-          maps.wsnameToNormalized.get(order.symbol) || order.symbol || ''
-
         const orderKey = `${order.order_id || order.cl_ord_id || ''}`
+        // A frame that names no pair inherits the one we last saw for this
+        // order; `''` only when the order is genuinely unknown to us.
+        const symbol = order.symbol
+          ? maps.wsnameToNormalized.get(order.symbol) || order.symbol
+          : (orderKey && krakenSpotOrderSymbols.get(orderKey)) || ''
+
         const execId = `${order.exec_id ?? ''}`
         const feeTotals = krakenSpotFeeTotals.get(orderKey) ?? {
           amounts: {} as Record<string, number>,
@@ -4615,7 +4649,15 @@ class UserConnector {
           newClientOrderId: order.cl_ord_id || order.order_id || '',
           orderId: order.order_id || '',
           orderTime: Date.parse(order.timestamp) || Date.now(),
-          orderStatus: this.mapKrakenOrderStatus(order.status),
+          // v2 `executions` names this `order_status`; `status` is the REST
+          // shape and is never present here, so reading it mapped 100% of
+          // spot executions to 'NEW' — a no-op for fills in app-sh, which is
+          // why they only landed later via the fill-failsafe REST sweep
+          // (spec 007 §1.2a). `?? order.status` keeps a v1-shaped payload
+          // working.
+          orderStatus: this.mapKrakenOrderStatus(
+            order.order_status ?? order.status,
+          ),
           orderType: order.order_type === 'limit' ? 'LIMIT' : 'MARKET',
           originalClientOrderId: order.cl_ord_id || order.order_id || '',
           price: order.avg_price || order.limit_price || order.price || '0',
@@ -4769,7 +4811,13 @@ class UserConnector {
 
     const statusLower = status.toLowerCase()
 
-    // Spot statuses: pending, open, closed, canceled, expired
+    // Spot (v2 `executions`.`order_status`): pending_new, new,
+    //   partially_filled, filled, canceled — `pending_new` is intentionally
+    //   left to the trailing `return 'NEW'`. The older `pending, open,
+    //   closed, expired` set below is Kraken's REST vocabulary, kept because
+    //   the same mapper is reachable from REST-shaped payloads; it is NOT
+    //   what the user stream sends, and mistaking one for the other is how
+    //   the call site came to read `order.status` (spec 007 §3).
     // Futures statuses: placed, untriggered, cancelled, filled, partially_filled
     if (
       statusLower === 'open' ||
