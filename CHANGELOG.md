@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.17] - 2026-09-15
+
+### Fixed
+
+- **Binance spot accounts using Ed25519 keys keep receiving order and balance updates after the connection to Binance reconnects.** A Binance WebSocket API user data stream belongs to its connection, so after a reconnect it has to be subscribed again; the Binance client library does that automatically, but the connector removed the library's reconnect listener while silencing its console logging. The connection came back and was logged as reconnected, yet no order or balance update arrived again until the account's stream was rebuilt — fills and cancels were only picked up by slower reconciliation, and grids could stop replacing filled orders. The library's resubscription is now left in place (its logging is turned off through its own option instead), bots are told to reconcile once the stream is actually subscribed again rather than two seconds before, and a resubscription queued for a stream that has since been closed is dropped. binanceUS and Binance futures streams are unaffected. Tests: `test/binanceWsApiResubscribe.test.ts`. Spec 008.
+
 ## [1.14.16] - 2026-09-08
 
 ### Added

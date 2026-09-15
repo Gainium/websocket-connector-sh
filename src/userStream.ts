@@ -3,8 +3,9 @@ import {
   krakenOpenOrderFill,
   krakenOpenOrdersRemovalIsFill,
 } from './utils/krakenOpenOrders'
-import { WebsocketAPIClient, WebsocketClient } from 'binance'
+import { WebsocketClient } from 'binance'
 import { withLosslessOrderIds } from './binance-custom'
+import { createBinanceWsApiUserStream } from './binance-custom/wsApiUserStream'
 import * as hl from '@nktkas/hyperliquid'
 import KucoinApi from '@gainium/kucoin-api'
 import Coinbase, {
@@ -1919,18 +1920,28 @@ class UserConnector {
           )
         } else {
           if (useWebsocketAPI) {
-            const wsAPI = new WebsocketAPIClient(
-              withLosslessOrderIds({
+            const wsApiStream = createBinanceWsApiUserStream(
+              {
                 api_key: api.key,
                 api_secret: api.secret,
-              }),
+              },
               wsLoggerOptions,
+              () => {
+                // The reconcile signal for a reconnect, sent only once the
+                // SDK's resubscribe is accepted — see the `reconnected`
+                // handler below for why it is not sent there on this path.
+                this.logger(
+                  `${id} user data stream resubscribed ${api.provider}`,
+                )
+                this.redis?.publish(
+                  `userStreamInfo${id}`,
+                  `Subscribed to user ${id}`,
+                )
+              },
             )
 
-            client = wsAPI.getWSClient()
-            startMethod = async () => {
-              await wsAPI.subscribeUserDataStream('mainWSAPI')
-            }
+            client = wsApiStream.client
+            startMethod = wsApiStream.start
             stopMethod = async () => {
               //@ts-ignore
               client.respawnUserDataStream = (...args: unknown[]) =>
@@ -1963,11 +1974,10 @@ class UserConnector {
         // (Legacy HMAC/RSA binance-spot keys never get here — they are
         // circuit-broken above, before a client is even constructed.)
 
-        client.removeAllListeners('open')
-        client.removeAllListeners('reconnecting')
-        client.removeAllListeners('reconnected')
-        client.removeAllListeners('authenticated')
-        client.removeAllListeners('exception')
+        // Never `removeAllListeners` on this client: it is brand new, so the
+        // only listeners it can have are the SDK's own, and the WS-API client's
+        // `reconnected` listener is the one that resubscribes the user data
+        // stream after a reconnect (spec 008).
         client.on('message', (data: any) => {
           if (
             [ExchangeEnum.binance, ExchangeEnum.binanceUS].includes(
@@ -1999,8 +2009,15 @@ class UserConnector {
           // Same reconcile signal bybit/bitget publish, and for the same
           // reason: a reconnect means we may have missed an executionReport
           // while the socket was down, and only the bots can find out. Scoped
-          // to this one account's room.
-          this.redis?.publish(`userStreamInfo${id}`, `Subscribed to user ${id}`)
+          // to this one account's room. On the WS-API path the stream is not
+          // back yet at this point — the SDK resubscribes ~2s later — so that
+          // path publishes from its `onResubscribed` callback instead.
+          if (!useWebsocketAPI) {
+            this.redis?.publish(
+              `userStreamInfo${id}`,
+              `Subscribed to user ${id}`,
+            )
+          }
           this.noteReconnect(id, api.provider)
         })
         client.on('close', (data) => {
