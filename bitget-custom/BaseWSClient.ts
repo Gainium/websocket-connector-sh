@@ -542,8 +542,14 @@ export abstract class BaseWebsocketClient<
       const emittableEvent = { ...msg, wsKey }
 
       if (typeof msg === 'object') {
-        if (typeof msg['code'] === 'number') {
-          if (msg.event === 'login' && msg.code === 0) {
+        // v2 answers a login with `code: 0`; the unified-account (v3) docs
+        // document `code: "0"`. Accept either, or a v3 client never
+        // authenticates and never subscribes its private topics.
+        if (
+          typeof msg['code'] === 'number' ||
+          typeof msg['code'] === 'string'
+        ) {
+          if (msg.event === 'login' && `${msg.code}` === '0') {
             this.logger.info('Successfully authenticated WS client', {
               ...LOGGER_CATEGORY,
               wsKey,

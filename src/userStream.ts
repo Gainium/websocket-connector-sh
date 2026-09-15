@@ -16,6 +16,7 @@ import Coinbase, {
   WebsocketUserMessage,
 } from 'coinbase-advanced-node'
 import crypto from 'crypto'
+import EventEmitter from 'events'
 import { CategoryV5 } from 'bybit-api'
 import { WebsocketClient as BybitClient } from '../bybit-custom/websocket-client'
 import { WebsocketClient as OKXClient, WsChannelArgInstType } from 'okx-api'
@@ -121,6 +122,11 @@ import {
 } from './utils/hyperliquidFillPark'
 import { exchangeUrl } from './utils/env'
 import axios from 'axios'
+import { WebsocketClientUta as BitgetUtaClient } from '../bitget-custom/websocket-client-uta'
+import {
+  BitgetAccountMode,
+  detectBitgetAccountMode,
+} from './utils/bitgetAccountMode'
 
 const mutex = new IdMutex()
 
@@ -406,6 +412,35 @@ type BitgetSpotOrder = {
     fee: string
   }[]
   enterPointSource: string
+}
+
+/** A Unified Trading Account (v3) `order` push — one shape for every category. */
+type BitgetUtaOrder = {
+  category: string
+  symbol: string
+  orderId: string
+  clientOid: string
+  price: string
+  qty: string
+  orderType: string
+  side: string
+  cumExecQty: string
+  cumExecValue: string
+  avgPrice: string
+  orderStatus: string
+  feeDetail?: { feeCoin: string; fee: string }[]
+  createdTime: string
+  updatedTime: string
+}
+
+/** A Unified Trading Account (v3) `account` push. */
+type BitgetUtaAccount = {
+  coin?: {
+    coin: string
+    balance: string
+    available: string
+    locked?: string
+  }[]
 }
 
 type BitgetSpotBalance = {
@@ -1628,10 +1663,11 @@ class UserConnector {
   }
 
   @IdMute(mutex, () => `closeStreamBitget`)
-  private async closeBitgetConnection(client: BitgetClient) {
+  private async closeBitgetConnection(client: BitgetClient | BitgetUtaClient) {
     client.closeAll(true)
-    client.on('exception', () => null)
-    client.on('update', () => null)
+    const events = client as unknown as EventEmitter
+    events.on('exception', () => null)
+    events.on('update', () => null)
   }
   /**
    * User-stream flap detector. A single reconnect is healthy auto-recovery;
@@ -2981,104 +3017,159 @@ class UserConnector {
       ) {
         /** Open stream and set callback  */
         try {
-          /** New exchange instance */
-          const client = new BitgetClient(
-            {
-              apiKey: api.key,
-              apiPass: api.passphrase,
-              apiSecret: api.secret,
-            },
-            {
-              silly: () => null,
-              // Unlike the `msg?.[0]` adapters below, these two serialize every
-              // argument — including the `{ wsMessage, wsKey, exception }`
-              // context the SDK passes on a send failure. Bitget does not call
-              // these levels today, but the shape is the one that leaks, so
-              // redact rather than rely on that staying true across a bump.
-              debug: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bitget debug log ${safeStringify({
-                    msg,
-                  })} ${api.provider}`,
-                ),
-              notice: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bitget notice log ${safeStringify({
-                    msg,
-                  })} ${api.provider}`,
-                ),
-              info: (...msg) => {
-                if (msg[0] === 'Websocket reconnected') {
-                  this.redis?.publish(
-                    `userStreamInfo${id}`,
-                    `Subscribed to user ${id}`,
-                  )
-                }
-                this.logger(
-                  `${id} ${userId} bitget info log ${JSON.stringify({
-                    msg: msg?.[0],
-                  })} ${api.provider}`,
+          // A Unified Trading Account publishes its orders and balances only
+          // on the v3 private socket; the v2 channels stay silent for it.
+          const accountMode = await this.bitgetAccountMode(api)
+          if (
+            accountMode === 'uta' &&
+            api.provider === ExchangeEnum.bitgetCoinm
+          ) {
+            throw new Error(
+              `${id} ${userId} Bitget COIN-M futures are not supported for Unified Trading Accounts`,
+            )
+          }
+          const credentials = {
+            apiKey: api.key,
+            apiPass: api.passphrase,
+            apiSecret: api.secret,
+          }
+          const bitgetLogger = {
+            silly: () => null,
+            // Unlike the `msg?.[0]` adapters below, these two serialize every
+            // argument — including the `{ wsMessage, wsKey, exception }`
+            // context the SDK passes on a send failure. Bitget does not call
+            // these levels today, but the shape is the one that leaks, so
+            // redact rather than rely on that staying true across a bump.
+            debug: (...msg: unknown[]) =>
+              this.logger(
+                `${id} ${userId} bitget debug log ${safeStringify({
+                  msg,
+                })} ${api.provider}`,
+              ),
+            notice: (...msg: unknown[]) =>
+              this.logger(
+                `${id} ${userId} bitget notice log ${safeStringify({
+                  msg,
+                })} ${api.provider}`,
+              ),
+            info: (...msg: unknown[]) => {
+              if (msg[0] === 'Websocket reconnected') {
+                this.redis?.publish(
+                  `userStreamInfo${id}`,
+                  `Subscribed to user ${id}`,
                 )
-              },
-              warning: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bitget warning log ${JSON.stringify({
-                    msg: msg?.[0],
-                  })} ${api.provider}`,
-                ),
-              error: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bitget error log ${JSON.stringify({
-                    msg: msg?.[0],
-                  })} ${api.provider}`,
-                ),
+              }
+              this.logger(
+                `${id} ${userId} bitget info log ${JSON.stringify({
+                  msg: msg?.[0],
+                })} ${api.provider}`,
+              )
             },
-          )
+            warning: (...msg: unknown[]) =>
+              this.logger(
+                `${id} ${userId} bitget warning log ${JSON.stringify({
+                  msg: msg?.[0],
+                })} ${api.provider}`,
+              ),
+            error: (...msg: unknown[]) =>
+              this.logger(
+                `${id} ${userId} bitget error log ${JSON.stringify({
+                  msg: msg?.[0],
+                })} ${api.provider}`,
+              ),
+          }
+          const client: BitgetClient | BitgetUtaClient =
+            accountMode === 'uta'
+              ? new BitgetUtaClient(credentials, bitgetLogger)
+              : new BitgetClient(credentials, bitgetLogger)
+          // Both are the same emitter underneath; the lifecycle handlers
+          // below only need `on`/`once`.
+          const events = client as unknown as EventEmitter
           const categories: BitgetInstTypeV2[] =
             api.provider === ExchangeEnum.bitget
               ? ['SPOT']
               : api.provider === ExchangeEnum.bitgetUsdm
                 ? ['USDT-FUTURES', 'USDC-FUTURES']
                 : ['COIN-FUTURES']
-          for (const category of categories) {
-            client.subscribeTopic(category, 'orders', 'default')
+          if (client instanceof BitgetUtaClient) {
+            this.logger(
+              `${id} ${userId} Bitget Unified Trading Account, using the v3 private stream ${api.provider}`,
+            )
+            client.subscribeTopic('order')
             await sleep(100)
-            client.subscribeTopic(category, 'account', 'default')
-            await sleep(100)
-          }
-          client.on('update', (msg) => {
-            if (!categories.includes(msg.arg.instType)) {
-              return
-            }
-            if (
-              (msg.action === 'snapshot' || msg.action === 'update') &&
-              msg.arg.channel === 'orders'
-            ) {
-              const orders = this.prepareBitgetOrderMsg(msg.data)
-              orders.forEach((o) => this.userStreamEvent(id, o))
-            }
-            if (
-              (msg.action === 'snapshot' || msg.action === 'update') &&
-              msg.arg.channel === 'account'
-            ) {
-              const convertedMessage =
-                msg.arg.instType === 'SPOT'
-                  ? this.prepareBitgetSpotOutboundAccountInfo(
-                      msg.data,
+            client.subscribeTopic('account')
+            events.on(
+              'update',
+              (msg: {
+                action?: string
+                arg?: { topic?: string }
+                data: unknown[]
+                ts: number
+              }) => {
+                if (msg.action !== 'snapshot' && msg.action !== 'update') {
+                  return
+                }
+                if (msg.arg?.topic === 'order') {
+                  this.prepareBitgetUtaOrderMsg(
+                    msg.data as BitgetUtaOrder[],
+                    api.provider,
+                  ).forEach((o) => this.userStreamEvent(id, o))
+                }
+                if (msg.arg?.topic === 'account') {
+                  const convertedMessage =
+                    this.prepareBitgetUtaOutboundAccountInfo(
+                      msg.data as BitgetUtaAccount[],
                       msg.ts,
                       uuid || userId,
+                      api.provider,
                     )
-                  : this.prepareBitgetFuturesOutboundAccountInfo(
-                      msg.data,
-                      msg.ts,
-                      uuid || userId,
-                    )
-              if (convertedMessage) {
-                this.userStreamEvent(id, convertedMessage)
+                  if (convertedMessage) {
+                    this.userStreamEvent(id, convertedMessage)
+                  }
+                }
+              },
+            )
+          } else {
+            for (const category of categories) {
+              client.subscribeTopic(category, 'orders', 'default')
+              await sleep(100)
+              client.subscribeTopic(category, 'account', 'default')
+              await sleep(100)
+            }
+            client.on('update', (msg) => {
+              if (!categories.includes(msg.arg.instType)) {
+                return
               }
-            }
-          })
-          client.on('reconnected', () => {
+              if (
+                (msg.action === 'snapshot' || msg.action === 'update') &&
+                msg.arg.channel === 'orders'
+              ) {
+                const orders = this.prepareBitgetOrderMsg(msg.data)
+                orders.forEach((o) => this.userStreamEvent(id, o))
+              }
+              if (
+                (msg.action === 'snapshot' || msg.action === 'update') &&
+                msg.arg.channel === 'account'
+              ) {
+                const convertedMessage =
+                  msg.arg.instType === 'SPOT'
+                    ? this.prepareBitgetSpotOutboundAccountInfo(
+                        msg.data,
+                        msg.ts,
+                        uuid || userId,
+                      )
+                    : this.prepareBitgetFuturesOutboundAccountInfo(
+                        msg.data,
+                        msg.ts,
+                        uuid || userId,
+                      )
+                if (convertedMessage) {
+                  this.userStreamEvent(id, convertedMessage)
+                }
+              }
+            })
+          }
+          events.on('reconnected', () => {
             this.redis?.publish(
               `userStreamInfo${id}`,
               `Subscribed to user ${id}`,
@@ -3088,7 +3179,7 @@ class UserConnector {
           const close = () => {
             this.closeBitgetConnection(client)
           }
-          client.on('exception', async (error: Error | string) => {
+          events.on('exception', async (error: Error | string) => {
             const message = typeof error !== 'string' ? error.message : error
             try {
               this.logger(
@@ -3139,15 +3230,15 @@ class UserConnector {
               )
               reject()
             }, 60 * 1000)
-            client.once('open', () => {
+            events.once('open', () => {
               clearTimeout(timer)
               resolve()
             })
-            client.once('exception', () => {
+            events.once('exception', () => {
               clearTimeout(timer)
               reject()
             })
-            client.once('error', () => {
+            events.once('error', () => {
               clearTimeout(timer)
               reject()
             })
@@ -4551,6 +4642,125 @@ class UserConnector {
       eventType: 'outboundAccountPosition',
       lastAccountUpdate: 0,
       uniqueMessageId: `outboundAccountPosition${userId}${JSON.stringify(balances)}bitget`,
+    }
+  }
+
+  /**
+   * Bitget Classic vs Unified Trading Account for this key, asked a few times
+   * before giving up: an undetermined key falls back to the classic stream,
+   * which for a unified account would publish nothing at all.
+   */
+  private async bitgetAccountMode(api: {
+    key: string
+    secret: string
+    passphrase?: string
+  }): Promise<BitgetAccountMode> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const mode = await detectBitgetAccountMode(api)
+      if (mode) {
+        return mode
+      }
+      await sleep(2000)
+    }
+    this.logger(
+      'Bitget account mode undetermined after 3 attempts, using the classic stream',
+      true,
+    )
+    return 'classic'
+  }
+
+  private prepareBitgetUtaOrderMsg(
+    msg: BitgetUtaOrder[],
+    provider: ExchangeEnum,
+  ): ExecutionReport[] {
+    // One unified socket carries every category; a connection only reports
+    // the ones its exchange trades.
+    const categories =
+      provider === ExchangeEnum.bitget
+        ? ['spot']
+        : ['usdt-futures', 'usdc-futures']
+    return (msg ?? [])
+      .filter((data) =>
+        categories.includes(`${data.category ?? ''}`.toLowerCase()),
+      )
+      .map((data) => {
+        const primaryFeeLeg = data.feeDetail?.length
+          ? (data.feeDetail.find(
+              (d) =>
+                data.symbol.startsWith(d.feeCoin) ||
+                data.symbol.endsWith(d.feeCoin),
+            ) ?? data.feeDetail[0])
+          : undefined
+        return {
+          creationTime: parseInt(data.createdTime),
+          eventTime: parseInt(data.updatedTime),
+          eventType: 'executionReport',
+          newClientOrderId: data.clientOid,
+          orderId: data.orderId,
+          orderTime: parseInt(data.updatedTime),
+          orderStatus:
+            data.orderStatus === 'live' || data.orderStatus === 'new'
+              ? 'NEW'
+              : data.orderStatus === 'partially_filled'
+                ? 'PARTIALLY_FILLED'
+                : data.orderStatus === 'filled'
+                  ? 'FILLED'
+                  : 'CANCELED',
+          orderType: data.orderType === 'limit' ? 'LIMIT' : 'MARKET',
+          originalClientOrderId: data.clientOid,
+          price: `${+data.avgPrice || +data.price}`,
+          // Filled base quantity, as the classic mapper reports it — `qty` is
+          // the quote amount on a spot market buy.
+          quantity: data.cumExecQty,
+          side: data.side === 'buy' ? 'BUY' : 'SELL',
+          symbol: data.symbol,
+          totalQuoteTradeQuantity: data.cumExecValue || '0',
+          totalTradeQuantity: data.cumExecQty,
+          uniqueMessageId: `BitgetUtaexecutionReport${JSON.stringify(data)}`,
+          feeBreakdown: data.feeDetail?.map((d) => ({
+            asset: d.feeCoin,
+            amount: d.fee,
+          })),
+          feePaid: primaryFeeLeg?.fee,
+          feeAsset: primaryFeeLeg?.feeCoin,
+        } as ExecutionReport
+      })
+  }
+
+  private prepareBitgetUtaOutboundAccountInfo(
+    msg: BitgetUtaAccount[],
+    time: number,
+    userId: string,
+    provider: ExchangeEnum,
+  ): OutboundAccountPosition | undefined {
+    const coins = (msg ?? []).flatMap((m) => m.coin ?? [])
+    // `free + locked` is the coin's balance; whatever is not available is
+    // held by open orders or position margin.
+    const balances = coins
+      .filter(
+        (c) =>
+          provider === ExchangeEnum.bitget ||
+          c.coin === 'USDT' ||
+          c.coin === 'USDC',
+      )
+      .map((c) => {
+        const balance = +c.balance || 0
+        const free = Math.min(Math.max(+c.available || 0, 0), balance)
+        return {
+          asset: c.coin,
+          free: `${free}`,
+          locked: `${balance - free}`,
+        }
+      })
+    if (!balances.length) {
+      return undefined
+    }
+    return {
+      balances,
+      eventTime: time,
+      eventType: 'outboundAccountPosition',
+      lastAccountUpdate: 0,
+      uniqueMessageId: `outboundAccountPosition${userId}${JSON.stringify(balances)}bitgetUta`,
     }
   }
 
