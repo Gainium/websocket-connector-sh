@@ -5,16 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.15.0] - 2026-09-15
+## [1.15.0] - 2026-09-18
 
 ### Added
 
 - **Bitget Unified Trading Accounts receive order and balance updates.** Bitget runs two account systems and publishes a unified account's orders and balances only on its unified private stream — the classic channels the connector subscribed to never carry them, so a unified account's fills and balance changes were only found by slower reconciliation. The connector now checks which system each API key's account is in before opening its stream and subscribes to the matching one. Classic accounts are unaffected. A unified account's COIN-M futures stream is not opened: that product is not supported for unified accounts yet. Tests: `test/bitgetUtaStream.test.ts`.
-## [1.14.21] - 2026-09-18
+- **Bitget Reality stock tokens stream live candles.** Bitget accepts a candle subscription for these pairs on the channels the connector uses and then never sends anything on it; their candles are only published on Bitget's newer market-data stream. Reality token candles at 1m, 5m, 15m, 1h and 4h are now streamed from there and published on the same channels as every other pair. Other intervals are not streamed for these pairs (Bitget has no matching candle), and their closed candles keep arriving through the regular history fill.
 
 ### Fixed
 
-- **A Binance US candle subscription no longer fails permanently, and a single unreachable Binance market can no longer interrupt the others.** Candle subscriptions are multiplexed — up to two hundred streams share one connection, requested through the exchange's combined-stream address. The Binance US branch was the only one that did not spell that address out: it asked the exchange library for the connection's own address and appended the stream list to it. That address is the single-stream one the Binance US ticker connection needs, and the library appends a further path segment to it, so the result was a hybrid path the venue does not serve and answered with a not-found response. The Binance US candle connection therefore never opened once, for as long as that venue has been served. It is now built the same way as the Binance spot, COIN-M and USD-M branches beside it. Separately, the recovery that ran when any Binance connection reported a fault rebuilt all eight of them — spot, COIN-M, USD-M and US, tickers and candles alike — and re-subscribed everything. A market that could never connect therefore tore down the healthy international price and candle feeds each time it retried, and each teardown produced further faults that re-entered the same recovery, so the cycle sustained itself and closed-candle delivery was repeatedly interrupted for every Binance pair rather than only US ones. Recovery is now scoped to the connection that actually reported the fault and re-subscribes only that one, re-checking the same venue and stream-type switches the startup path applies; repeat faults from one connection while its restart is already in flight are coalesced rather than compounded, matching the equivalent guard on Bybit. Tests: `test/binanceUsCandleUrlRestartStorm.test.ts`. Spec 011.
+- **Bitget candle subscriptions are restored after the price connector restarts its Bitget streams.** The restore step read another exchange's subscription list, so Bitget candle streams stayed closed until the subscribing service asked again.
 
 ## [1.14.20] - 2026-09-17
 

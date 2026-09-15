@@ -11,6 +11,11 @@ import {
   WsTopicSubscribeEventArgsV2,
 } from 'bitget-api'
 import { WebsocketClientV2 as WSClient } from '../../bitget-custom/websocket-client-v2'
+import { WebsocketClientV3Public } from '../../bitget-custom/websocket-client-v3-public'
+import {
+  bitgetRealityKlineInterval,
+  getBitgetRealitySymbols,
+} from '../utils/bitgetReality'
 import getAllExchangeInfo from '../utils/exchange'
 import CommonConnector from './common'
 
@@ -102,6 +107,17 @@ class BitgetConnector extends CommonConnector {
       id: 0,
     },
   ]
+  /**
+   * Reality stock token candles. v2 accepts `candle*` subscriptions for them
+   * and never pushes; the v3 `kline` topic does. See utils/bitgetReality.ts.
+   */
+  private bitgetClientCandleReality: {
+    client: WebsocketClientV3Public
+    subs: number
+    id: number
+  }[] = [{ client: this.getBitgetRealityClient(), subs: 0, id: 0 }]
+  /** `${symbol}|${v3 interval}` → the v2 channel name main-app subscribed. */
+  private realityChannels: Map<string, string> = new Map()
   private timer: Map<Market, NodeJS.Timeout | null> = new Map()
   private inQueueCandles: Map<Market, Map<string, MapValue>> = new Map()
 
@@ -145,6 +161,58 @@ class BitgetConnector extends CommonConnector {
         )
       }
     }
+  }
+
+  private bitgetRealityCandleCb(msg: any) {
+    if (msg.arg?.topic !== 'kline' || msg.action !== 'update') {
+      return
+    }
+    const channel = this.realityChannels.get(
+      `${msg.arg.symbol}|${msg.arg.interval}`,
+    )
+    const candle = msg.data?.[msg.data.length - 1]
+    if (!channel || !candle) {
+      return
+    }
+    // Published on the v2 channel name, so main-app's subscription for the
+    // pair is unchanged. `turnover` is the quote volume, as v2's is.
+    this.cbWsTrade(
+      {
+        e: 'kline',
+        E: msg.ts,
+        s: msg.arg.symbol,
+        k: {
+          o: candle.open,
+          h: candle.high,
+          l: candle.low,
+          c: candle.close,
+          v: candle.turnover,
+          i: channel,
+          t: +candle.start,
+        },
+      },
+      ExchangeEnum.bitget,
+    )
+  }
+
+  private getBitgetRealityClient(current?: WebsocketClientV3Public) {
+    if (current) {
+      current.removeAllListeners()
+      current.closeAll(false)
+      current.on('exception', () => null)
+    }
+    const client = new WebsocketClientV3Public(
+      { reconnectTimeout: this.wsReconnect },
+      obsoleteWsLoggerOptions,
+    )
+    client.on('update', (msg) => this.bitgetRealityCandleCb(msg))
+    client.on('open', this.commonWsOpenCb(ExchangeEnum.bitget, 'candle'))
+    client.on('exception', this.bitgetRestartCb(ExchangeEnum.bitget))
+    client.on(
+      'reconnected',
+      this.commonWsReconnectCb(ExchangeEnum.bitget, 'candle'),
+    )
+    return client
   }
 
   private bitgetGetCallback(e: ExchangeEnum, type: StreamType) {
@@ -270,6 +338,14 @@ class BitgetConnector extends CommonConnector {
       subs: 0,
       id: bg.id,
     }))
+    this.bitgetClientCandleReality = this.bitgetClientCandleReality.map(
+      (bg) => ({
+        client: this.getBitgetRealityClient(bg.client),
+        subs: 0,
+        id: bg.id,
+      }),
+    )
+    this.realityChannels.clear()
   }
 
   private bitgetRestartCb(e?: ExchangeEnum) {
@@ -444,7 +520,7 @@ class BitgetConnector extends CommonConnector {
   private async reconnectBitgetCandleStream() {
     /** spot */
     const allSpot =
-      this.subscribedCandlesMap.get(ExchangeEnum.bybit) ?? new Set()
+      this.subscribedCandlesMap.get(ExchangeEnum.bitget) ?? new Set()
     const storeSpot: string[][] = []
     allSpot.forEach((s) => {
       if (s.indexOf('tickers') === -1) {
@@ -456,7 +532,7 @@ class BitgetConnector extends CommonConnector {
     )
     /** usdm */
     const allUsdm =
-      this.subscribedCandlesMap.get(ExchangeEnum.bybitUsdm) ?? new Set()
+      this.subscribedCandlesMap.get(ExchangeEnum.bitgetUsdm) ?? new Set()
     const storeUsdm: string[][] = []
     allUsdm.forEach((s) => {
       if (s.indexOf('tickers') === -1) {
@@ -468,7 +544,7 @@ class BitgetConnector extends CommonConnector {
     )
     /** coinm */
     const allCoinm =
-      this.subscribedCandlesMap.get(ExchangeEnum.bybitCoinm) ?? new Set()
+      this.subscribedCandlesMap.get(ExchangeEnum.bitgetCoinm) ?? new Set()
     const storeCoinm: string[][] = []
     allCoinm.forEach((s) => {
       if (s.indexOf('tickers') === -1) {
@@ -501,6 +577,14 @@ class BitgetConnector extends CommonConnector {
           : demo
             ? 'SCOIN-FUTURES'
             : 'COIN-FUTURES'
+    if (
+      !timer &&
+      market === 'spot' &&
+      (await getBitgetRealitySymbols()).has(symbol)
+    ) {
+      this.subscribeBitgetRealityCandle(symbol, interval)
+      return
+    }
     const t = this.timer.get(market)
     if (t) {
       clearTimeout(t)
@@ -621,6 +705,43 @@ class BitgetConnector extends CommonConnector {
         }
       }
     }
+  }
+
+  private subscribeBitgetRealityCandle(symbol: string, channel: string) {
+    const interval = bitgetRealityKlineInterval(channel)
+    if (!interval) {
+      logger.info(
+        `Bitget Reality ${symbol} has no ${channel} stream; closed candles come from the REST back-fill`,
+      )
+      return
+    }
+    const key = `${symbol}|${interval}`
+    if (this.realityChannels.has(key)) {
+      return
+    }
+    this.realityChannels.set(key, channel)
+    if (!this.mainData[ExchangeEnum.bitget]) {
+      this.mainData[ExchangeEnum.bitget] = this.base
+    }
+    const topic = {
+      instType: 'spot' as const,
+      topic: 'kline' as const,
+      symbol,
+      interval,
+    }
+    const cl = this.bitgetClientCandleReality
+      .filter((c) => c.subs < maxSubs)
+      .sort((a, b) => b.subs - a.subs)[0]
+    if (cl) {
+      cl.client.subscribe(topic)
+      cl.subs += 1
+      return
+    }
+    const client = this.getBitgetRealityClient()
+    client.subscribe(topic)
+    const last =
+      this.bitgetClientCandleReality.sort((a, b) => b.id - a.id)[0]?.id ?? 0
+    this.bitgetClientCandleReality.push({ client, subs: 1, id: last + 1 })
   }
 
   override stop() {
