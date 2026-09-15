@@ -1958,8 +1958,10 @@ class UserConnector {
               // and raised `stream_flap` (bug #433). Closing the connection IS
               // the unsubscribe here: a WS-API user data stream is bound to its
               // connection, and `close()` marks the socket CLOSING so the SDK
-              // neither reconnects nor resubscribes.
-              client.closeAll(false)
+              // neither reconnects nor resubscribes. `stop()` also no-ops a
+              // resubscribe the SDK queued before the teardown, which would
+              // otherwise re-open that socket.
+              wsApiStream.stop()
             }
           } else {
             client = new WebsocketClient(
