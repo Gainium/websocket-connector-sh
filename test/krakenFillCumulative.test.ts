@@ -54,6 +54,10 @@ function connector() {
 const emit = (uc: any, fill: unknown) =>
   uc.prepareKrakenOrderMsg({ fills: [fill] }, 'fills', ExchangeEnum.krakenUsdm)
 
+/** One WS message carrying a whole batch, exactly as Kraken delivers it. */
+const emitBatch = (uc: any, fills: unknown[]) =>
+  uc.prepareKrakenOrderMsg({ fills }, 'fills', ExchangeEnum.krakenUsdm)
+
 /**
  * The accumulator is module-level on purpose — in production ONE process sees
  * every fill of an order, and it must survive across `prepareKrakenOrderMsg`
@@ -107,6 +111,121 @@ test('fills of different orders are accumulated independently', async () => {
 
   assert.equal(+otherReport.totalTradeQuantity, 0.037)
   assert.equal(+second.totalTradeQuantity, 0.07)
+})
+
+/**
+ * Bug #769 (spec 009). A `fills` message can carry the WHOLE batch, delivered
+ * NEWEST-FIRST. Order D-BO-lDG9nW4K2gWCFBHnoyMggTj5oIHmgc: a LIMIT BUY of
+ * 0.0955 BTC-USD @78460 taker-filled in 4 chunks, all stamped 15:00:02.492Z.
+ *
+ * The array order below is reconstructed from the relay's OWN emitted
+ * cumulative totals in the prod log (0.0139 / 0.0235 / 0.0551 / 0.0955):
+ * emitted cumulative #k == 0.0955 - remaining_order_qty of fill #k, which is
+ * self-consistent only for a strictly reverse-chronological batch. `time` is
+ * identical across all four, so `seq` is what actually orders them.
+ *
+ * Mapping in array order emitted FILLED at 0.0139 — 6.9x short — and app-sh
+ * treated that as final, sent a market buy for the 0.0816 "shortfall" Kraken
+ * had already filled, and sized the TP from 0.0139. 0.1632 BTC ended up held
+ * with no deal, no TP and no SL.
+ */
+const BTC_BATCH_NEWEST_FIRST = (() => {
+  const base = {
+    instrument: 'PF_XBTUSD',
+    time: 1789045202492,
+    price: 78460,
+    buy: true,
+    order_id: 'batch-a1b2c3',
+    cli_ord_id: 'D-BO-lDG9nW4K2gWCFBHnoyMggTj5oIHmgc',
+    fill_type: 'taker',
+    order_type: 'limit',
+  }
+  return [
+    { ...base, qty: 0.0139, remaining_order_qty: 0, fill_id: 'b-f4', seq: 4 },
+    {
+      ...base,
+      qty: 0.0096,
+      remaining_order_qty: 0.0139,
+      fill_id: 'b-f3',
+      seq: 3,
+    },
+    {
+      ...base,
+      qty: 0.0316,
+      remaining_order_qty: 0.0235,
+      fill_id: 'b-f2',
+      seq: 2,
+    },
+    {
+      ...base,
+      qty: 0.0404,
+      remaining_order_qty: 0.0551,
+      fill_id: 'b-f1',
+      seq: 1,
+    },
+  ]
+})()
+
+test('a multi-fill batch delivered newest-first reports FILLED last, at the full quantity', async () => {
+  const uc = connector()
+  uc.getKrakenMaps = async () => ({
+    wsnameToNormalized: new Map([['PF_XBTUSD', 'BTC-USD']]),
+  })
+
+  const reports = await emitBatch(uc, BTC_BATCH_NEWEST_FIRST)
+  assert.equal(reports.length, 4)
+
+  // §1.1b — exactly one FILLED, and it is the LAST report emitted. The bug:
+  // reports[0] was FILLED at 0.0139 and the rest were PARTIALLY_FILLED.
+  assert.deepEqual(
+    reports.map((r: any) => r.orderStatus),
+    ['PARTIALLY_FILLED', 'PARTIALLY_FILLED', 'PARTIALLY_FILLED', 'FILLED'],
+  )
+  assert.ok(Math.abs(+reports[3].totalTradeQuantity - 0.0955) < 1e-9)
+
+  // §1.1a — cumulative, non-decreasing, ending at the full size.
+  const cumulative = reports.map((r: any) => +r.totalTradeQuantity)
+  for (let i = 1; i < cumulative.length; i++) {
+    assert.ok(
+      cumulative[i] >= cumulative[i - 1],
+      `cumulative went backwards: ${cumulative[i - 1]} -> ${cumulative[i]}`,
+    )
+  }
+
+  // §1.1c — the order's original size, on EVERY report. The bug drifted this
+  // to 0.1506 for an order of 0.0955.
+  for (const r of reports) {
+    assert.ok(
+      Math.abs(+r.quantity - 0.0955) < 1e-9,
+      `quantity should be the 0.0955 placed, got ${r.quantity}`,
+    )
+  }
+
+  // Cumulative notional follows the same chronological order, so the VWAP main
+  // -app derives from quote/base is the real one.
+  assert.ok(
+    Math.abs(+reports[3].totalQuoteTradeQuantity - 0.0955 * 78460) < 1e-6,
+  )
+})
+
+test('a batch already in chronological order is mapped unchanged', async () => {
+  const uc = connector()
+  uc.getKrakenMaps = async () => ({
+    wsnameToNormalized: new Map([['PF_XBTUSD', 'BTC-USD']]),
+  })
+
+  const chronological = [...BTC_BATCH_NEWEST_FIRST].reverse().map((f) => ({
+    ...f,
+    order_id: 'chrono-a1b2c3',
+    fill_id: `c-${f.fill_id}`,
+  }))
+
+  const reports = await emitBatch(uc, chronological)
+  assert.deepEqual(
+    reports.map((r: any) => r.orderStatus),
+    ['PARTIALLY_FILLED', 'PARTIALLY_FILLED', 'PARTIALLY_FILLED', 'FILLED'],
+  )
+  assert.ok(Math.abs(+reports[3].totalTradeQuantity - 0.0955) < 1e-9)
 })
 
 test('a single-fill order is unchanged', async () => {

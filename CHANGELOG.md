@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.19] - 2026-09-15
+
+### Fixed
+
+- **A Kraken Futures order that fills in several chunks at once is no longer reported as complete at a fraction of its size.** Kraken can deliver every chunk of one execution in a single `fills` message, newest chunk first. The connector mapped that batch in the order it arrived, so the chunk that closed the order became the *first* report — announcing the order as fully filled while carrying the smallest running total, with the true totals following behind it as partial fills the bot engine had already stopped listening for. A bot therefore saw a large shortfall on an order the exchange had filled in full, bought that shortfall a second time, and then sized its take-profit from the understated amount: the extra quantity stayed on the exchange with no take-profit and no stop-loss, and the deal closed without it. Fills in a batch are now ordered by execution time — and by sequence number, since the chunks of one taker fill routinely share a millisecond — before the running totals are summed, and an order's status and original size are derived from the cumulative executed quantity paired with the quantity still open, the same arithmetic the `open_orders` feed already uses, instead of from one chunk's `remaining_order_qty`. As a side effect, a fill that omits `remaining_order_qty` now completes its order instead of leaving it partially filled indefinitely. Kraken spot and all other exchanges are unaffected. Tests: `test/krakenFillCumulative.test.ts`. Spec 009.
+
 ## [1.14.18] - 2026-09-15
 
 ### Fixed

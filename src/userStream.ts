@@ -625,6 +625,29 @@ const krakenFillTotals = new ExpirableMap<
   { qty: number; cost: number; fillIds: Set<string> }
 >(60 * 60 * 1000)
 
+/**
+ * One `fills` message can carry a whole batch, and Kraken delivers it
+ * NEWEST-FIRST. The accumulator above only produces the CUMULATIVE executed
+ * quantity if it sums the batch in the order the chunks actually executed, so
+ * the batch is ordered before it is mapped (spec 009 §4.1).
+ *
+ * Mapping in delivery order put the chunk that closed the order first, so the
+ * relay emitted FILLED carrying the SMALLEST running total and the true totals
+ * behind it as PARTIALLY_FILLED — which app-sh discards as `already processed`.
+ *
+ * `seq` is the tiebreak, not the primary key: the chunks of one taker fill
+ * commonly share a millisecond, but `seq` is a per-connection counter that
+ * resets across reconnects. Missing values compare equal and `sort` is stable,
+ * so a batch Kraken gave us no ordering for keeps its delivery order. Returns
+ * a copy — the caller's message is not ours to reorder.
+ */
+const chronologicalKrakenFills = <T extends { time?: number; seq?: number }>(
+  fills: T[],
+): T[] =>
+  [...fills].sort(
+    (a, b) => (a.time || 0) - (b.time || 0) || (a.seq || 0) - (b.seq || 0),
+  )
+
 // Running per-order fee totals for Kraken spot, keyed by exchange order id.
 // The v2 `executions` channel's `fees[]` is treated as per-fill (spec 003
 // §2.1/§3.1 — the docs don't say whether it accumulates, so under-forwarding
@@ -4697,7 +4720,7 @@ class UserConnector {
 
     // Kraken futures fills format
     if (channel === 'fills' && msg.fills && Array.isArray(msg.fills)) {
-      return msg.fills.map((fill: any) => {
+      return chronologicalKrakenFills(msg.fills).map((fill: any) => {
         const symbol =
           maps.wsnameToNormalized.get(fill.instrument) || fill.instrument || ''
         // Kraken's `fills` feed reports THIS fill only (`qty`/`price`), but
@@ -4726,6 +4749,17 @@ class UserConnector {
           totals.cost += fillQty * fillPrice
         }
         krakenFillTotals.set(orderKey, totals)
+        // Status and original size from the CUMULATIVE executed quantity paired
+        // with what is still open — the same arithmetic the `open_orders` feed
+        // below uses, so one order cannot be read two ways (spec 009 §4.2).
+        // Reading `fill.remaining_order_qty === 0` directly asked a single fill
+        // where it sat in a sequence this branch did not know, and a fill that
+        // omits the field failed the identity check and left the order
+        // PARTIALLY_FILLED at its full quantity forever.
+        const { status, total } = krakenOpenOrderFill({
+          qty: remaining,
+          filled: totals.qty,
+        })
         return {
           creationTime: fill.time || Date.now(),
           eventTime: fill.time || Date.now(),
@@ -4733,12 +4767,11 @@ class UserConnector {
           newClientOrderId: fill.cli_ord_id || fill.order_id || '',
           orderId: fill.order_id || '',
           orderTime: fill.time || Date.now(),
-          orderStatus:
-            fill.remaining_order_qty === 0 ? 'FILLED' : 'PARTIALLY_FILLED',
+          orderStatus: status,
           orderType: fill.order_type === 'limit' ? 'LIMIT' : 'MARKET',
           originalClientOrderId: fill.cli_ord_id || fill.order_id || '',
           price: `${fillPrice}`,
-          quantity: `${totals.qty + remaining}`,
+          quantity: `${total}`,
           side: fill.buy ? 'BUY' : 'SELL',
           symbol,
           totalQuoteTradeQuantity: `${totals.cost}`,
