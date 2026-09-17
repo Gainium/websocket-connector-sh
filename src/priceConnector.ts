@@ -181,8 +181,24 @@ class Connector {
   get isBinance() {
     return this.isFamilyNeeded('binance')
   }
+  /**
+   * binanceUS has no worker of its own — `FAMILY_VARIANTS.binance` serves it —
+   * so the family gate has to answer first, with the same `binance`/`binanceus`
+   * env alias and the same admin-config precedence as every sibling venue. It
+   * then gets the variant-level admin-config gate `subscribeCandleCb` already
+   * applies below, so an operator who unticks Binance US keeps it off while
+   * Binance intl stays up.
+   *
+   * Read only by `initWorker` (as the worker payload's `binance.isUs`) and by
+   * `init`. When it is false the binance worker still spawns for the intl
+   * variants, but `binance.ts` never opens the binance.us ticker or candle
+   * socket — no ticks, no candles, and no log line either way.
+   */
   get isBinanceUS() {
-    return exchanges.length ? exchanges.includes('binanceus') : true
+    return (
+      this.isFamilyNeeded('binance') &&
+      isExchangeEnabled(ExchangeEnum.binanceUS)
+    )
   }
   get isBybit() {
     return this.isFamilyNeeded('bybit')
@@ -229,8 +245,16 @@ class Connector {
         ? 'PRICE_CONNECTOR_EXCHANGES'
         : 'default (no allow-list — every family)'
     const all = Object.keys(FAMILY_VARIANTS)
-    const on = all.filter((f) => this.isFamilyNeeded(f))
-    const off = all.filter((f) => !on.includes(f))
+    // binanceUS rides inside the `binance` family worker but is gated
+    // separately (its own WS host), so reporting families alone put it in
+    // NEITHER list — the line read `NOT streaming: (none)` while the venue was
+    // dark. Report it as its own unit.
+    const units = [
+      ...all.map((f) => ({ label: f, on: this.isFamilyNeeded(f) })),
+      { label: ExchangeEnum.binanceUS as string, on: this.isBinanceUS },
+    ]
+    const on = units.filter((u) => u.on).map((u) => u.label)
+    const off = units.filter((u) => !u.on).map((u) => u.label)
     logger.info(
       `Price connector families [${source}] | streaming: ${
         on.join(',') || '(none)'

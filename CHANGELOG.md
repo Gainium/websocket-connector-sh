@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.20] - 2026-09-17
+
+### Fixed
+
+- **Bots on Binance US now receive live prices and candles again, instead of falling back to periodic price polling indefinitely.** The price connector runs one worker per exchange *family*, and Binance US is served by the Binance worker rather than one of its own — so allow-listing Binance is what is meant to bring it up. Every other venue's switch honoured that, but the Binance US switch alone still demanded its own separate entry, and did not consult the self-hosted Enabled Exchanges setting at all. Where the allow-list named Binance without also naming Binance US, the Binance worker started and its international streams connected normally while the Binance US market stream was never opened: no live ticks, and candle subscriptions accepted and then silently discarded. Bots on that venue fell back to their periodic REST price poll, so take-profit, stop-loss, trailing and averaging levels were evaluated on that slower cadence instead of on every tick, for as long as the process ran. The switch now answers from the same family rule as every sibling venue — the two Binance allow-list spellings are aliases on both the environment and the Enabled Exchanges paths — and remains individually controllable, so turning Binance US off leaves Binance international running. The boot line that summarises which venues a process streams now lists Binance US as its own entry: it previously appeared under neither "streaming" nor "NOT streaming", which is why a dark venue could read as a perfectly healthy configuration. Tests: `test/binanceUsPriceGate.test.ts`. Spec 010.
+
 ## [1.14.19] - 2026-09-15
 
 ### Fixed
