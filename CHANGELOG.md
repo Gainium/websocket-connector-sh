@@ -5,12 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.14.21] - 2026-09-18
-
-### Fixed
-
-- **A Binance US candle subscription no longer fails permanently, and a single unreachable Binance market can no longer interrupt the others.** Candle subscriptions are multiplexed — up to two hundred streams share one connection, requested through the exchange's combined-stream address. The Binance US branch was the only one that did not spell that address out: it asked the exchange library for the connection's own address and appended the stream list to it. That address is the single-stream one the Binance US ticker connection needs, and the library appends a further path segment to it, so the result was a hybrid path the venue does not serve and answered with a not-found response. The Binance US candle connection therefore never opened once, for as long as that venue has been served. It is now built the same way as the Binance spot, COIN-M and USD-M branches beside it. Separately, the recovery that ran when any Binance connection reported a fault rebuilt all eight of them — spot, COIN-M, USD-M and US, tickers and candles alike — and re-subscribed everything. A market that could never connect therefore tore down the healthy international price and candle feeds each time it retried, and each teardown produced further faults that re-entered the same recovery, so the cycle sustained itself and closed-candle delivery was repeatedly interrupted for every Binance pair rather than only US ones. Recovery is now scoped to the connection that actually reported the fault and re-subscribes only that one, re-checking the same venue and stream-type switches the startup path applies; repeat faults from one connection while its restart is already in flight are coalesced rather than compounded, matching the equivalent guard on Bybit. Tests: `test/binanceUsCandleUrlRestartStorm.test.ts`. Spec 011.
-
 ## [1.14.20] - 2026-09-17
 
 ### Fixed

@@ -165,22 +165,7 @@ class BinanceConnector extends CommonConnector {
     }
   }
 
-  /**
-   * Bug #792: recovery used to be family-wide. `stopBinance()` + `init()`
-   * rebuilt all eight clients (spot/coin-m/usd-m/US × ticker/candle) on ANY
-   * single client's exception, so the binanceUS candle socket — which 404'd
-   * on every attempt until the URL above was fixed — tore down the healthy
-   * intl feeds every few seconds, and each teardown raised fresh intl
-   * exceptions that re-entered here. Keyed `${exchange}:${type}` so one venue
-   * can never interrupt the other seven.
-   *
-   * This must COALESCE (drop) concurrent restarts, not queue them — see the
-   * same note in bybit.ts (#121): the `IdMutex` used elsewhere in this file
-   * serialises, which would still run N restarts for a burst of N exceptions.
-   */
-  private binanceRestarting: Set<string> = new Set()
-
-  private binanceErrorCb(e: ExchangeEnum, type: StreamType) {
+  private binanceErrorCb(e: ExchangeEnum) {
     return (data: any) => {
       logger.error(
         `${e.toUpperCase()} error: ${`${data.wsKey}`.slice(
@@ -188,108 +173,8 @@ class BinanceConnector extends CommonConnector {
           100,
         )} ${JSON.stringify(data.error ?? data ?? '')}`,
       )
-      const id = `${e}:${type}`
-      if (this.binanceRestarting.has(id)) {
-        logger.info(`Binance ${id} restart already in progress — coalescing`)
-        return
-      }
-      this.binanceRestarting.add(id)
-      void this.restartBinanceClient(e, type).finally(() => {
-        this.binanceRestarting.delete(id)
-      })
-    }
-  }
-
-  /**
-   * Rebuild and re-subscribe exactly one client. `getBinanceClient(_, _,
-   * current)` retires the outgoing one (listeners removed, sockets closed, a
-   * no-op `exception` handler installed), so a dying socket cannot re-enter.
-   * The gates `init()` applies are re-checked here, so a venue or stream type
-   * this worker does not serve is never revived.
-   */
-  private async restartBinanceClient(e: ExchangeEnum, type: StreamType) {
-    try {
-      const us = e === ExchangeEnum.binanceUS
-      if (us ? !this.isUs : !this.isIntl) {
-        return
-      }
-      if (type === 'candle') {
-        if (!this.isCandle && !this.isAll) {
-          return
-        }
-        switch (e) {
-          case ExchangeEnum.binanceUS:
-            this.binanceClientCandleUs = this.getBinanceClient(
-              e,
-              type,
-              this.binanceClientCandleUs,
-            )
-            await this.connectBinanceCandleStreams(true)
-            break
-          case ExchangeEnum.binanceCoinm:
-            this.binanceClientCandleCoinm = this.getBinanceClient(
-              e,
-              type,
-              this.binanceClientCandleCoinm,
-            )
-            await this.connectBinanceCandleStreams(false, 'coinm')
-            break
-          case ExchangeEnum.binanceUsdm:
-            this.binanceClientCandleUsdm = this.getBinanceClient(
-              e,
-              type,
-              this.binanceClientCandleUsdm,
-            )
-            await this.connectBinanceCandleStreams(false, 'usdm')
-            break
-          default:
-            this.binanceClientCandle = this.getBinanceClient(
-              e,
-              type,
-              this.binanceClientCandle,
-            )
-            await this.connectBinanceCandleStreams(false)
-        }
-        return
-      }
-      if (this.isCandle && !this.isAll) {
-        return
-      }
-      switch (e) {
-        case ExchangeEnum.binanceUS:
-          this.binanceClientUs = this.getBinanceClient(
-            e,
-            type,
-            this.binanceClientUs,
-          )
-          this.binanceClientUs.subscribeSpotAllMini24hrTickers()
-          break
-        case ExchangeEnum.binanceCoinm:
-          this.binanceClientCoinm = this.getBinanceClient(
-            e,
-            type,
-            this.binanceClientCoinm,
-          )
-          this.binanceClientCoinm.subscribeAll24hrTickers('coinm')
-          break
-        case ExchangeEnum.binanceUsdm:
-          this.binanceClientUsdm = this.getBinanceClient(
-            e,
-            type,
-            this.binanceClientUsdm,
-          )
-          this.binanceClientUsdm.subscribeAll24hrTickers('usdm')
-          break
-        default:
-          this.binanceClient = this.getBinanceClient(
-            e,
-            type,
-            this.binanceClient,
-          )
-          this.binanceClient.subscribeSpotAllMini24hrTickers()
-      }
-    } catch (err) {
-      logger.error(`Binance ${e} ${type} restart cycle failed: ${err}`)
+      this.stopBinance()
+      this.init()
     }
   }
 
@@ -315,7 +200,7 @@ class BinanceConnector extends CommonConnector {
     const client = new BinanceWSClient(settings, wsLoggerOptions)
     client.on('message', this.binanceGetCallback(exchange, type))
     client.on('open', this.binanceOpenCb(exchange, type))
-    client.on('exception', this.binanceErrorCb(exchange, type))
+    client.on('exception', this.binanceErrorCb(exchange))
     return client
   }
 
@@ -520,15 +405,9 @@ class BinanceConnector extends CommonConnector {
       i++
       await sleep(1000)
       if (us) {
-        // `?streams=` is only valid on the combined-stream path. `getWsUrl()`
-        // is the SDK's client-wide builder: it returns the `settings.wsUrl`
-        // override — the raw `/ws` path the *ticker* client needs — and then
-        // appends its own `/stream` suffix, yielding `/ws/stream?streams=`,
-        // which the venue answers with 404. Hardcoded like the three branches
-        // below for exactly that reason.
-        //@ts-expect-error connect to wsUrl is private
+        //@ts-ignore
         this.binanceClientCandleUs.connectToWsUrl(
-          `wss://stream.binance.us:9443/stream?streams=${wsKey}`,
+          `${await this.binanceClientCandleUs.getWsUrl(WS_KEY_MAP.main)}?streams=${wsKey}`,
           WS_KEY_MAP.main,
         )
       } else {
