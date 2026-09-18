@@ -10,6 +10,7 @@ import {
   WsMessage24hrMiniTickerRaw,
 } from 'binance'
 import CommonConnector from './common'
+import { safeStringify } from '../utils/redact'
 
 import type {
   StreamType,
@@ -18,6 +19,75 @@ import type {
 } from './types'
 
 const mutex = new IdMutex()
+
+/**
+ * Spec 012. The `ws` event slots the SDK's object spread orphans, by the only
+ * handle available on them: the symbol's description. `binance` emits
+ * `{ ...error, wsKey }` (`binance/lib/util/BaseWSClient.js` `parseWsError`) and
+ * `error` is a `ws` `ErrorEvent`/`CloseEvent`, whose `message`/`error`/`type`/
+ * `target` (and `code`/`reason` on a close) are *prototype getters* over
+ * symbol-keyed own slots. The spread copies the slots and drops the getters, so
+ * the payload has no reachable property and `JSON.stringify` — which ignores
+ * symbol keys — printed `{"wsKey":"main"}` for essentially every real fault.
+ *
+ * An unknown description is ignored, so a rename in `ws` degrades this to the
+ * previous output rather than breaking the line.
+ */
+const WS_EVENT_SLOTS: Record<string, string> = {
+  kMessage: 'message',
+  kError: 'error',
+  kType: 'type',
+  kCode: 'code',
+  kReason: 'reason',
+  kTarget: 'url',
+}
+
+/** One line of log stays one readable line, whatever the SDK stapled on. */
+const MAX_EXCEPTION_PAYLOAD_CHARS = 1000
+
+/**
+ * Serialize an `exception` payload so it says why the socket faulted.
+ *
+ * Reads both shapes the SDK produces: the ordinary own properties its
+ * non-transport sites carry (`message`, `error`, `functionRef`, …) and the
+ * orphaned `ws` slots above. Own properties win a name collision — the SDK set
+ * those deliberately. Serialization goes through `safeStringify` rather than
+ * `JSON.stringify` so credentials stapled onto an SDK error never reach the pm2
+ * logs (see `utils/redact.ts`) and so a bare `Error`, whose `name`/`message`
+ * are non-enumerable, reports as more than `{}`.
+ */
+const describeWsException = (data: unknown): string => {
+  if (data === null || typeof data !== 'object') {
+    return data === undefined ? '' : String(data)
+  }
+  const source = data as Record<string | symbol, unknown>
+  const out: Record<string, unknown> = {}
+
+  const put = (key: string, value: unknown) => {
+    if (value === undefined || value === null || value === '') return
+    if (out[key] !== undefined) return
+    out[key] =
+      value instanceof Error ? `${value.name}: ${value.message}` : value
+  }
+
+  for (const [key, value] of Object.entries(source)) {
+    if (key === 'wsKey') continue
+    put(key, value)
+  }
+  for (const slot of Object.getOwnPropertySymbols(source)) {
+    const field = WS_EVENT_SLOTS[slot.description ?? '']
+    if (!field) continue
+    const value = source[slot]
+    // `kTarget` is the live socket — take its URL, never the object.
+    put(field, field === 'url' ? (value as { url?: string })?.url : value)
+  }
+
+  // Nothing readable: degrade to what this line has always printed.
+  const payload = Object.keys(out).length
+    ? safeStringify(out)
+    : safeStringify(data)
+  return payload.slice(0, MAX_EXCEPTION_PAYLOAD_CHARS)
+}
 
 class BinanceConnector extends CommonConnector {
   private binanceClient: BinanceWSClient = this.getBinanceClient(
@@ -171,7 +241,7 @@ class BinanceConnector extends CommonConnector {
         `${e.toUpperCase()} error: ${`${data.wsKey}`.slice(
           0,
           100,
-        )} ${JSON.stringify(data.error ?? data ?? '')}`,
+        )} ${describeWsException(data)}`,
       )
       this.stopBinance()
       this.init()

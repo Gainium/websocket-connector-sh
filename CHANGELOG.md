@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.2] - 2026-09-18
+
+### Fixed
+
+- **A Binance websocket fault is now logged with the reason it faulted.** The exchange library announces a transport fault by copying the underlying error's own fields onto a small event and handing that to our handler. The error it copies from is a websocket event object whose message, type, target address and — on a disconnect — close code and reason are all exposed through accessors defined on its class rather than as fields on the object itself, so the copy carried none of them, and serialising the result to a log line produced only the name of the connection that faulted. Every Binance websocket error line was therefore empty of any cause, for all eight of the venue's price and candle connections. The handler now reads both the copied fields and the accessor-backed values the copy left behind, reports an error object by its class and message instead of as an empty object, and passes the result through the shared credential-redacting serialiser rather than a plain one, so a fault now names its message, its close code and reason, and the address that was dialled. The log line keeps its existing prefix and single-line shape, and the connection recovery behaviour is unchanged. Tests: `test/binanceWsExceptionPayload.test.ts`. Spec 012.
+
 ## [1.15.1] - 2026-09-18
 
 ### Fixed
