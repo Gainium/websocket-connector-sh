@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.4] - 2026-09-18
+
+### Fixed
+
+- **Binance candle connections are now actually closed when they are replaced, instead of being left open and still publishing.** Binance candle streams are opened in batches of two hundred, and each batch is dialled through a low-level entry point of the exchange library rather than its ordinary connect call. Only the ordinary call records the resulting connection in the library's own registry, and the close-everything call works off that registry — so it had nothing to close, and neither did the teardown that runs when a connection is rebuilt. Nothing else held a reference to those connections either, so every re-dial *added* a live candle connection rather than replacing one, and each survivor kept delivering closed candles into the market-data channel and the candle archive for as long as the process ran. Restarting the price connector, or a transport fault that rebuilds the Binance connections, therefore made the problem worse rather than resetting it, and the duplicate deliveries grew with it. The connector now keeps its own reference to every candle connection it opens, and closes exactly those — detaching the library's handlers first, so a connection being torn down cannot publish a last frame, cannot report its own shutdown as a transport fault, and cannot trigger the library's lost-connection recovery. The library's close-everything call is still made, for connections it opened itself. The ordinary connect call was not adopted instead: it refuses a second connection on a name that is already in use, and every batch of a given market shares one name, so all batches beyond the first would have been dropped silently. Opening a candle batch is also now reported in the log, one line per batch, which it never was before — the library only announces connections it opened through its ordinary call, so until now nothing in the log said whether a candle batch had reached the venue, and its absence was easy to misread as a failure to connect. Addresses, batching and subscriptions are unchanged. Tests: `test/binanceCandleSocketClose.test.ts`. Spec 014.
+
 ## [1.15.3] - 2026-09-18
 
 ### Fixed

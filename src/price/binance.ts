@@ -20,6 +20,34 @@ import type {
 
 const mutex = new IdMutex()
 
+/** The raw `ws` socket `connectToWsUrl` returns, by the members we touch. */
+type DialledSocket = {
+  readyState?: number
+  close: () => void
+  on?: (event: string, cb: () => void) => void
+  onopen: unknown
+  onmessage: unknown
+  onerror: unknown
+  onclose: unknown
+}
+
+/**
+ * Spec 014 §3.3a. The candle sockets this connector dialled itself, per client.
+ *
+ * The candle branches dial through the SDK's private `connectToWsUrl()`, which
+ * — unlike `connect()` — never calls `wsStore.setWs()`. `closeAll()` iterates
+ * that store, so it had nothing to close and every re-dial *added* a live,
+ * still-publishing socket instead of replacing one. Under spec 013's restart
+ * storm that was one leaked candle socket per branch per cycle, each emitting
+ * duplicate closed candles into the shared market-data channels.
+ *
+ * These entries are the only handles on those sockets that exist. Module-level
+ * so the connector can still be built off its prototype in tests, and weakly
+ * keyed by client so a client replaced by `getBinanceClient()` takes its list
+ * with it.
+ */
+const dialledCandleSockets = new WeakMap<object, DialledSocket[]>()
+
 /**
  * Spec 012. The `ws` event slots the SDK's object spread orphans, by the only
  * handle available on them: the symbol's description. `binance` emits
@@ -329,6 +357,70 @@ class BinanceConnector extends CommonConnector {
     }
   }
 
+  /**
+   * Dial one candle chunk and keep the handle (spec 014 §3.3a).
+   *
+   * `connectToWsUrl` is private because the SDK expects `connect()` to be used,
+   * and `connect()` cannot serve here: it refuses a second call on a wsKey that
+   * is already open, and every chunk of a branch shares one key, so all chunks
+   * past the first would be silently dropped. A synthetic per-chunk key is
+   * worse — the SDK's reconnect path calls `connect(wsKey)` with no custom URL,
+   * and its URL builder throws `Unhandled WsKey` for anything outside
+   * `WS_KEY_MAP`, which `connect()` re-emits as an `exception` straight back
+   * into `binanceErrorCb` (spec 014 §3.2).
+   */
+  private dialCandleSocket(
+    client: BinanceWSClient,
+    exchange: ExchangeEnum,
+    url: string,
+    wsKey: string,
+  ) {
+    //@ts-expect-error connect to wsUrl is private
+    const ws = client.connectToWsUrl(url, wsKey) as DialledSocket | undefined
+    if (!ws) {
+      return
+    }
+    dialledCandleSockets.set(client, [
+      ...(dialledCandleSockets.get(client) ?? []),
+      ws,
+    ])
+    // The SDK emits its client-level `open` only for a connection opened
+    // through `connect()`, so `binanceOpenCb` never fired for a candle socket
+    // and no log line has ever said a candle chunk reached the venue (spec 014
+    // §1.3). Report it off the socket instead.
+    const onOpen = this.binanceOpenCb(exchange, 'candle')
+    ws.on?.('open', () => onOpen({ wsKey, wsUrl: url }))
+  }
+
+  /**
+   * Close the candle sockets this connector dialled on `client`
+   * (spec 014 §3.3b/§3.3c).
+   *
+   * The SDK's handlers come off first (§3.3d): a socket torn down with them
+   * still attached publishes during the close handshake (`onmessage`), can
+   * raise an `exception` into `binanceErrorCb` — which spec 013 answers with a
+   * full family restart (`onerror`) — and trips the SDK's unintentional-close
+   * recovery, re-dialling a stream-less socket on the shared wsKey (`onclose`).
+   */
+  private closeDialledCandleSockets(client?: BinanceWSClient) {
+    if (!client) {
+      return
+    }
+    const sockets = dialledCandleSockets.get(client)
+    dialledCandleSockets.delete(client)
+    for (const ws of sockets ?? []) {
+      try {
+        ws.onopen = null
+        ws.onmessage = null
+        ws.onerror = null
+        ws.onclose = null
+        ws.close()
+      } catch (err) {
+        logger.error(`Failed to close a binance candle socket: ${err}`)
+      }
+    }
+  }
+
   private getBinanceClient(
     exchange: ExchangeEnum,
     type: StreamType,
@@ -337,6 +429,7 @@ class BinanceConnector extends CommonConnector {
     if (current) {
       current.removeAllListeners()
       current.closeAll(false)
+      this.closeDialledCandleSockets(current)
       current.on('exception', () => null)
     }
     const settings: { [x: string]: unknown } = {
@@ -468,15 +561,18 @@ class BinanceConnector extends CommonConnector {
     us = false,
     futures?: 'coinm' | 'usdm',
   ) {
-    if (us) {
-      this.binanceClientCandleUs.closeAll(false)
-    } else if (futures === 'coinm') {
-      this.binanceClientCandleCoinm.closeAll(false)
-    } else if (futures === 'usdm') {
-      this.binanceClientCandleUsdm.closeAll(false)
-    } else {
-      this.binanceClientCandle.closeAll(false)
-    }
+    const client = us
+      ? this.binanceClientCandleUs
+      : futures === 'coinm'
+        ? this.binanceClientCandleCoinm
+        : futures === 'usdm'
+          ? this.binanceClientCandleUsdm
+          : this.binanceClientCandle
+    // Anything the SDK opened on its own (its reconnect path does register a
+    // socket) — kept exactly as before, spec 014 §3.3e...
+    client.closeAll(false)
+    // ...and the sockets we dialled ourselves, which it cannot reach.
+    this.closeDialledCandleSockets(client)
   }
 
   private async reconnectBinanceCandleStream() {
@@ -563,29 +659,33 @@ class BinanceConnector extends CommonConnector {
         // and the venue answered 404. Hardcoded like the three branches below,
         // which were converted in "v1.5.3: Fixed Binance new urls" while this
         // one was missed.
-        //@ts-expect-error connect to wsUrl is private
-        this.binanceClientCandleUs.connectToWsUrl(
+        this.dialCandleSocket(
+          this.binanceClientCandleUs,
+          e,
           `wss://stream.binance.us:9443/stream?streams=${wsKey}`,
           WS_KEY_MAP.main,
         )
       } else {
         if (futures) {
           if (futures === 'coinm') {
-            //@ts-expect-error connect to wsUrl is private
-            this.binanceClientCandleCoinm.connectToWsUrl(
+            this.dialCandleSocket(
+              this.binanceClientCandleCoinm,
+              e,
               `wss://dstream.binance.com/stream?streams=${wsKey}`,
               WS_KEY_MAP.coinm,
             )
           } else if (futures === 'usdm') {
-            //@ts-expect-error connect to wsUrl is private
-            this.binanceClientCandleUsdm.connectToWsUrl(
+            this.dialCandleSocket(
+              this.binanceClientCandleUsdm,
+              e,
               `wss://fstream.binance.com/market/stream?streams=${wsKey}`,
               WS_KEY_MAP.usdm,
             )
           }
         } else {
-          //@ts-expect-error connect to wsUrl is private
-          this.binanceClientCandle.connectToWsUrl(
+          this.dialCandleSocket(
+            this.binanceClientCandle,
+            e,
             `wss://stream.binance.com:9443/stream?streams=${wsKey}`,
             WS_KEY_MAP.main,
           )
