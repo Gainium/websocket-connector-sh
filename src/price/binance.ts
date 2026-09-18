@@ -46,6 +46,23 @@ const WS_EVENT_SLOTS: Record<string, string> = {
 const MAX_EXCEPTION_PAYLOAD_CHARS = 1000
 
 /**
+ * Spec 013 §1.1c. Replies the sibling connectors already classify as
+ * informational rather than as a connection failure — `bybit.ts` learned this
+ * the hard way in bug #121, where restarting on `already subscribed` was what
+ * closed the feedback loop. Matched against `describeWsException`'s output so
+ * there is one serializer for the payload, not two.
+ */
+const BENIGN_EXCEPTION_MARKERS = [
+  'handler not found',
+  'format error',
+  // Informational reply to re-subscribing a still-active topic.
+  'already subscribed',
+]
+
+const isBenignWsException = (description: string) =>
+  BENIGN_EXCEPTION_MARKERS.some((marker) => description.indexOf(marker) !== -1)
+
+/**
  * Serialize an `exception` payload so it says why the socket faulted.
  *
  * Reads both shapes the SDK produces: the ordinary own properties its
@@ -235,16 +252,80 @@ class BinanceConnector extends CommonConnector {
     }
   }
 
+  /**
+   * Spec 013: a restart cycle is in flight.
+   *
+   * `binanceErrorCb` is registered on ALL EIGHT clients (`getBinanceClient`)
+   * and `stopBinance()` recreates all eight whichever one faulted, so without
+   * this guard every exception starts its own full teardown + re-subscribe
+   * cycle. In production one persistently failing international `main`
+   * connection drove ~0.4-1.3 cycles per second, and because each cycle
+   * reconstructs sockets that are still mid-handshake, no Binance client — not
+   * even the separate-endpoint binanceUS/usdm/coinm ones, which were not
+   * faulting — ever completed one, while BYBIT/BITGET/OKX opened normally in
+   * the same process.
+   *
+   * Like bybit's (`bybitRestartCb`, bug #121) this must COALESCE (drop)
+   * concurrent restarts, not queue them: the `IdMutex` used elsewhere in this
+   * file serialises, which would still run N full restarts back-to-back.
+   */
+  private binanceRestarting = false
+
+  /**
+   * How long the guard is held *after* `init()` resolves.
+   *
+   * Unlike bybit's, this cycle's promise is not a usable window: `init()` only
+   * ARMS the reconnect. `reconnectBinanceCandleStream()` delegates to
+   * `connectBinanceCandleStreams`, whose first act is to set a 5s debounce
+   * timer and return, and the dial it schedules then issues one 200-stream
+   * chunk per second. So `init()` settles in the same tick, and releasing there
+   * would let the exceptions raised by that very dial tear down the sockets it
+   * just created — which is the 1.0s-spaced storm the production logs show.
+   * 15s covers the debounce plus a typical multi-chunk dial, and matches the
+   * window bybit gets for free from the sleeps inside `initBybitWS()`.
+   */
+  private binanceRestartSettle = 15000
+
   private binanceErrorCb(e: ExchangeEnum) {
     return (data: any) => {
-      logger.error(
-        `${e.toUpperCase()} error: ${`${data.wsKey}`.slice(
-          0,
-          100,
-        )} ${describeWsException(data)}`,
-      )
+      const description = describeWsException(data)
+      const line = `${e.toUpperCase()} error: ${`${data.wsKey}`.slice(
+        0,
+        100,
+      )} ${description}`
+      // Benign, self-clearing replies are logged as info: emitting them at
+      // error level made a healthy connector look broken.
+      if (isBenignWsException(description)) {
+        logger.info(line)
+        return
+      }
+      logger.error(line)
+      if (this.binanceRestarting) {
+        logger.info(
+          `Binance restart already in progress — coalescing ${e} exception`,
+        )
+        return
+      }
+      this.binanceRestarting = true
+      void this.runBinanceRestart()
+    }
+  }
+
+  /**
+   * One full restart cycle, held under `binanceRestarting` until the re-dial it
+   * scheduled has had time to settle, so concurrent exceptions are dropped
+   * rather than interleaved. The recovery RADIUS is deliberately unchanged —
+   * a fatal exception still recreates the whole family (spec 013 §3).
+   */
+  private async runBinanceRestart() {
+    try {
       this.stopBinance()
-      this.init()
+      await this.init()
+      await sleep(this.binanceRestartSettle)
+    } catch (err) {
+      logger.error(`Binance restart cycle failed: ${err}`)
+    } finally {
+      this.binanceRestarting = false
     }
   }
 

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.3] - 2026-09-18
+
+### Fixed
+
+- **A single Binance websocket fault no longer restarts every Binance connection, over and over.** The venue's market data arrives over eight separate connections — spot, USD-M, COIN-M and the US venue, each with a ticker and a candle socket — and all eight report a transport fault to one shared handler. That handler answered every fault by rebuilding all eight connections and re-subscribing every stream, with nothing to stop the next fault from starting the same cycle again. A rebuilt socket needs several seconds to finish its handshake and re-subscribe, so a connection that kept failing could restart the cycle faster than any socket could complete it, and none of them ever opened — including the US, USD-M and COIN-M connections, which are dialled on their own addresses and were not failing. Other venues in the same process were unaffected: each has its own handler, and two of them already carried this guard. The handler now starts at most one rebuild at a time and **drops** — rather than queues — any fault raised while one is in progress; queueing would still have run every restart, just one after another. That guard is held until the re-subscription a rebuild schedules has had time to settle, because the rebuild only arms that work rather than carrying it out, and releasing sooner let the re-subscription's own faults tear down the sockets it had just created. Replies the exchange sends to report a harmless, self-clearing condition — such as re-subscribing to a stream that is still active — are now recorded as information and trigger no rebuild at all, matching the other venues. A genuine fault still rebuilds the whole Binance family exactly as before: only the rate changes, not the scope. Tests: `test/binanceRestartStorm.test.ts`. Spec 013.
+
 ## [1.15.2] - 2026-09-18
 
 ### Fixed
