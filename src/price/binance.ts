@@ -405,9 +405,16 @@ class BinanceConnector extends CommonConnector {
       i++
       await sleep(1000)
       if (us) {
-        //@ts-ignore
+        // `?streams=` is only valid on the combined-stream path. `getWsUrl()`
+        // is the SDK's client-wide builder: it returns the `settings.wsUrl`
+        // override — the raw `/ws` path the *ticker* client needs (:195) — and
+        // appends its own `/stream` suffix, so this read `/ws/stream?streams=`
+        // and the venue answered 404. Hardcoded like the three branches below,
+        // which were converted in "v1.5.3: Fixed Binance new urls" while this
+        // one was missed.
+        //@ts-expect-error connect to wsUrl is private
         this.binanceClientCandleUs.connectToWsUrl(
-          `${await this.binanceClientCandleUs.getWsUrl(WS_KEY_MAP.main)}?streams=${wsKey}`,
+          `wss://stream.binance.us:9443/stream?streams=${wsKey}`,
           WS_KEY_MAP.main,
         )
       } else {

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.1] - 2026-09-18
+
+### Fixed
+
+- **Bots on Binance US now receive closed candles from the live candle stream instead of only from periodic polling.** The candle stream multiplexes many pairs onto one socket, and the exchange serves that multiplexed subscription only on its combined-stream address. The Binance spot, COIN-M and USD-M candle branches each name that address directly; the Binance US branch instead asked the exchange library for the connection's own address and appended the stream list to it. That library call returns the address configured for the venue's *single-stream* socket — which is what the ticker connection needs — with the library's own suffix already appended, so the result was a hybrid path the venue does not serve: it answered with a not-found response, the socket never opened, and the reconnect behind it repeated the same request for as long as the process ran. Candle subscriptions for the venue were therefore accepted and then never fulfilled, leaving candle-close and indicator driven checks to run on the slower periodic price poll. The branch now names the combined-stream address the same way its three siblings do. Binance international is unaffected, as is the Binance US ticker stream — that is the connection the single-stream address is correct for. Tests: `test/binanceUsCandleUrl.test.ts`. Spec 011.
+
 ## [1.15.0] - 2026-09-18
 
 ### Added
