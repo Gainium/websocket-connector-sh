@@ -115,6 +115,9 @@ import {
   reserveHyperliquidIp,
 } from './utils/hyperliquidIpRotation'
 import { HyperliquidUserClient } from './utils/hyperliquidUserClient'
+import HyperliquidSymbolMap, {
+  aliasHyperliquidToken,
+} from './utils/hyperliquidSymbols'
 import {
   HyperliquidFillParkResolver,
   ingestUserFills,
@@ -4407,7 +4410,12 @@ class UserConnector {
     // fee/feeToken are per-fill (spec 003 §2.1) — sum across the same buffered
     // fills used for filledSize/quote above, not a separate accumulator.
     const feePaid = get ? `${get.reduce((a, c) => a + +c.fee, 0)}` : undefined
-    const feeAsset = get ? get[get.length - 1].feeToken : undefined
+    // HL's raw token name (UAVAX) → the ticker the pair uses (AVAX); main-app
+    // matches fees to the pair by name, and an unmatched one is booked as a
+    // third-asset fee, which leaves it out of the TP size.
+    const feeAsset = get
+      ? aliasHyperliquidToken(get[get.length - 1].feeToken)
+      : undefined
     if (
       isFilled &&
       (filledSize < +order.order.origSz || filledSize > +order.order.origSz)
@@ -4525,6 +4533,13 @@ class UserConnector {
     ctx: { roomId: string; user: string; exchange: ExchangeEnum; key: string },
   ): Promise<(UserDataStreamEvent & { uniqueMessageId?: string })[]> {
     const out: (UserDataStreamEvent & { uniqueMessageId?: string })[] = []
+    // The fee token alias needs spotMeta. Block only until the first load;
+    // after that, refreshes run in the background.
+    const hlSymbols = HyperliquidSymbolMap.getInstance()
+    const spotTokens = hlSymbols.ensureSpotTokens()
+    if (!hlSymbols.hasSpotTokens()) {
+      await spotTokens
+    }
     for (const order of data) {
       if (!order.order.cloid) {
         continue

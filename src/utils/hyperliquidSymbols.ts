@@ -58,6 +58,10 @@ let tokenDisplayMap: Map<string, string> = new Map([
   ['USDT0', 'USDT'],
 ])
 const aliasToken = (name: string): string => tokenDisplayMap.get(name) ?? name
+/** Spot token name → the ticker its pairs are listed under (UAVAX→AVAX).
+ *  Accurate only once `ensureSpotTokens()` / `refresh()` has run in this
+ *  process; until then only the seed pairs resolve. */
+export const aliasHyperliquidToken = aliasToken
 
 /**
  * HIP-3 builder dexes let third-party deployers register arbitrary
@@ -133,6 +137,9 @@ class HyperliquidSymbolMap {
    *  prevents every consumer call from re-fetching when meta() fails. */
   private failureRetryInterval = 60 * 1000
   private fetching: Promise<void> | null = null
+  private lastSpotTokensFetch = 0
+  private spotTokensLoaded = false
+  private fetchingSpotTokens: Promise<void> | null = null
   private client = new hl.InfoClient({
     transport: new hl.HttpTransport({
       isTestnet: process.env.HYPERLIQUIDENV === 'demo',
@@ -147,6 +154,11 @@ class HyperliquidSymbolMap {
    *  spot-only names (e.g. builder-dex or non-colliding spot pairs). */
   spotPairToCode(pair: string): string | undefined {
     return this.spotNameToCode.get(pair) ?? this.nameToCode.get(pair)
+  }
+
+  /** Whether a real spotMeta token list has been loaded in this process. */
+  hasSpotTokens(): boolean {
+    return this.spotTokensLoaded
   }
 
   codeToPair(code: string): string | undefined {
@@ -186,6 +198,38 @@ class HyperliquidSymbolMap {
     return this.fetching
   }
 
+  /**
+   * Keep only the token alias map warm (one `spotMeta` call), for processes
+   * that need `aliasHyperliquidToken` but not the pair maps — the user
+   * stream, which would otherwise pay for the full perp-dex fan-out.
+   */
+  async ensureSpotTokens(): Promise<void> {
+    if (this.fetchingSpotTokens) return this.fetchingSpotTokens
+    const interval = this.spotTokensLoaded
+      ? this.fetchInterval
+      : this.failureRetryInterval
+    if (
+      this.lastSpotTokensFetch &&
+      Date.now() - this.lastSpotTokensFetch < interval
+    ) {
+      return
+    }
+    this.fetchingSpotTokens = this.client
+      .spotMeta()
+      .then((spot) => {
+        tokenDisplayMap = buildTokenDisplayMap(spot.tokens)
+        this.spotTokensLoaded = true
+      })
+      .catch((e) => {
+        logger.error(`Failed to refresh Hyperliquid spot tokens: ${e}`)
+      })
+      .finally(() => {
+        this.lastSpotTokensFetch = Date.now()
+        this.fetchingSpotTokens = null
+      })
+    return this.fetchingSpotTokens
+  }
+
   private async _refresh(): Promise<void> {
     try {
       const newName = new Map<string, string>()
@@ -196,6 +240,8 @@ class HyperliquidSymbolMap {
       const spot = await this.client.spotMeta()
       const spotTokens = spot.tokens
       tokenDisplayMap = buildTokenDisplayMap(spotTokens)
+      this.spotTokensLoaded = true
+      this.lastSpotTokensFetch = Date.now()
       spot.universe.forEach((u) => {
         const base = spotTokens.find((t) => t.index === u.tokens[0])
         const quote = spotTokens.find((t) => t.index === u.tokens[1])

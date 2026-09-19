@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.5] - 2026-09-19
+
+### Fixed
+
+- **Hyperliquid spot fills now report their fee under the same asset name the trading pair uses.** Hyperliquid names some spot tokens differently from the ticker their pairs are listed under — bridged assets carry a `U` prefix (`UAVAX`, `UETH`, `UBTC`), while the pair is listed as `AVAX-USDC`. The user stream already mapped pair names this way, but passed each fill's fee token through raw, so a buy whose fee Hyperliquid took in the base asset was reported as a fee in some unrelated asset. Consumers that match a fee to the pair by name then left it out of the quantity held, and the take-profit sell was sized for the full bought amount — slightly more than the wallet actually held, which Hyperliquid rejects for insufficient balance. The fee token is now mapped with the same token table as the pair names. The user stream loads that table from Hyperliquid's spot metadata (one request, refreshed every twenty minutes) instead of relying on the two built-in entries it previously had.
+
 ## [1.15.4] - 2026-09-18
 
 ### Fixed
