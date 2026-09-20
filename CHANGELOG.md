@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] - 2026-09-20
+
+### Added
+
+- Bitget's inverse perpetuals stream again. The venue moved them to its unified line, where they carry a different name and are quoted only on the v3 topics — the classic ticker and candle channels answer them with nothing, so a bot on one of those pairs saw no prices and no candles at all. Their tickers and candles now come from v3 and are published under the pair's own name, on the same channels as before. Their fills arrive on the unified private socket, where an inverse order is sized in 1-USD contracts; the quantity is converted back to the base coin the platform holds these positions in, taking the unit from whichever reading the venue's own figures agree with. Weekly, daily and 8h candles are not streamed for them — the venue's unified line has no weekly interval and opens its daily bucket at 16:00 UTC — so those keep coming from the REST back-fill, which serves them UTC-aligned.
+
+### Fixed
+
+- A coin-margined Unified Trading Account reports the coins it is margined in. Its balances were filtered to USDT and USDC, which are the margin coins of the linear product types only; inverse contracts are margined in the coin they are written on, so the account reported no balance at all. The same account's stream was previously refused outright, which is what left it without orders or balances after the venue's migration.
+
 ## [1.15.5] - 2026-09-19
 
 ### Fixed

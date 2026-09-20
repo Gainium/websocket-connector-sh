@@ -130,6 +130,10 @@ import {
   BitgetAccountMode,
   detectBitgetAccountMode,
 } from './utils/bitgetAccountMode'
+import {
+  bitgetInversePlatformSymbol,
+  bitgetInverseQtyUnit,
+} from './utils/bitgetInverse'
 
 const mutex = new IdMutex()
 
@@ -3023,14 +3027,6 @@ class UserConnector {
           // A Unified Trading Account publishes its orders and balances only
           // on the v3 private socket; the v2 channels stay silent for it.
           const accountMode = await this.bitgetAccountMode(api)
-          if (
-            accountMode === 'uta' &&
-            api.provider === ExchangeEnum.bitgetCoinm
-          ) {
-            throw new Error(
-              `${id} ${userId} Bitget COIN-M futures are not supported for Unified Trading Accounts`,
-            )
-          }
           const credentials = {
             apiKey: api.key,
             apiPass: api.passphrase,
@@ -4693,7 +4689,10 @@ class UserConnector {
     const categories =
       provider === ExchangeEnum.bitget
         ? ['spot']
-        : ['usdt-futures', 'usdc-futures']
+        : provider === ExchangeEnum.bitgetCoinm
+          ? ['coin-futures']
+          : ['usdt-futures', 'usdc-futures']
+    const inverse = provider === ExchangeEnum.bitgetCoinm
     return (msg ?? [])
       .filter((data) =>
         categories.includes(`${data.category ?? ''}`.toLowerCase()),
@@ -4706,6 +4705,16 @@ class UserConnector {
                 data.symbol.endsWith(d.feeCoin),
             ) ?? data.feeDetail[0])
           : undefined
+        // An inverse perpetual is named `BTCUSD_CM` on the unified line and
+        // sized there in 1-USD contracts, while the platform knows it as
+        // `BTCUSD` and holds it in the base coin (exchange-connector spec
+        // 014 §3.2/§3.4).
+        const price = +data.avgPrice || +data.price
+        const contracts =
+          inverse && price > 0 && bitgetInverseQtyUnit(data) === 'quote'
+        const filled = contracts
+          ? `${+data.cumExecQty / price}`
+          : data.cumExecQty
         return {
           creationTime: parseInt(data.createdTime),
           eventTime: parseInt(data.updatedTime),
@@ -4726,11 +4735,15 @@ class UserConnector {
           price: `${+data.avgPrice || +data.price}`,
           // Filled base quantity, as the classic mapper reports it — `qty` is
           // the quote amount on a spot market buy.
-          quantity: data.cumExecQty,
+          quantity: filled,
           side: data.side === 'buy' ? 'BUY' : 'SELL',
-          symbol: data.symbol,
-          totalQuoteTradeQuantity: data.cumExecValue || '0',
-          totalTradeQuantity: data.cumExecQty,
+          symbol: inverse
+            ? bitgetInversePlatformSymbol(data.symbol)
+            : data.symbol,
+          totalQuoteTradeQuantity: contracts
+            ? data.cumExecQty
+            : data.cumExecValue || '0',
+          totalTradeQuantity: filled,
           uniqueMessageId: `BitgetUtaexecutionReport${JSON.stringify(data)}`,
           feeBreakdown: data.feeDetail?.map((d) => ({
             asset: d.feeCoin,
@@ -4755,6 +4768,9 @@ class UserConnector {
       .filter(
         (c) =>
           provider === ExchangeEnum.bitget ||
+          // Inverse contracts are margined in the coin they are written on,
+          // a different coin per pair.
+          provider === ExchangeEnum.bitgetCoinm ||
           c.coin === 'USDT' ||
           c.coin === 'USDC',
       )
