@@ -19,6 +19,7 @@ import {
   bitgetInverseKlineInterval,
   bitgetInverseQtyUnit,
   setBitgetInversePerps,
+  splitBitgetCoinmMarkets,
 } from '../src/utils/bitgetInverse'
 
 const proto = BitgetConnector.prototype as any
@@ -231,4 +232,15 @@ test('a linear connection does not report the inverse categories, and vice versa
     ).length,
     0,
   )
+})
+
+test('the perpetuals are added to the coin-margined tickers, not filtered out of them', () => {
+  // the classic contract listing the connector builds its markets from kept
+  // only the quarterly contracts, so an intersection would open nothing
+  const split = splitBitgetCoinmMarkets(
+    ['BTCUSDU26', 'ETHUSDU26'],
+    new Set(['BTCUSD', 'ETHUSD']),
+  )
+  assert.deepEqual(split.classic, ['BTCUSDU26', 'ETHUSDU26'])
+  assert.deepEqual(split.inverse, ['BTCUSD', 'ETHUSD'])
 })

@@ -21,6 +21,7 @@ import {
   bitgetInversePlatformSymbol,
   bitgetInverseVenueSymbol,
   getBitgetInversePerps,
+  splitBitgetCoinmMarkets,
 } from '../utils/bitgetInverse'
 import getAllExchangeInfo from '../utils/exchange'
 import CommonConnector from './common'
@@ -620,11 +621,12 @@ class BitgetConnector extends CommonConnector {
       if (!this.mainData[ExchangeEnum.bitgetCoinm]) {
         this.mainData[ExchangeEnum.bitgetCoinm] = this.base
       }
-      // The perpetuals are quoted only on v3; the quarterly delivery
-      // contracts are still on v2 (utils/bitgetInverse.ts).
-      const perps = await getBitgetInversePerps()
-      const marketsCoinm = allCoinmMarkets.filter((m) => !perps.has(m))
-      const inverseMarkets = allCoinmMarkets.filter((m) => perps.has(m))
+      // The perpetuals are quoted only on v3, and the market list above is
+      // built from the classic contract listing, which no longer carries
+      // them at all — so they are added from the venue's own v3 listing
+      // rather than filtered out of this one (utils/bitgetInverse.ts).
+      const { classic: marketsCoinm, inverse: inverseMarkets } =
+        splitBitgetCoinmMarkets(allCoinmMarkets, await getBitgetInversePerps())
       if (inverseMarkets.length) {
         this.subscribeBitgetInverseTickers(inverseMarkets)
         logger.info(

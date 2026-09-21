@@ -120,3 +120,17 @@ export const bitgetInverseQtyUnit = (order: {
     ? 'base'
     : 'quote'
 }
+
+/**
+ * Which coin-margined tickers to open on which line. The classic contract
+ * listing the price connector builds its markets from kept only the quarterly
+ * delivery contracts, so the perpetuals cannot be filtered out of it — they
+ * are added from the venue's own v3 listing.
+ */
+export const splitBitgetCoinmMarkets = (
+  classicListing: string[],
+  perps: Set<string>,
+): { classic: string[]; inverse: string[] } => ({
+  classic: classicListing.filter((m) => !perps.has(m)),
+  inverse: [...perps],
+})
