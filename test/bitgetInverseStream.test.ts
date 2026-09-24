@@ -179,6 +179,48 @@ const inverseOrder = (o: Record<string, unknown> = {}) => ({
   ...o,
 })
 
+test('a production fill: the venue quotes the contracts in both fields', () => {
+  // Verbatim from the v3 private stream (2026-09-23): 120 contracts filled at
+  // 84350.2, with cumExecQty and cumExecValue BOTH reported as 120.
+  const [r] = (new UserConnector(true) as any).prepareBitgetUtaOrderMsg(
+    [
+      inverseOrder({
+        qty: '120',
+        cumExecQty: '120',
+        cumExecValue: '120',
+        avgPrice: '84350.2',
+        side: 'buy',
+        feeDetail: [{ feeCoin: 'BTC', fee: '0.0000002845280747' }],
+      }),
+    ],
+    ExchangeEnum.bitgetCoinm,
+  )
+  assert.equal(r.symbol, 'BTCUSD')
+  assert.equal(r.totalTradeQuantity, `${120 / 84350.2}`)
+  assert.equal(r.totalQuoteTradeQuantity, '120')
+  assert.equal(r.feeAsset, 'BTC')
+})
+
+test('a cheap contract is not mistaken for a base-coin quantity', () => {
+  // Same shape under a dollar: reading the two equal figures as different
+  // currencies would answer "base" and report 120 DOGE instead of 600.
+  const [r] = (new UserConnector(true) as any).prepareBitgetUtaOrderMsg(
+    [
+      inverseOrder({
+        symbol: 'DOGEUSD_CM',
+        qty: '120',
+        cumExecQty: '120',
+        cumExecValue: '120',
+        avgPrice: '0.2',
+      }),
+    ],
+    ExchangeEnum.bitgetCoinm,
+  )
+  assert.equal(r.symbol, 'DOGEUSD')
+  assert.equal(r.totalTradeQuantity, '600')
+  assert.equal(r.totalQuoteTradeQuantity, '120')
+})
+
 test('an inverse fill reports the platform name and a base-coin quantity', () => {
   const [r] = (new UserConnector(true) as any).prepareBitgetUtaOrderMsg(
     [inverseOrder()],
