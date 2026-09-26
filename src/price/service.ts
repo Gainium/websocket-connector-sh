@@ -12,6 +12,7 @@ import logger from '../utils/logger'
 import sleep from '../utils/sleep'
 import { skipReason } from '../../type'
 import type { BinancePayload } from './types'
+import { STALL_EXIT_THRESHOLD, stallCounter, stallOf } from './stallEscalation'
 
 type ConnectorType =
   | ExchangeEnum.binance
@@ -140,6 +141,13 @@ process
     }
     logger.error(err.stack || err.message, 'Uncaught Exception thrown')
     console.error(err)
+    const stall = stallOf(err.message)
+    if (stall && stallCounter.noteStall(stall.exchange, stall.kind)) {
+      logger.error(
+        `${stall.exchange} ${stall.kind} feed still dead after ${STALL_EXIT_THRESHOLD} stalls, restarting the worker`,
+      )
+      process.exit(1)
+    }
     if (`${err.message}`.includes('response: 403')) {
       const sleepSec = (retry + 1) * 30000
       logger.error(`Got 403 error. Sleeps ${sleepSec / 1000}s`)

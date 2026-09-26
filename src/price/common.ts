@@ -3,6 +3,7 @@ import { ExchangeEnum } from '../utils/common'
 import RedisClient, { RedisWrapper } from '../utils/redis'
 import sleep from '../utils/sleep'
 import logger from '../utils/logger'
+import { stallCounter } from './stallEscalation'
 
 import type {
   Ticker,
@@ -83,6 +84,7 @@ class CommonConnector {
   async cbWs(trades: Ticker[], exchange: ExchangeEnum) {
     this.mainData[exchange].lastData = +new Date()
     this.targetedRestartCount = 0
+    stallCounter.noteData(exchange, 'price')
     for (const trade of trades) {
       const symbol = trade.symbol as string
       const data = {
@@ -160,6 +162,7 @@ class CommonConnector {
   protected noteCandleActivity(exchange: ExchangeEnum) {
     this.mainData[exchange].lastDataTrade = +new Date()
     this.targetedRestartCount = 0
+    stallCounter.noteData(exchange, 'candle')
   }
 
   /**
