@@ -442,9 +442,12 @@ type BitgetUtaOrder = {
 
 /** A Unified Trading Account (v3) `account` push. */
 type BitgetUtaAccount = {
+  totalEquity?: string
+  unrealisedPnL?: string
   coin?: {
     coin: string
     equity?: string
+    usdValue?: string
     balance: string
     available: string
     locked?: string
@@ -4772,30 +4775,40 @@ class UserConnector {
   ): OutboundAccountPosition | undefined {
     const coins = (msg ?? []).flatMap((m) => m.coin ?? [])
     // `free + locked` is the coin's total; whatever is not available is
-    // held by open orders or position margin. The total is `equity`: the
-    // venue takes reserved funds and position margin out of `balance`, so a
-    // resting ladder shrank it to its unreserved part (exchange-connector-sh
-    // spec 030). An entry without equity keeps the balance anchor.
-    const balances = coins
-      .filter(
-        (c) =>
-          provider === ExchangeEnum.bitget ||
-          // Inverse contracts are margined in the coin they are written on,
-          // a different coin per pair.
-          provider === ExchangeEnum.bitgetCoinm ||
-          c.coin === 'USDT' ||
-          c.coin === 'USDC',
-      )
-      .map((c) => {
-        const equity = +(c.equity ?? 0)
-        const balance = equity > 0 ? equity : +c.balance || 0
-        const free = Math.min(Math.max(+c.available || 0, 0), balance)
-        return {
-          asset: c.coin,
-          free: `${free}`,
-          locked: `${balance - free}`,
-        }
-      })
+    // held by open orders or position margin. The per-coin figures leave out
+    // what resting orders and positions hold (`balance` and `equity` both
+    // shrink as a ladder is placed), so the account's USD `totalEquity`, less
+    // open P&L, over the coins' `usdValue` is held funds. They go to the one
+    // coin that can hold them, at its own price; with several candidates the
+    // coin figures stand (exchange-connector-sh spec 030, same as REST).
+    const kept = coins.filter(
+      (c) =>
+        provider === ExchangeEnum.bitget ||
+        // Inverse contracts are margined in the coin they are written on,
+        // a different coin per pair.
+        provider === ExchangeEnum.bitgetCoinm ||
+        c.coin === 'USDT' ||
+        c.coin === 'USDC',
+    )
+    const priced = kept.filter((c) => +c.balance > 0 && +(c.usdValue ?? 0) > 0)
+    const heldUsd = (msg ?? []).reduce(
+      (sum, m) =>
+        sum + (+(m.totalEquity ?? 0) || 0) - (+(m.unrealisedPnL ?? 0) || 0),
+      -coins.reduce((sum, c) => sum + (+(c.usdValue ?? 0) || 0), 0),
+    )
+    // `totalEquity` is rounded to cents; below that it is rounding, not funds.
+    const holder = heldUsd > 0.01 && priced.length === 1 ? priced[0] : null
+    const balances = kept.map((c) => {
+      const held =
+        c === holder ? (heldUsd * +c.balance) / +(c.usdValue ?? 0) : 0
+      const balance = (+c.balance || 0) + held
+      const free = Math.min(Math.max(+c.available || 0, 0), balance)
+      return {
+        asset: c.coin,
+        free: `${free}`,
+        locked: `${balance - free}`,
+      }
+    })
     if (!balances.length) {
       return undefined
     }

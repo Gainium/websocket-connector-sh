@@ -149,20 +149,37 @@ test('UTA account push: futures reports only its margin coins', () => {
   assert.equal(+msg.balances[0].free + +msg.balances[0].locked, 354411.45536458)
 })
 
-// exchange-connector-sh spec 030 §4.1/§4.2: the venue takes order-reserved
-// funds and position margin out of `balance`; `equity` keeps the full value.
+// exchange-connector-sh spec 030. Snapshot from a live COIN-M account with a
+// resting DCA ladder: balance and equity both shrank to the unreserved part;
+// totalEquity (USD) is the venue's own total (Est. value 0.007488 BTC).
+const LADDER = {
+  coin: 'BTC',
+  balance: '0.00088924',
+  equity: '0.00088924',
+  locked: '0.00587569',
+  available: '-0.00498646',
+  usdValue: '75.3740391',
+}
+
 test('UTA account push: a resting ladder does not shrink the total', () => {
+  const msg = connector().prepareBitgetUtaOutboundAccountInfo(
+    [{ totalEquity: '634.73', unrealisedPnL: '0', coin: [LADDER] }],
+    1740546523244,
+    'u1',
+    ExchangeEnum.bitgetCoinm,
+  )
+  assert.equal(msg.balances[0].free, '0')
+  assert.equal(+(+msg.balances[0].locked).toFixed(7), 0.0074884)
+})
+
+test('UTA account push: open P&L stays out of the total', () => {
   const msg = connector().prepareBitgetUtaOutboundAccountInfo(
     [
       {
+        totalEquity: '350',
+        unrealisedPnL: '50',
         coin: [
-          {
-            coin: 'BTC',
-            equity: '1',
-            balance: '0.119',
-            available: '0',
-            locked: '0.785',
-          },
+          { coin: 'BTC', balance: '0.001', available: '0', usdValue: '100' },
         ],
       },
     ],
@@ -170,11 +187,10 @@ test('UTA account push: a resting ladder does not shrink the total', () => {
     'u1',
     ExchangeEnum.bitgetCoinm,
   )
-  assert.equal(msg.balances[0].free, '0')
-  assert.equal(msg.balances[0].locked, '1')
+  assert.equal(+(+msg.balances[0].locked).toFixed(8), 0.003)
 })
 
-test('UTA account push: an entry without equity keeps the balance anchor', () => {
+test('UTA account push: without an account total the coin figures stand', () => {
   const msg = connector().prepareBitgetUtaOutboundAccountInfo(
     [{ coin: [{ coin: 'BTC', balance: '0.5', available: '0.2' }] }],
     1740546523244,
