@@ -444,6 +444,7 @@ type BitgetUtaOrder = {
 type BitgetUtaAccount = {
   coin?: {
     coin: string
+    equity?: string
     balance: string
     available: string
     locked?: string
@@ -4762,8 +4763,11 @@ class UserConnector {
     provider: ExchangeEnum,
   ): OutboundAccountPosition | undefined {
     const coins = (msg ?? []).flatMap((m) => m.coin ?? [])
-    // `free + locked` is the coin's balance; whatever is not available is
-    // held by open orders or position margin.
+    // `free + locked` is the coin's total; whatever is not available is
+    // held by open orders or position margin. The total is `equity`: the
+    // venue takes reserved funds and position margin out of `balance`, so a
+    // resting ladder shrank it to its unreserved part (exchange-connector-sh
+    // spec 030). An entry without equity keeps the balance anchor.
     const balances = coins
       .filter(
         (c) =>
@@ -4775,7 +4779,8 @@ class UserConnector {
           c.coin === 'USDC',
       )
       .map((c) => {
-        const balance = +c.balance || 0
+        const equity = +(c.equity ?? 0)
+        const balance = equity > 0 ? equity : +c.balance || 0
         const free = Math.min(Math.max(+c.available || 0, 0), balance)
         return {
           asset: c.coin,

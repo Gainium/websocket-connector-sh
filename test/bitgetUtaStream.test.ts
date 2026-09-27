@@ -149,6 +149,42 @@ test('UTA account push: futures reports only its margin coins', () => {
   assert.equal(+msg.balances[0].free + +msg.balances[0].locked, 354411.45536458)
 })
 
+// exchange-connector-sh spec 030 §4.1/§4.2: the venue takes order-reserved
+// funds and position margin out of `balance`; `equity` keeps the full value.
+test('UTA account push: a resting ladder does not shrink the total', () => {
+  const msg = connector().prepareBitgetUtaOutboundAccountInfo(
+    [
+      {
+        coin: [
+          {
+            coin: 'BTC',
+            equity: '1',
+            balance: '0.119',
+            available: '0',
+            locked: '0.785',
+          },
+        ],
+      },
+    ],
+    1740546523244,
+    'u1',
+    ExchangeEnum.bitgetCoinm,
+  )
+  assert.equal(msg.balances[0].free, '0')
+  assert.equal(msg.balances[0].locked, '1')
+})
+
+test('UTA account push: an entry without equity keeps the balance anchor', () => {
+  const msg = connector().prepareBitgetUtaOutboundAccountInfo(
+    [{ coin: [{ coin: 'BTC', balance: '0.5', available: '0.2' }] }],
+    1740546523244,
+    'u1',
+    ExchangeEnum.bitgetCoinm,
+  )
+  assert.equal(msg.balances[0].free, '0.2')
+  assert.equal(msg.balances[0].locked, '0.3')
+})
+
 test('account mode: unified/hybrid/upgrading are UTA, switching is classic', () => {
   assert.equal(bitgetAccountModeFromSettings({ accountMode: 'unified' }), 'uta')
   assert.equal(bitgetAccountModeFromSettings({ accountMode: 'hybrid' }), 'uta')
