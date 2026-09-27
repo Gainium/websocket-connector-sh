@@ -3116,6 +3116,14 @@ class UserConnector {
                   ).forEach((o) => this.userStreamEvent(id, o))
                 }
                 if (msg.arg?.topic === 'account') {
+                  // Raw venue figures: which field carries a coin's full
+                  // total (reserved funds included) was never observed on a
+                  // live account (spec 030). Balances only, no credentials.
+                  this.logger(
+                    `${id} ${userId} bitget uta account raw ${msg.action} ${JSON.stringify(
+                      msg.data,
+                    )} ${api.provider}`,
+                  )
                   const convertedMessage =
                     this.prepareBitgetUtaOutboundAccountInfo(
                       msg.data as BitgetUtaAccount[],
