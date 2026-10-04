@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.4] - 2026-10-04
+
+### Fixed
+
+- Bitget fees reported on the live order stream are now recorded at the amount the venue charged. Bitget states a charge as a negative number, and both Bitget order mappers forwarded it with that sign, while the platform reads the forwarded fee as a cost and ignores anything that is not positive. So a fee arriving on the stream was discarded: the order fell back to an estimated fee, a fee paid in BGB never reached the per-asset fee totals, and a stream update arriving after the order poll replaced the fee the poll had already read. A negative Bitget fee is now forwarded as its cost, which matches how the order poll already reads the same fee. Any other value, and every other venue's fee, is forwarded exactly as before.
+
 ## [1.16.3] - 2026-09-26
 
 ### Fixed

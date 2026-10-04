@@ -134,6 +134,7 @@ import {
   bitgetInversePlatformSymbol,
   bitgetInverseQtyUnit,
 } from './utils/bitgetInverse'
+import { bitgetFeeCost } from './utils/bitgetFee'
 
 const mutex = new IdMutex()
 
@@ -4344,9 +4345,9 @@ class UserConnector {
           .join(',')}`,
         feeBreakdown: data.feeDetail?.map((d) => ({
           asset: d.feeCoin,
-          amount: d.fee,
+          amount: bitgetFeeCost(d.fee),
         })),
-        feePaid: primaryFeeLeg?.fee,
+        feePaid: bitgetFeeCost(primaryFeeLeg?.fee),
         feeAsset: primaryFeeLeg?.feeCoin,
       }
     })
@@ -4751,9 +4752,9 @@ class UserConnector {
           uniqueMessageId: `BitgetUtaexecutionReport${JSON.stringify(data)}`,
           feeBreakdown: data.feeDetail?.map((d) => ({
             asset: d.feeCoin,
-            amount: d.fee,
+            amount: bitgetFeeCost(d.fee),
           })),
-          feePaid: primaryFeeLeg?.fee,
+          feePaid: bitgetFeeCost(primaryFeeLeg?.fee),
           feeAsset: primaryFeeLeg?.feeCoin,
         } as ExecutionReport
       })

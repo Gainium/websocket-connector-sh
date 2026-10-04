@@ -153,11 +153,13 @@ test('Bitget: feeDetail (cumulative, multi-leg) reaches the outgoing report as f
   ]
   const [report] = uc.prepareBitgetOrderMsg(msg)
   assert.deepEqual((report as any).feeBreakdown, [
-    { asset: 'USDT', amount: '-0.05' },
+    { asset: 'USDT', amount: '0.05' },
   ])
   // feePaid/feeAsset alongside feeBreakdown — the single-value shape every
   // other venue's normalizer already guarantees.
-  assert.equal((report as any).feePaid, '-0.05')
+  // Bitget states a charge as a negative number; the report carries the
+  // cost (spec 016).
+  assert.equal((report as any).feePaid, '0.05')
   assert.equal((report as any).feeAsset, 'USDT')
 })
 
@@ -201,7 +203,7 @@ test('Bitget: a multi-leg fee prefers the base/quote-denominated leg for feePaid
       { feeCoin: 'USDT', fee: '-0.03' },
     ]),
   )
-  assert.equal((withOffPairFirst as any).feePaid, '-0.03')
+  assert.equal((withOffPairFirst as any).feePaid, '0.03')
   assert.equal((withOffPairFirst as any).feeAsset, 'USDT')
 
   // BTC (base) + BGB (off-pair) — base wins.
@@ -211,7 +213,7 @@ test('Bitget: a multi-leg fee prefers the base/quote-denominated leg for feePaid
       { feeCoin: 'BTC', fee: '-0.00001' },
     ]),
   )
-  assert.equal((withBaseLeg as any).feePaid, '-0.00001')
+  assert.equal((withBaseLeg as any).feePaid, '0.00001')
   assert.equal((withBaseLeg as any).feeAsset, 'BTC')
 
   // Neither leg matches base or quote — falls back to the first reported.
@@ -221,7 +223,7 @@ test('Bitget: a multi-leg fee prefers the base/quote-denominated leg for feePaid
       { feeCoin: 'KCS', fee: '-0.002' },
     ]),
   )
-  assert.equal((withNeitherMatching as any).feePaid, '-0.001')
+  assert.equal((withNeitherMatching as any).feePaid, '0.001')
   assert.equal((withNeitherMatching as any).feeAsset, 'BGB')
 })
 
