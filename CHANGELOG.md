@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.5] - 2026-10-04
+
+### Fixed
+
+- OKX fees reported on the live order stream are now recorded at the amount the venue charged. OKX states a charge as a negative number, and the OKX order mapper forwarded it with that sign, while the platform reads the forwarded fee as a cost and ignores anything that is not positive. So a fee arriving on the stream was discarded: the order fell back to an estimated fee, the per-asset fee totals never saw it, and a stream update arriving after the order poll replaced the fee the poll had already read. A negative OKX fee is now forwarded as its cost, the same way Bitget fees have been since 1.16.4. A zero or positive OKX fee is forwarded exactly as before.
+
 ## [1.16.4] - 2026-10-04
 
 ### Fixed

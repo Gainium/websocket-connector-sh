@@ -114,7 +114,8 @@ test('OKX: the order-level fee/feeCcy (not the per-fill fillFee/fillFeeCcy) reac
     },
   ]
   const [report] = uc.prepareOkxOrderMsg(msg, 'SPOT')
-  assert.equal((report as any).feePaid, '-0.05')
+  // A charge is forwarded as its cost (spec 017).
+  assert.equal((report as any).feePaid, '0.05')
   assert.equal((report as any).feeAsset, 'USDT')
 })
 

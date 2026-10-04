@@ -134,7 +134,7 @@ import {
   bitgetInversePlatformSymbol,
   bitgetInverseQtyUnit,
 } from './utils/bitgetInverse'
-import { bitgetFeeCost } from './utils/bitgetFee'
+import { chargeCost } from './utils/feeCost'
 
 const mutex = new IdMutex()
 
@@ -4168,7 +4168,7 @@ class UserConnector {
           totalTradeQuantity: data.accFillSz,
           uniqueMessageId: `${data.instId}executionReport${data.uTime}${symbol}${data.state}${data.sz}${data.px}${data.accFillSz}${data.ordType}${data.clOrdId}${data.category}`,
           liquidation: data.category === 'full_liquidation',
-          feePaid: data.fee,
+          feePaid: chargeCost(data.fee),
           feeAsset: data.feeCcy,
         }
       })
@@ -4345,9 +4345,9 @@ class UserConnector {
           .join(',')}`,
         feeBreakdown: data.feeDetail?.map((d) => ({
           asset: d.feeCoin,
-          amount: bitgetFeeCost(d.fee),
+          amount: chargeCost(d.fee),
         })),
-        feePaid: bitgetFeeCost(primaryFeeLeg?.fee),
+        feePaid: chargeCost(primaryFeeLeg?.fee),
         feeAsset: primaryFeeLeg?.feeCoin,
       }
     })
@@ -4752,9 +4752,9 @@ class UserConnector {
           uniqueMessageId: `BitgetUtaexecutionReport${JSON.stringify(data)}`,
           feeBreakdown: data.feeDetail?.map((d) => ({
             asset: d.feeCoin,
-            amount: bitgetFeeCost(d.fee),
+            amount: chargeCost(d.fee),
           })),
-          feePaid: bitgetFeeCost(primaryFeeLeg?.fee),
+          feePaid: chargeCost(primaryFeeLeg?.fee),
           feeAsset: primaryFeeLeg?.feeCoin,
         } as ExecutionReport
       })
