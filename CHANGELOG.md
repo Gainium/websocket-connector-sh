@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.6] - 2026-10-05
+
+### Fixed
+
+- Coinbase fees reported on the live order stream are now recorded against the quote currency they were charged in. Coinbase states the fee on an order without naming its currency, and the order-stream mapper forwarded the amount alone, so the platform could not place it on either side of the pair and fell back to an estimated fee. An order that rests and fills later learns its fee only from the stream, so its real fee was never booked, and on an account set to ignore exchange fees the estimate is zero, so the deal's profit carried no fee at all. The stream now states that the fee was charged in quote, as Coinbase's fee schedule and the order poll already do. The amount forwarded and every other venue are unchanged.
+
 ## [1.16.5] - 2026-10-04
 
 ### Fixed

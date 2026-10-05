@@ -4228,6 +4228,11 @@ class UserConnector {
                 .map(([k, v]) => `${k}:${v}`)
                 .join(',')}`,
               feePaid: order.total_fees,
+              // Coinbase settles every trading fee in the product's quote
+              // currency and has no fee-currency field to say so. Without a
+              // side main-app cannot place the fee on the pair and books the
+              // estimate instead (spec 018).
+              feeSide: 'quote' as const,
             }
           }),
       )
