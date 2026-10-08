@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.7] - 2026-10-08
+
+### Fixed
+
+- **OKX Europe X-Perp fills were not delivered over the user stream.** X-Perps are listed by OKX under the `FUTURES` instrument type, but the user stream subscribed to and accepted only `SWAP` order updates for linear connections. No X-Perp order update reached the bot; each fill was booked only when the periodic REST reconcile found it, minutes late. Linear connections now also subscribe to `FUTURES` order updates, and an X-Perp update is forwarded under its pair id (the expiry suffix is removed, as the price feed already does). Global swap and spot streams are unchanged.
+
 ## [1.16.6] - 2026-10-05
 
 ### Fixed

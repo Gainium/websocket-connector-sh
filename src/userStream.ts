@@ -312,6 +312,22 @@ export enum CoinbaseKeysType {
   cloud = 'cloud',
 }
 
+/**
+ * The `orders` channel instTypes an OKX connection must subscribe to. A linear
+ * connection trades global perpetuals (`SWAP`) and, on OKX Europe, X-Perps,
+ * which OKX lists under `FUTURES` (`ruleType=xperp`). Subscribing to `SWAP`
+ * alone delivered no X-Perp order update at all, so every X-Perp fill reached
+ * the bot only through the REST reconcile sweep, minutes late.
+ */
+export const okxOrderInstTypes = (
+  provider: ExchangeEnum,
+): WsChannelArgInstType[] =>
+  provider === ExchangeEnum.okx
+    ? ['SPOT']
+    : provider === ExchangeEnum.okxLinear
+      ? ['SWAP', 'FUTURES']
+      : ['SWAP']
+
 export enum OKXSource {
   my = 'my',
   app = 'app',
@@ -2745,8 +2761,7 @@ class UserConnector {
               error: () => null,
             },
           )
-          const instType: WsChannelArgInstType =
-            api.provider === ExchangeEnum.okx ? 'SPOT' : 'SWAP'
+          const instTypes = okxOrderInstTypes(api.provider)
           const subscriptions = [
             {
               channel: 'account',
@@ -2756,7 +2771,7 @@ class UserConnector {
                 }
                 `,
             },
-            { channel: 'orders', instType },
+            ...instTypes.map((instType) => ({ channel: 'orders', instType })),
           ]
           //@ts-ignore
           client.subscribe(subscriptions)
@@ -2770,8 +2785,12 @@ class UserConnector {
               }
             }
             //@ts-ignore
-            if (msg.arg.channel === 'orders' && msg.arg.instType === instType) {
-              const orders = this.prepareOkxOrderMsg(msg.data, instType)
+            if (
+              msg.arg.channel === 'orders' &&
+              //@ts-ignore
+              instTypes.includes(msg.arg.instType)
+            ) {
+              const orders = this.prepareOkxOrderMsg(msg.data, instTypes)
               orders.forEach((o) => this.userStreamEvent(id, o))
             }
           })
@@ -4126,19 +4145,23 @@ class UserConnector {
   }
 
   private clearSymbol(s: string) {
-    return s.replace(/-SWAP$/, '')
+    // `-SWAP` for global perpetuals; the expiry suffix for OKX Europe X-Perps
+    // (`BTC-USD_UM_XPERP-310404` -> the pair id `BTC-USD_UM_XPERP`), as the
+    // price publisher does. Spot and swap ids never end in six digits.
+    return s.replace(/-SWAP$/, '').replace(/-\d{6,}$/, '')
   }
 
   private prepareOkxOrderMsg(
     msg?: OKXOrderMsg[],
-    instType?: WsChannelArgInstType,
+    instType?: WsChannelArgInstType | WsChannelArgInstType[],
   ): ExecutionReport[] {
     if (!msg) {
       return []
     }
+    const accepted = Array.isArray(instType) ? instType : [instType]
 
     return msg
-      .filter((d) => d.instType === instType)
+      .filter((d) => accepted.includes(d.instType as WsChannelArgInstType))
       .map((data) => {
         const symbol = this.clearSymbol(data.instId)
         return {
