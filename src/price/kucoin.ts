@@ -462,6 +462,18 @@ class KucoinConnector extends CommonConnector {
     }
   }
 
+  /**
+   * KuCoin's inverse futures list a handful of contracts whose tickers can
+   * pause for minutes; judged on its own with the default window that market
+   * would read as dead while it is only quiet.
+   */
+  protected override getPriceTimeout(exchange: ExchangeEnum): number {
+    if (exchange === ExchangeEnum.kucoinInverse) {
+      return 30 * 60 * 1000
+    }
+    return super.getPriceTimeout(exchange)
+  }
+
   stop() {
     super.stop()
     this.stopKucoin()

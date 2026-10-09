@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.9] - 2026-10-09
+
+### Fixed
+
+- **A dead market could be hidden by a live sibling on the same exchange.** Every price connector gave all its markets (spot, linear and inverse futures) one shared liveness record, so a ticker on any of them counted as a ticker on all of them, and a market whose feed died went unnoticed for as long as another market of the exchange kept delivering. Each market now has its own record. A market that delivered and then went silent is restarted after three minutes while its siblings keep delivering (KuCoin's inverse futures, a handful of contracts whose tickers legitimately pause for minutes, after thirty), and after the usual fifty seconds when every market is silent. A market that never delivered (for example one that is disabled) is not judged on its own, the connect check still asks whether any market delivered, and candle liveness is still judged across the exchange's markets, as some markets carry no candle subscription. The targeted-restart budget is now kept per market, so a sibling's data no longer resets it.
+
 ## [1.16.8] - 2026-10-09
 
 ### Fixed

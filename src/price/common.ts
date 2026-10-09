@@ -15,6 +15,7 @@ import type {
 
 const priceRole = process.env.PRICEROLE
 const tradeTimeout = +(process.env.TRADESTIMEOUT || '0') || 0
+const marketPriceTimeout = 3 * 60 * 1000
 
 class CommonConnector {
   mainData: {
@@ -31,12 +32,20 @@ class CommonConnector {
   wsReconnect = 3500
   isCandle = priceRole === 'candle'
   isAll = priceRole === 'all'
-  base = {
-    lastData: 0,
-    lastDataTrade: 0,
-    connectTime: +new Date(),
-    ticker: null,
-    trade: null,
+  /**
+   * A fresh liveness record for one market. A getter, so every
+   * `mainData[market] = this.base` gets its own: the connectors used to share
+   * one object between all their markets, so data on any market refreshed
+   * them all and a dead market was hidden by a live sibling.
+   */
+  get base() {
+    return {
+      lastData: 0,
+      lastDataTrade: 0,
+      connectTime: +new Date(),
+      ticker: null,
+      trade: null,
+    }
   }
   private redis: RedisWrapper | null = null
 
@@ -47,7 +56,7 @@ class CommonConnector {
    * recoveries between real data events; after that we escalate to the old
    * full-worker restart (throw) so a genuinely dead worker still gets nuked.
    */
-  private targetedRestartCount = 0
+  private targetedRestarts: Map<ExchangeEnum, number> = new Map()
   private maxTargetedRestarts = 2
 
   /**
@@ -94,7 +103,7 @@ class CommonConnector {
 
   async cbWs(trades: Ticker[], exchange: ExchangeEnum) {
     this.mainData[exchange].lastData = +new Date()
-    this.targetedRestartCount = 0
+    this.targetedRestarts.delete(exchange)
     stallCounter.noteData(exchange, 'price')
     for (const trade of trades) {
       const symbol = trade.symbol as string
@@ -172,7 +181,7 @@ class CommonConnector {
    */
   protected noteCandleActivity(exchange: ExchangeEnum) {
     this.mainData[exchange].lastDataTrade = +new Date()
-    this.targetedRestartCount = 0
+    this.targetedRestarts.delete(exchange)
     stallCounter.noteData(exchange, 'candle')
   }
 
@@ -278,90 +287,111 @@ class CommonConnector {
     exchange: ExchangeEnum,
     kind: 'price' | 'candle' | 'connect',
   ): boolean {
-    if (this.targetedRestartCount >= this.maxTargetedRestarts) {
+    const count = this.targetedRestarts.get(exchange) ?? 0
+    if (count >= this.maxTargetedRestarts) {
       return false
     }
     const handled = this.handleStall(exchange, kind)
     if (handled) {
-      this.targetedRestartCount++
+      this.targetedRestarts.set(exchange, count + 1)
       logger.info(
-        `Targeted restart ${this.targetedRestartCount}/${this.maxTargetedRestarts} for ${kind} stall | ${exchange}`,
+        `Targeted restart ${count + 1}/${this.maxTargetedRestarts} for ${kind} stall | ${exchange}`,
       )
     }
     return handled
   }
 
+  /**
+   * How long ONE market may go without a ticker while a sibling market of the
+   * same connector still delivers. Longer than `timeout`, which still applies
+   * when every market is quiet: a market with a handful of symbols can be
+   * quiet for a while on its own. Override for thinner markets.
+   */
+  protected getPriceTimeout(_exchange: ExchangeEnum): number {
+    return marketPriceTimeout
+  }
+
+  /**
+   * Connect and candle stalls are judged across all of the connector's
+   * markets: a market that is disabled, or has no candle subscription, never
+   * delivers and must not read as dead. Ticker stalls are judged per market,
+   * from the moment that market first delivered: after `timeout` when every
+   * market is quiet, after `getPriceTimeout` when only that one is.
+   */
   private watchdogFn() {
     const now = new Date().getTime()
     this.checkClientStalls(now)
-    const keys = Object.keys(this.mainData) as ExchangeEnum[]
-    for (const exchange of keys) {
+    const keys = (Object.keys(this.mainData) as ExchangeEnum[]).filter(
+      (e) => e !== ExchangeEnum.binanceUS && e !== ExchangeEnum.mexc,
+    )
+    if (!keys.length) {
+      return
+    }
+    const markets = keys.map((e) => this.mainData[e])
+    if (!this.isCandle || this.isAll) {
+      const connectSince = Math.min(...markets.map((m) => m.connectTime))
       if (
-        exchange === ExchangeEnum.binanceUS ||
-        exchange === ExchangeEnum.mexc
+        markets.every((m) => m.lastData === 0) &&
+        now - connectSince > this.connectTime
       ) {
-        continue
-      }
-      if (!this.isCandle || this.isAll) {
-        if (
-          this.mainData[exchange].lastData === 0 &&
-          now - this.mainData[exchange].connectTime > this.connectTime
-        ) {
-          const stale = Math.floor(
-            (now - this.mainData[exchange].connectTime) / 1000,
-          )
-          this.reportStall(exchange, 'connect', stale)
-          if (this.escalateOrHandle(exchange, 'connect')) {
-            this.mainData[exchange].connectTime = now
-            continue
-          }
+        const exchange = keys[0]
+        const stale = Math.floor((now - connectSince) / 1000)
+        this.reportStall(exchange, 'connect', stale)
+        if (!this.escalateOrHandle(exchange, 'connect')) {
           throw new Error(
             `Exchange exceed connect time ${stale}s | ${exchange}`,
           )
         }
-        if (
-          this.mainData[exchange].lastData > 0 &&
-          now - this.mainData[exchange].lastData > this.timeout
-        ) {
-          const stale = Math.floor(
-            (now - this.mainData[exchange].lastData) / 1000,
-          )
-          if (this.isFeedAlive(exchange, 'price')) {
-            this.mainData[exchange].lastData = now
-            continue
-          }
-          this.reportStall(exchange, 'price', stale)
-          if (this.escalateOrHandle(exchange, 'price')) {
-            this.mainData[exchange].lastData = now
-            continue
-          }
+        markets.forEach((m) => (m.connectTime = now))
+      }
+      const newest = Math.max(...markets.map((m) => m.lastData))
+      const allQuiet = newest > 0 && now - newest > this.timeout
+      for (const exchange of keys) {
+        const market = this.mainData[exchange]
+        const limit = allQuiet ? this.timeout : this.getPriceTimeout(exchange)
+        if (market.lastData === 0 || now - market.lastData <= limit) {
+          continue
+        }
+        const stale = Math.floor((now - market.lastData) / 1000)
+        if (this.isFeedAlive(exchange, 'price')) {
+          market.lastData = now
+          continue
+        }
+        this.reportStall(exchange, 'price', stale)
+        if (!this.escalateOrHandle(exchange, 'price')) {
           throw new Error(
             `Exchange not received new data for ${stale}s | ${exchange}`,
           )
         }
+        market.lastData = now
       }
-      if (this.isCandle || this.isAll) {
-        if (
-          (this.mainData[exchange].lastDataTrade ?? 0) > 0 &&
-          now - (this.mainData[exchange].lastDataTrade ?? now) >
-            this.getTradeTimeout(exchange)
-        ) {
-          const stale = Math.floor(
-            (now - (this.mainData[exchange].lastDataTrade ?? 0)) / 1000,
-          )
-          if (this.isFeedAlive(exchange, 'candle')) {
-            this.mainData[exchange].lastDataTrade = now
-            continue
-          }
-          this.reportStall(exchange, 'candle', stale)
-          if (this.escalateOrHandle(exchange, 'candle')) {
-            this.mainData[exchange].lastDataTrade = now
-            continue
-          }
+    }
+    if (this.isCandle || this.isAll) {
+      const lastTrade = Math.max(...markets.map((m) => m.lastDataTrade ?? 0))
+      // Named after the first market that has candles, as when the record
+      // was shared — the per-exchange hooks below restart that market's.
+      const exchange = keys.find(
+        (e) => (this.mainData[e].lastDataTrade ?? 0) > 0,
+      )
+      if (exchange && now - lastTrade > this.getTradeTimeout(exchange)) {
+        const stale = Math.floor((now - lastTrade) / 1000)
+        const revive = () =>
+          markets.forEach((m) => {
+            if ((m.lastDataTrade ?? 0) > 0) {
+              m.lastDataTrade = now
+            }
+          })
+        if (this.isFeedAlive(exchange, 'candle')) {
+          revive()
+          return
+        }
+        this.reportStall(exchange, 'candle', stale)
+        if (!this.escalateOrHandle(exchange, 'candle')) {
           throw new Error(
             `Trades on exchange not received new data for ${stale}s | ${exchange}`,
           )
         }
+        revive()
       }
     }
   }
