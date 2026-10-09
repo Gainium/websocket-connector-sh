@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.8] - 2026-10-09
+
+### Fixed
+
+- **A Bitget price socket could stay open for many minutes without delivering a price.** Bitget markets are spread over several sockets, and the stall watchdog judged each exchange as a whole, so while the other sockets delivered, one socket that had reconnected but was never resubscribed went unnoticed until its next reconnect. Each Bitget socket is now judged on its own: one that delivers no market data for two minutes while another Bitget socket does is replaced by a fresh socket with the same subscriptions, the stall is reported on the watchdog channel at a bounded rate, and a socket that stays silent after two replacements escalates to the regular stall restart. A quiet market is not mistaken for a dead socket: nothing is flagged unless another socket is delivering, and sockets carrying fewer than 25 subscriptions are not judged.
+- **Bitget resubscriptions waited behind every other socket's.** Subscribe requests are spaced to Bitget's per-connection limit, but the spacing was enforced by one queue shared by every Bitget socket in the process, and requests queued for a socket that had since reconnected kept their place in it. After a burst of reconnects a socket could wait several minutes before its first subscription was sent. The spacing is now per connection, and requests meant for a socket that has since reopened are dropped (the reopened socket resubscribes everything itself).
+- A Bitget instrument the venue reports as no longer listed is removed from its socket's subscriptions instead of being requested again on every reconnect.
+
 ## [1.16.7] - 2026-10-08
 
 ### Fixed

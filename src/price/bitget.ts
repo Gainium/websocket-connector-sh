@@ -25,6 +25,7 @@ import {
 } from '../utils/bitgetInverse'
 import getAllExchangeInfo from '../utils/exchange'
 import CommonConnector from './common'
+import { findSilentClients } from './clientSilence'
 
 import type {
   Ticker,
@@ -71,7 +72,62 @@ const maxSubs = 900
 
 const chunkSize = 200
 
+/**
+ * A socket that delivered no market data this long after it (re)opened, while
+ * another Bitget socket of the same stream type did, is recreated. Its first
+ * subscribe batch is sent on open, so a healthy socket delivers well inside it.
+ */
+const clientSilenceTimeout = 2 * 60 * 1000
+
+/** Fewer subscriptions than this can legitimately go quiet; not judged. */
+const clientSilenceMinSubs = 25
+
+type V2PoolName =
+  | 'bitgetClient'
+  | 'bitgetClientUsdm'
+  | 'bitgetClientCoinm'
+  | 'bitgetClientCandle'
+  | 'bitgetClientCandleUsdm'
+  | 'bitgetClientCandleCoinm'
+
+const v2Pools: {
+  name: V2PoolName
+  exchange: ExchangeEnum
+  type: StreamType
+}[] = [
+  { name: 'bitgetClient', exchange: ExchangeEnum.bitget, type: 'ticker' },
+  {
+    name: 'bitgetClientUsdm',
+    exchange: ExchangeEnum.bitgetUsdm,
+    type: 'ticker',
+  },
+  {
+    name: 'bitgetClientCoinm',
+    exchange: ExchangeEnum.bitgetCoinm,
+    type: 'ticker',
+  },
+  { name: 'bitgetClientCandle', exchange: ExchangeEnum.bitget, type: 'candle' },
+  {
+    name: 'bitgetClientCandleUsdm',
+    exchange: ExchangeEnum.bitgetUsdm,
+    type: 'candle',
+  },
+  {
+    name: 'bitgetClientCandleCoinm',
+    exchange: ExchangeEnum.bitgetCoinm,
+    type: 'candle',
+  },
+]
+
 class BitgetConnector extends CommonConnector {
+  /**
+   * Market data per v2 socket. Declared before the pools: their initialisers
+   * create the first sockets, which register here.
+   */
+  private clientActivity: WeakMap<
+    WSClient,
+    { lastData: number; createdAt: number }
+  > = new WeakMap()
   private bitgetClient: BitgetClient = [
     {
       client: this.getBitgetClient(ExchangeEnum.bitget, 'ticker'),
@@ -414,8 +470,18 @@ class BitgetConnector extends CommonConnector {
       market: 'v5' as const,
     }
     const client = new WSClient(settings, obsoleteWsLoggerOptions)
+    const activity = { lastData: 0, createdAt: Date.now() }
+    this.clientActivity.set(client, activity)
+    client.on('update', (msg: any) => {
+      if (msg?.arg && msg.action) {
+        activity.lastData = Date.now()
+      }
+    })
     client.on('update', this.bitgetGetCallback(exchange, type))
     client.on('open', this.commonWsOpenCb(exchange, type))
+    client.on('exception', (data: any) =>
+      this.dropRejectedTopic(client, exchange, data),
+    )
     client.on('exception', this.bitgetRestartCb(exchange))
     client.on('reconnected', this.commonWsReconnectCb(exchange, type))
     return client
@@ -560,6 +626,119 @@ class BitgetConnector extends CommonConnector {
         this.init()
       }
     }
+  }
+
+  /**
+   * The exchange-wide watchdog cannot see one Bitget socket going silent: the
+   * markets are spread over several sockets of up to `maxSubs` each, and the
+   * others keep the exchange's timestamp fresh. Each v2 socket is judged
+   * against the other sockets of its stream type (clientSilence.ts), and a
+   * silent one is recreated with its own subscriptions.
+   */
+  protected override checkClientStalls(now: number) {
+    for (const type of ['ticker', 'candle'] as const) {
+      const entries = v2Pools
+        .filter((p) => p.type === type)
+        .flatMap((pool) =>
+          this[pool.name].map((entry) => ({
+            pool,
+            entry,
+            key: `${pool.name}#${entry.id}`,
+          })),
+        )
+      const activity = entries.map(({ entry, key }) => {
+        const a = this.clientActivity.get(entry.client)
+        const lastData = a?.lastData ?? 0
+        if (lastData > 0 && now - lastData <= clientSilenceTimeout) {
+          this.noteClientData(key)
+        }
+        return {
+          id: key,
+          subs: entry.subs,
+          lastData,
+          since: Math.max(a?.createdAt ?? 0, entry.client.lastOpenAt),
+          lastFrame: entry.client.lastFrameAt,
+        }
+      })
+      const silent = findSilentClients(activity, now, {
+        timeout: clientSilenceTimeout,
+        peerWindow: this.timeout,
+        minSubs: clientSilenceMinSubs,
+      })
+      for (const s of silent) {
+        const found = entries.find((e) => e.key === s.id)
+        if (!found) {
+          continue
+        }
+        this.handleClientStall(
+          found.pool.exchange,
+          type === 'candle' ? 'candle' : 'price',
+          s.id,
+          s.staleSeconds,
+          `${s.id}, ${found.entry.subs} subs, ${
+            s.socketAlive
+              ? 'socket answering but no data'
+              : 'socket not answering'
+          }`,
+        )
+        this.recreateClient(found.pool, found.entry.id)
+      }
+    }
+  }
+
+  /**
+   * Bitget refuses a subscription to an instrument it no longer lists. Forget
+   * it, so it is not sent again with every resubscription of this socket.
+   */
+  private dropRejectedTopic(
+    client: WSClient,
+    exchange: ExchangeEnum,
+    data: any,
+  ) {
+    const arg = data?.arg
+    if (
+      !arg?.instId ||
+      `${data?.error ?? data?.msg}`.indexOf(`doesn't exist`) === -1
+    ) {
+      return
+    }
+    const store = client.getWsStore()
+    let dropped = false
+    for (const key of store.getKeys()) {
+      for (const chunk of store.getTopics(key)) {
+        for (let i = chunk.length - 1; i >= 0; i--) {
+          const t = chunk[i] as { instId?: string; channel?: string }
+          if (t.instId === arg.instId && t.channel === arg.channel) {
+            chunk.splice(i, 1)
+            dropped = true
+          }
+        }
+      }
+    }
+    if (dropped) {
+      logger.info(
+        `${exchange.toUpperCase()} dropped ${arg.channel} ${arg.instId}: not listed by the venue`,
+      )
+    }
+  }
+
+  /** Replace one v2 socket with a fresh one carrying the same subscriptions. */
+  private recreateClient(pool: (typeof v2Pools)[number], id: number) {
+    const entry = this[pool.name].find((e) => e.id === id)
+    if (!entry) {
+      return
+    }
+    const store = entry.client.getWsStore()
+    const topics = store
+      .getKeys()
+      .flatMap((k) => [...store.getTopics(k)].flat())
+    const client = this.getBitgetClient(pool.exchange, pool.type, entry.client)
+    if (topics.length) {
+      client.subscribe(topics)
+    }
+    this[pool.name] = this[pool.name].map((e) =>
+      e.id === id ? { client, subs: e.subs, id } : e,
+    )
   }
 
   @IdMute(mutex, () => 'initBitgetWS')

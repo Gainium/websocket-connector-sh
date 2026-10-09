@@ -11,9 +11,16 @@ import { getWsAuthSignature } from 'bitget-api/lib/util/websocket-util'
 import WsStore from 'bitget-api/lib/util/WsStore'
 import { WsConnectionStateEnum } from 'bitget-api/lib/util/WsStore.types'
 import sleep from '../src/utils/sleep'
-import { IdMutex, IdMute } from '../src/utils/mutex'
+import { IdMutex } from '../src/utils/mutex'
 
-const mutex = new IdMutex()
+/**
+ * Bitget allows 240 subscribe requests per hour on each connection, so
+ * subscribe requests are spaced this far apart — per connection. The queue
+ * used to be shared by every client in the process, so after a burst of
+ * reconnects one client's resubscription waited behind all the others' and
+ * its socket stayed open with no data for many minutes.
+ */
+const SUBSCRIBE_SPACING_MS = 3600000 / 240
 
 interface WSClientEventMap<WsKey extends string> {
   /** Connection opened. If this connection was previously opened and reconnected, expect the reconnected event instead */
@@ -50,13 +57,24 @@ export interface IBaseWebsocketClient<TWSKey extends string> {
 const LOGGER_CATEGORY = { category: 'bitget-ws' }
 
 export abstract class BaseWebsocketClient<
-    TWSKey extends string,
-    TWSTopicSubscribeEventArgs extends object,
-  >
+  TWSKey extends string,
+  TWSTopicSubscribeEventArgs extends object,
+>
   extends EventEmitter
   implements IBaseWebsocketClient<TWSKey>
 {
   private wsStore: WsStore<TWSKey, TWSTopicSubscribeEventArgs[]>
+
+  private subscribeQueue = new IdMutex()
+
+  /** Bumped on every open: batches queued for an older socket are dropped. */
+  private wsGeneration: Map<TWSKey, number> = new Map()
+
+  /** Time of the last frame of any kind, pongs and acks included. */
+  public lastFrameAt = 0
+
+  /** Time the socket last opened or reopened. */
+  public lastOpenAt = 0
 
   protected logger: typeof DefaultLogger
 
@@ -368,8 +386,7 @@ export abstract class BaseWebsocketClient<
   /**
    * @private Use the `subscribe(topics)` method to subscribe to topics. Send WS message to subscribe to topics.
    */
-  @IdMute(mutex, () => 'requestSubscribeTopics')
-  private async requestSubscribeTopics(
+  private requestSubscribeTopics(
     wsKey: TWSKey,
     topics: TWSTopicSubscribeEventArgs[],
   ) {
@@ -396,9 +413,34 @@ export abstract class BaseWebsocketClient<
       args: topics,
     })
 
-    this.tryWsSend(wsKey, wsMessage)
+    return this.sendSubscribe(
+      wsKey,
+      this.wsGeneration.get(wsKey) ?? 0,
+      wsMessage,
+    )
+  }
 
-    await sleep(3600000 / 240)
+  private async sendSubscribe(
+    wsKey: TWSKey,
+    generation: number,
+    wsMessage: string,
+  ) {
+    await this.subscribeQueue.lock(wsKey)
+    try {
+      // The socket this batch was meant for is gone. Its replacement
+      // resubscribes every stored topic on open, so sending (and waiting out
+      // the spacing) here would only delay that.
+      if (
+        (this.wsGeneration.get(wsKey) ?? 0) !== generation ||
+        !this.wsStore.isWsOpen(wsKey)
+      ) {
+        return
+      }
+      this.tryWsSend(wsKey, wsMessage)
+      await sleep(SUBSCRIBE_SPACING_MS)
+    } finally {
+      this.subscribeQueue.release(wsKey)
+    }
   }
 
   /**
@@ -481,6 +523,8 @@ export abstract class BaseWebsocketClient<
   }
 
   private async onWsOpen(event: WebSocket.Event, wsKey: TWSKey) {
+    this.wsGeneration.set(wsKey, (this.wsGeneration.get(wsKey) ?? 0) + 1)
+    this.lastOpenAt = Date.now()
     if (
       this.wsStore.isConnectionState(wsKey, WsConnectionStateEnum.CONNECTING)
     ) {
@@ -532,6 +576,7 @@ export abstract class BaseWebsocketClient<
     try {
       // any message can clear the pong timer - wouldn't get a message if the ws wasn't working
       this.clearPongTimer(wsKey)
+      this.lastFrameAt = Date.now()
 
       if (isWsPong(event)) {
         this.logger.silly('Received pong', { ...LOGGER_CATEGORY, wsKey })

@@ -50,6 +50,17 @@ class CommonConnector {
   private targetedRestartCount = 0
   private maxTargetedRestarts = 2
 
+  /**
+   * The same budget for a single silent socket among an exchange's several
+   * (`checkClientStalls`): recreations of that socket with no data from it in
+   * between. Kept per socket because its peers' data resets the exchange-wide
+   * budget above on every tick.
+   */
+  private clientRestarts: Map<string, number> = new Map()
+  /** Last `serviceLog` stall report per feed for single-socket stalls. */
+  private clientStallReported: Map<string, number> = new Map()
+  private clientStallReportInterval = 5 * 60 * 1000
+
   constructor() {
     this.cbWs = this.cbWs.bind(this)
     this.cbWsTrade = this.cbWsTrade.bind(this)
@@ -210,6 +221,56 @@ class CommonConnector {
   }
 
   /**
+   * Per-socket stall check, run at the start of every watchdog pass. Override
+   * in connectors that spread an exchange over several sockets; the
+   * exchange-wide check below cannot see one of them going silent.
+   */
+  protected checkClientStalls(_now: number) {
+    return
+  }
+
+  /** A socket delivered data: its single-socket stall budget is restored. */
+  protected noteClientData(client: string) {
+    this.clientRestarts.delete(client)
+  }
+
+  /**
+   * One socket of `exchange` is silent while its peers deliver. Returns when
+   * the caller should recreate just that socket. Once that has been tried
+   * `maxTargetedRestarts` times with no data from the socket in between, it
+   * throws the regular watchdog stall error instead, so the connector is
+   * rebuilt (and `stallEscalation` counts it) as for any other stall.
+   */
+  protected handleClientStall(
+    exchange: ExchangeEnum,
+    kind: 'price' | 'candle',
+    client: string,
+    staleSeconds: number,
+    detail: string,
+  ) {
+    const now = Date.now()
+    const feed = `${kind}|${exchange}`
+    if (
+      now - (this.clientStallReported.get(feed) ?? 0) >=
+      this.clientStallReportInterval
+    ) {
+      this.clientStallReported.set(feed, now)
+      this.reportStall(exchange, kind, staleSeconds)
+    }
+    const count = this.clientRestarts.get(client) ?? 0
+    if (count >= this.maxTargetedRestarts) {
+      this.clientRestarts.delete(client)
+      throw new Error(
+        `${kind === 'candle' ? 'Trades on exchange' : 'Exchange'} not received new data for ${staleSeconds}s | ${exchange} (${detail})`,
+      )
+    }
+    this.clientRestarts.set(client, count + 1)
+    logger.info(
+      `Recreating silent ${kind} socket ${count + 1}/${this.maxTargetedRestarts} | ${exchange} (${detail})`,
+    )
+  }
+
+  /**
    * Try a bounded targeted restart before escalating to a full-worker crash.
    * Returns true when the stall was handled in-place (skip the throw).
    */
@@ -232,6 +293,7 @@ class CommonConnector {
 
   private watchdogFn() {
     const now = new Date().getTime()
+    this.checkClientStalls(now)
     const keys = Object.keys(this.mainData) as ExchangeEnum[]
     for (const exchange of keys) {
       if (
