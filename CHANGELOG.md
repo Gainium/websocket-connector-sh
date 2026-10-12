@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.10] - 2026-10-12
+
+### Fixed
+
+- **A user stream's routine reconnect could raise a false "connected but dead" alert.** The flap detector counted every reconnect attempt, so when a periodic reconnect stuttered through a few quick retries within a few seconds and then held, those retries alone reached the alert threshold. Reconnects within 30 seconds of the first one in a burst now count as a single episode (`USER_STREAM_FLAP_BURST_MS`). A stream that keeps reconnecting still opens a new episode every 30 seconds and is reported as before.
+
 ## [1.16.9] - 2026-10-09
 
 ### Fixed

@@ -786,8 +786,8 @@ class UserConnector {
   private coinbaseErrors: Map<string, Map<string, number>> = new Map()
   /** Kucoin errors */
   private kucoinErrors: Map<string, number> = new Map()
-  /** Rolling-window reconnect timestamps per `${exchange}:${id}`, for the
-   *  user-stream flap detector (noteReconnect). Emit-only telemetry. */
+  /** Rolling-window reconnect-BURST start times per `${exchange}:${id}`, for
+   *  the user-stream flap detector (noteReconnect). Emit-only telemetry. */
   private streamFlaps: Map<string, number[]> = new Map()
   /** Sliding-window timestamps of Binance auth-rejections (-2015/-2014/-2008 /
    *  HTTP 401) per room id. A rejected key/IP/permission never recovers by
@@ -1723,11 +1723,22 @@ class UserConnector {
       const windowMs =
         Number(process.env.USER_STREAM_FLAP_WINDOW_MS) || 10 * 60 * 1000
       const threshold = Number(process.env.USER_STREAM_FLAP_THRESHOLD) || 4
+      // Reconnects within this long of the current burst's first one are the
+      // same episode: the SDK's routine periodic reconnect sometimes stutters
+      // through 3-4 quick retries in a few seconds and then holds, which must
+      // count once, not as a flap. Measured from the burst START, so a
+      // sustained storm still opens a new burst every `burstMs` and alerts.
+      const burstMs = Number(process.env.USER_STREAM_FLAP_BURST_MS) || 30 * 1000
       const key = `${exchange}:${id}`
       const now = Date.now()
       const hits = (this.streamFlaps.get(key) ?? []).filter(
         (t) => now - t < windowMs,
       )
+      const last = hits[hits.length - 1]
+      if (last !== undefined && now - last < burstMs) {
+        this.streamFlaps.set(key, hits)
+        return
+      }
       hits.push(now)
       if (hits.length >= threshold) {
         // Reset so we alert once per burst, not on every subsequent reconnect.
