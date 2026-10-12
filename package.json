@@ -41,7 +41,7 @@
     "@nktkas/hyperliquid": "^0.24.3",
     "@siebly/kraken-api": "^1.0.4",
     "amqplib": "^0.10.8",
-    "axios": "^1.16.0",
+    "axios": "^1.20.0",
     "binance": "^3.1.9",
     "bitget-api": "^2.3.6",
     "bybit-api": "4.1.17",
@@ -55,7 +55,7 @@
     "ws": "^8.21.0"
   },
   "overrides": {
-    "axios": "^1.16.0",
+    "axios": "^1.20.0",
     "ws": "^8.21.0",
     "fast-uri": "^3.1.2",
     "qs": "^6.15.3",
@@ -63,8 +63,8 @@
     "follow-redirects": "^1.15.12",
     "minimatch@3": "^3.1.5",
     "minimatch@9": "^9.0.9",
-    "brace-expansion@1": "^1.1.13",
-    "brace-expansion@2": "^2.0.3",
+    "brace-expansion@1": "^1.1.21",
+    "brace-expansion@2": "^2.1.7",
     "picomatch@2": "^2.3.2",
     "jws@3": "^3.2.3",
     "socket.io-parser": "^4.2.6"
