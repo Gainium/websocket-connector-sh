@@ -935,7 +935,14 @@ class UserConnector {
         )
       }
       if (this.role === 'worker') {
-        const { ips, cap } = installHyperliquidIpRotation()
+        const { ips, cap } = installHyperliquidIpRotation(
+          (lateIps, lateCap) => {
+            HYPERLIQUID_USER_CAP = lateCap
+            this.logger(
+              `Worker effective HL cap=${lateCap} across ${lateIps.length} IPv4 [${lateIps.join(',')}] (IPs appeared after start-up)`,
+            )
+          },
+        )
         HYPERLIQUID_USER_CAP = cap
         this.logger(
           `Worker effective HL cap=${cap} across ${ips.length} IPv4 [${
@@ -1132,7 +1139,6 @@ class UserConnector {
     if (!this.workerId) return
     const bootEpoch = `${Date.now()}`
     const ttl = this.heartbeatSec * 3
-    const hlCap = HYPERLIQUID_USER_CAP
     try {
       await this.redisSet?.set(
         `userStream:worker:${this.workerId}:boot`,
@@ -1145,7 +1151,7 @@ class UserConnector {
       )
       await this.redisSet?.set(
         `userStream:worker:${this.workerId}:cap`,
-        `${hlCap}`,
+        `${HYPERLIQUID_USER_CAP}`,
         ttl,
       )
       await this.publishWorkerUserList(ttl)
@@ -1159,7 +1165,11 @@ class UserConnector {
         ?.set(`userStream:worker:${this.workerId}:hb`, '1', ttl)
         .catch((e) => this.logger(`Worker heartbeat tick failed: ${e}`, true))
       this.redisSet
-        ?.set(`userStream:worker:${this.workerId}:cap`, `${hlCap}`, ttl)
+        ?.set(
+          `userStream:worker:${this.workerId}:cap`,
+          `${HYPERLIQUID_USER_CAP}`,
+          ttl,
+        )
         .catch((e) => this.logger(`Worker cap publish failed: ${e}`, true))
       this.publishWorkerUserList(ttl).catch((e) =>
         this.logger(`Worker user-list publish failed: ${e}`, true),

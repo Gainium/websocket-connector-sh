@@ -7,6 +7,7 @@ import { networkInterfaces } from 'os'
 import WebSocket from 'ws'
 import type { ClientOptions } from 'ws'
 import logger from './logger'
+import { watchForLateIps } from './lateIpDetection'
 
 /**
  * Hyperliquid IP rotation for the user-stream worker.
@@ -168,7 +169,9 @@ export function hyperliquidIpStatus(): {
  * the worker's boot path **before** any `WebSocketTransport` is
  * constructed.
  */
-export function installHyperliquidIpRotation(): {
+export function installHyperliquidIpRotation(
+  onLateIps?: (ips: string[], cap: number) => void,
+): {
   ips: string[]
   cap: number
 } {
@@ -187,9 +190,34 @@ export function installHyperliquidIpRotation(): {
         detectedIps.join(',') || '<none>'
       }); leaving global WebSocket alone, per-process cap=${PER_IP_CAP}`,
     )
+    // A reboot can start us before the secondary IPs are up; keep looking
+    // so the pool (and the cap) is picked up once they appear.
+    watchForLateIps('Hyperliquid IP rotation', detectAvailableIPs, (ips) => {
+      detectedIps = ips
+      patchGlobalWebSocket()
+      const cap = detectedIps.length * PER_IP_CAP
+      logger.info(
+        `Hyperliquid IP rotation: monkey-patched globalThis.WebSocket late; per-process cap=${cap}`,
+      )
+      onLateIps?.(detectedIps, cap)
+    })
     return { ips: detectedIps, cap: PER_IP_CAP }
   }
 
+  patchGlobalWebSocket()
+  const cap = detectedIps.length * PER_IP_CAP
+  logger.info(
+    `Hyperliquid IP rotation: ${detectedIps.length} external IPv4 detected [${detectedIps.join(
+      ',',
+    )}]; monkey-patched globalThis.WebSocket; per-process cap=${cap}`,
+  )
+  return { ips: detectedIps, cap }
+}
+
+/** Replace `globalThis.WebSocket` with the IP-rotating subclass. Reads
+ *  `detectedIps` at construction time, so it works whether the pool was
+ *  found at boot or later. */
+function patchGlobalWebSocket(): void {
   /**
    * Subclass of `ws.WebSocket` that round-robins through the detected
    * IPs. Caller-supplied `localAddress` (rare, but legal) wins over
@@ -240,12 +268,4 @@ export function installHyperliquidIpRotation(): {
   // readyState, send, close, addEventListener/removeEventListener,
   // onmessage/onopen/onclose/onerror) — all present on `ws.WebSocket`.
   ;(globalThis as any).WebSocket = IpRotatingWebSocket
-
-  const cap = detectedIps.length * PER_IP_CAP
-  logger.info(
-    `Hyperliquid IP rotation: ${detectedIps.length} external IPv4 detected [${detectedIps.join(
-      ',',
-    )}]; monkey-patched globalThis.WebSocket; per-process cap=${cap}`,
-  )
-  return { ips: detectedIps, cap }
 }
