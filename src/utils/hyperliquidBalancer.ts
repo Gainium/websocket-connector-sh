@@ -104,6 +104,12 @@ class HyperliquidBalancer {
   private rabbit = new Rabbit()
   /** uuid → assignment. In-memory mirror of `userStream:assignment:*`. */
   private assignments = new Map<string, Assignment>()
+  /** uuid → latest open payload that no worker would take. Main-app sends
+   *  `open stream` once per bot load and never learns of a refusal, so a
+   *  dropped open stays dropped unless we retry it — `tick()` does, once a
+   *  worker has room again (a restart, or a cap raised by late IPs). */
+  private refusedOpens = new Map<string, Record<string, unknown>>()
+  private retryingRefused = false
   /** workerId → last-seen bootEpoch. Tracks restart detection. */
   private workerBoot = new Map<string, string>()
   private workerCapMap = new Map<string, number>()
@@ -234,6 +240,7 @@ class HyperliquidBalancer {
         logger.info(
           `Hyperliquid routed open ${uuid} → ${target} (load ${load}/${this.capFor(target)})${retryNote}`,
         )
+        this.refusedOpens.delete(uuid)
         return true
       }
 
@@ -252,14 +259,16 @@ class HyperliquidBalancer {
         tried.size
           ? ` after every worker rejected (${[...tried].join(',')}, lastReason=${lastReason})`
           : ` — no healthy worker available`
-      }`,
+      }; will retry when a worker has room`,
     )
+    this.refusedOpens.set(uuid, payload)
     return false
   }
 
   @IdMute(routeMutex, () => 'route')
   async routeClose(uuid: string, payload: unknown): Promise<boolean> {
     if (!this.enabled()) return false
+    this.refusedOpens.delete(uuid)
     const a = this.assignments.get(uuid)
     if (!a) return false
     await this.rabbit.send(workerQueueName(a.workerId), payload)
@@ -303,7 +312,8 @@ class HyperliquidBalancer {
       // routing fails (no worker yet / all at cap). The balancer must never
       // open HL locally: it shares the host with the worker(s) and never
       // raises its own cap, so a self-open would double-bind IPs and break.
-      // A failed route is logged in routeOpen and left for main-app to retry.
+      // A failed route is logged in routeOpen and parked in `refusedOpens`,
+      // which `tick()` retries — main-app does not re-send a refused open.
       // Swallow throws too: if routeOpen rejects, the caller's `.catch`
       // would turn route() into `false` and the balancer would self-open.
       await this.routeOpen(msg.uuid, msg).catch((e) =>
@@ -312,6 +322,8 @@ class HyperliquidBalancer {
       return true
     }
     if (msg.event === 'close stream') {
+      // A close for a refused open cancels its retry.
+      this.refusedOpens.delete(msg.uuid)
       // close stream: if we have an assignment, forward; otherwise
       // it's a non-HL user, fall through to local.
       if (!this.has(msg.uuid)) return false
@@ -397,7 +409,40 @@ class HyperliquidBalancer {
       const recountedLoad = this.loadByWorker().get(id) ?? 0
       states.push(`${id}=alive(load=${recountedLoad}/${this.capFor(id)})`)
     }
-    logger.info(`Hyperliquid balancer tick: ${states.join(' ')}`)
+    logger.info(
+      `Hyperliquid balancer tick: ${states.join(' ')}${
+        this.refusedOpens.size ? ` refused-opens=${this.refusedOpens.size}` : ''
+      }`,
+    )
+    await this.retryRefusedOpens()
+  }
+
+  /**
+   * Re-route opens that every worker refused, oldest first. Capacity is
+   * shared, so the pass stops at the first open that is refused again: a
+   * tick spends at most one failed attempt while the fleet is still full.
+   */
+  private async retryRefusedOpens(): Promise<void> {
+    if (this.retryingRefused || this.refusedOpens.size === 0) return
+    this.retryingRefused = true
+    try {
+      let routed = 0
+      for (const [uuid, payload] of [...this.refusedOpens]) {
+        // A close (or a newer open that already landed) may have raced us.
+        if (this.refusedOpens.get(uuid) !== payload) continue
+        if (!(await this.routeOpen(uuid, payload))) break
+        routed++
+      }
+      if (routed) {
+        logger.info(
+          `Hyperliquid balancer: routed ${routed} previously refused open(s); ${this.refusedOpens.size} still waiting`,
+        )
+      }
+    } catch (e) {
+      logger.error(`Hyperliquid balancer: refused-open retry failed: ${e}`)
+    } finally {
+      this.retryingRefused = false
+    }
   }
 
   /**
