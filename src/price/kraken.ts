@@ -139,7 +139,13 @@ type KrakenCandleClient = {
   // connection, so a rejection that names no symbol (a rate-limit error
   // carries only a req_id) belongs to the head batch.
   pending: CandleSub[][]
+  // Every wsname queued, sent or subscribed on this socket. Subscribing one a
+  // second time is answered "Already subscribed to one ohlc interval on this
+  // symbol" — naming no symbol, so it would read as a rejection of the batch.
+  wsnames: Set<string>
 }
+
+const alreadySubscribed = /already subscribed/i
 
 type CandleSub = { room: string; wsname: string }
 
@@ -525,9 +531,21 @@ class KrakenConnector extends CommonConnector {
       return
     }
 
+    // Already on a socket for this interval. At boot this is the norm, not the
+    // exception: main-app's candle requests arrive before the symbol maps load,
+    // and `init()` then replays every room already in the set.
+    if (
+      this.krakenSpotCandleClients.some(
+        (c) => c.interval === krakenInterval && c.wsnames.has(wsnameSymbol),
+      )
+    ) {
+      return
+    }
+
     // One socket per interval — sharing one across intervals is what Kraken
     // rejects, leaving the extra timeframes without candles.
     const entry = this.getSpotCandleClient(krakenInterval)
+    entry.wsnames.add(wsnameSymbol)
 
     entry.queue.push({
       room: this.getCandleRoomName(symbol, ExchangeEnum.kraken, interval),
@@ -580,6 +598,7 @@ class KrakenConnector extends CommonConnector {
     }
 
     const pending: KrakenCandleClient['pending'] = []
+    const wsnames: KrakenCandleClient['wsnames'] = new Set()
 
     // Take `wsname` out of the batch that sent it (the head batch when the
     // payload names no symbol); returns what was removed.
@@ -609,6 +628,11 @@ class KrakenConnector extends CommonConnector {
       undefined,
       ` interval=${interval}`,
       (data) => {
+        // The symbol IS subscribed (a duplicate request, or a cached topic
+        // replayed onto a socket that already has it): nothing to retry.
+        if (!data?.symbol && alreadySubscribed.test(data?.error ?? '')) {
+          return ' — already subscribed; nothing to retry'
+        }
         const failed = settle(data?.symbol)
         if (!failed.length) {
           return ''
@@ -619,6 +643,7 @@ class KrakenConnector extends CommonConnector {
         // restart replays it into the same rejection. Dropping it lets
         // main-app's next `candlesRequests` message re-subscribe it.
         for (const sub of failed) {
+          wsnames.delete(sub.wsname)
           this.dropCandleRoom(sub.room)
         }
         const names = failed.map((s) => s.wsname).join(', ')
@@ -642,6 +667,7 @@ class KrakenConnector extends CommonConnector {
       queue: [],
       flushTimer: null,
       pending,
+      wsnames,
     }
     this.krakenSpotCandleClients.push(entry)
     return entry

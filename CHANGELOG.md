@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.14] - 2026-10-29
+
+### Fixed
+
+- Kraken spot: a candle symbol requested twice at one interval was subscribed twice. At startup this is routine (candle requests arrive before the symbol maps load and are replayed once they do), and Kraken answers the repeat with "Already subscribed to one ohlc interval on this symbol", naming no symbol, which 1.16.13 read as a rejection of the whole batch and forgot its symbols. A symbol already queued or subscribed at that interval is no longer subscribed again, and that answer is no longer treated as a rejection.
+
 ## [1.16.13] - 2026-10-29
 
 ### Fixed

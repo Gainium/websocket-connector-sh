@@ -145,3 +145,41 @@ test('acks settle their own symbol; a named rejection drops only that symbol', a
     mock.timers.reset()
   }
 })
+
+test('a symbol requested twice at one interval is subscribed once', async () => {
+  // Boot order on prod: main-app's candle requests arrive before the symbol
+  // maps load, then init() replays every room already in the set.
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const f = fake(names(2))
+    for (const s of names(2)) await f.request(s)
+    for (const s of names(2)) await f.request(s)
+    mock.timers.tick(500)
+    mock.timers.tick(500)
+    assert.equal(f.sent.length, 1)
+    assert.deepEqual(f.sent[0].symbol, ['C0/USD', 'C1/USD'])
+  } finally {
+    mock.timers.reset()
+  }
+})
+
+test('"Already subscribed" names no symbol but drops nothing', async () => {
+  // Verbatim shape of Kraken's answer to a repeated ohlc subscribe: the other
+  // symbols of the same message are acked, the repeat gets this.
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const f = fake(names(2))
+    for (const s of names(2)) await f.request(s)
+    mock.timers.tick(500)
+    const line = f.reject({
+      error: 'Already subscribed to one ohlc interval on this symbol',
+      method: 'subscribe',
+      req_id: 1,
+      success: false,
+    })
+    assert.match(line, /already subscribed; nothing to retry/)
+    assert.equal(f.rooms().size, 2)
+  } finally {
+    mock.timers.reset()
+  }
+})
