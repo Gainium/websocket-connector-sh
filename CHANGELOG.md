@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.13] - 2026-10-29
+
+### Fixed
+
+- **Kraken spot candle subscribes were rejected with "Exceeded msg rate" after reconnects.** Each symbol was subscribed with its own message, and the Kraken client replays every subscribe back-to-back on reconnect, so a busy candle socket sent a burst Kraken partly refused; the refused symbols received no candles until they were requested again. Symbols requested together are now subscribed in one message (up to 100 per message, at most one message per half second).
+- Kraken futures `candles_trade_*_snapshot` frames are no longer published as candles under a `<interval>_snapshot` interval.
+
 ## [1.16.12] - 2026-10-29
 
 ### Fixed

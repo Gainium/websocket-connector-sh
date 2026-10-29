@@ -19,6 +19,15 @@ const maxSubsPerClient = 200 // Conservative limit for Kraken
 
 const chunkSize = 100 // Symbols per subscription request
 
+// The kraken-api client caches every subscribe and, on each reconnect, replays
+// them all back-to-back. One ohlc subscribe per symbol therefore meant a burst
+// of 100+ messages per socket on every reconnect, and Kraken answered the tail
+// of it with "Exceeded msg rate" — those symbols then got no candles until
+// main-app asked for them again. Candle subscribes are coalesced instead: the
+// symbols requested within one flush window go out as a single message (ohlc
+// takes a symbol list), at most one message per window.
+const candleFlushMs = 500
+
 // Kraken's candle OHLC feed is trade-driven (no periodic kline frames), so thin
 // markets legitimately go quiet well past the default candle timeout. Widen the
 // stall window for Kraken; the connection-liveness check (isFeedAlive) is the
@@ -122,13 +131,17 @@ type KrakenCandleClient = {
   client: KrakenWsClient
   subs: number
   interval: number
-  // wsnames awaiting a subscribe ack, oldest first. Kraken answers subscribes
-  // in order on a connection and we subscribe one symbol at a time, so the head
-  // of this queue identifies what a rejection refers to — the error payload
-  // itself carries only a req_id, which is why the prod log was 24 identical
-  // unactionable lines.
-  pending: { room: string; wsname: string }[]
+  // Requested but not yet sent; flushed as one subscribe per `candleFlushMs`.
+  queue: CandleSub[]
+  flushTimer: ReturnType<typeof setTimeout> | null
+  // Sent subscribes awaiting acks, one batch per message, oldest first. Kraken
+  // acks each symbol of a batch separately, and answers messages in order on a
+  // connection, so a rejection that names no symbol (a rate-limit error
+  // carries only a req_id) belongs to the head batch.
+  pending: CandleSub[][]
 }
+
+type CandleSub = { room: string; wsname: string }
 
 class KrakenConnector extends CommonConnector {
   private krakenSpotClients: KrakenClient = []
@@ -218,9 +231,9 @@ class KrakenConnector extends CommonConnector {
     // socket's messages say WHICH timeframe they belong to.
     label: string = '',
     // Called for a `method:"subscribe"` failure to resolve the offending
-    // (symbol, interval) — the Kraken payload only carries a req_id. Returns
-    // extra text appended to the single error line.
-    describeSubscribeError?: () => string,
+    // (symbol, interval) from the error payload. Returns extra text appended to
+    // the single error line.
+    describeSubscribeError?: (data: any) => string,
   ) {
     if (current) {
       current.closeAll(true)
@@ -260,7 +273,7 @@ class KrakenConnector extends CommonConnector {
     client.on('exception', (data) => {
       const extra =
         data?.method === 'subscribe' && describeSubscribeError
-          ? describeSubscribeError()
+          ? describeSubscribeError(data)
           : ''
       const line = `${tag} exception: ${JSON.stringify(data)}${extra}`
       logThrottled(`exception|${line}`, (suffix) =>
@@ -401,7 +414,13 @@ class KrakenConnector extends CommonConnector {
         }
       }
       // Futures candles_trade format: { feed: 'candles_trade_1m', candle: {...} }
-      else if (msg.feed?.startsWith('candles_trade_') && msg.candle) {
+      // `candles_trade_<interval>_snapshot` frames are skipped: they would
+      // publish under an interval named e.g. "5m_snapshot" that nothing reads.
+      else if (
+        msg.feed?.startsWith('candles_trade_') &&
+        !msg.feed.endsWith('_snapshot') &&
+        msg.candle
+      ) {
         const { time, open, high, low, close, volume } = msg.candle
         const product_id = msg.product_id || ''
         // Convert product_id to normalized symbol
@@ -510,22 +529,42 @@ class KrakenConnector extends CommonConnector {
     // rejects, leaving the extra timeframes without candles.
     const entry = this.getSpotCandleClient(krakenInterval)
 
-    entry.pending.push({
+    entry.queue.push({
       room: this.getCandleRoomName(symbol, ExchangeEnum.kraken, interval),
       wsname: wsnameSymbol,
     })
     entry.subs++
+    this.scheduleCandleFlush(entry)
+  }
 
-    // Subscribe to ohlc for the symbol (spot only)
-    entry.client.subscribe(
-      [
-        {
-          topic: 'ohlc',
-          payload: { symbol: [wsnameSymbol], interval: krakenInterval },
-        },
-      ],
-      spotWsKey,
-    )
+  /** Send the queued symbols of a spot candle socket as one ohlc subscribe. */
+  private scheduleCandleFlush(entry: KrakenCandleClient) {
+    if (entry.flushTimer) {
+      return
+    }
+    entry.flushTimer = setTimeout(() => {
+      entry.flushTimer = null
+      const batch = entry.queue.splice(0, chunkSize)
+      if (!batch.length) {
+        return
+      }
+      entry.pending.push(batch)
+      entry.client.subscribe(
+        [
+          {
+            topic: 'ohlc',
+            payload: {
+              symbol: batch.map((s) => s.wsname),
+              interval: entry.interval,
+            },
+          },
+        ],
+        spotWsKey,
+      )
+      if (entry.queue.length) {
+        this.scheduleCandleFlush(entry)
+      }
+    }, candleFlushMs)
   }
 
   /**
@@ -542,14 +581,36 @@ class KrakenConnector extends CommonConnector {
 
     const pending: KrakenCandleClient['pending'] = []
 
+    // Take `wsname` out of the batch that sent it (the head batch when the
+    // payload names no symbol); returns what was removed.
+    const settle = (wsname?: string): CandleSub[] => {
+      if (!pending.length) {
+        return []
+      }
+      if (!wsname) {
+        return pending.shift() ?? []
+      }
+      for (let b = 0; b < pending.length; b++) {
+        const i = pending[b].findIndex((s) => s.wsname === wsname)
+        if (i >= 0) {
+          const [sub] = pending[b].splice(i, 1)
+          if (!pending[b].length) {
+            pending.splice(b, 1)
+          }
+          return [sub]
+        }
+      }
+      return []
+    }
+
     const client = this.getKrakenClient(
       'candle',
       false,
       undefined,
       ` interval=${interval}`,
-      () => {
-        const failed = pending.shift()
-        if (!failed) {
+      (data) => {
+        const failed = settle(data?.symbol)
+        if (!failed.length) {
           return ''
         }
         // A rejected subscribe never delivers a single candle, so stop
@@ -557,23 +618,31 @@ class KrakenConnector extends CommonConnector {
         // forever while the timeframe is silently dead, and every candle-stall
         // restart replays it into the same rejection. Dropping it lets
         // main-app's next `candlesRequests` message re-subscribe it.
-        this.dropCandleRoom(failed.room)
-        return ` — rejected ohlc subscribe for ${failed.wsname} at interval ${interval}; dropped from the subscribed set so it is retried`
+        for (const sub of failed) {
+          this.dropCandleRoom(sub.room)
+        }
+        const names = failed.map((s) => s.wsname).join(', ')
+        return ` — rejected ohlc subscribe for ${names} at interval ${interval}; dropped from the subscribed set so it is retried`
       },
     )
 
     client.on('message', this.krakenCandleCb(ExchangeEnum.kraken))
 
     client.on('response', (data) => {
-      if (data?.method !== 'subscribe' || !data?.success || !pending.length) {
+      if (data?.method !== 'subscribe' || !data?.success) {
         return
       }
-      const wsname = data?.result?.symbol
-      const i = pending.findIndex((p) => p.wsname === wsname)
-      pending.splice(i >= 0 ? i : 0, 1)
+      settle(data?.result?.symbol)
     })
 
-    const entry: KrakenCandleClient = { client, subs: 0, interval, pending }
+    const entry: KrakenCandleClient = {
+      client,
+      subs: 0,
+      interval,
+      queue: [],
+      flushTimer: null,
+      pending,
+    }
     this.krakenSpotCandleClients.push(entry)
     return entry
   }
