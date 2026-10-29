@@ -3,6 +3,7 @@ import Rabbit from './rabbit'
 import logger from './logger'
 import { IdMute, IdMutex } from './mutex'
 import { ExchangeEnum } from './common'
+import { serviceLogRedis } from '../../type'
 
 /**
  * Hyperliquid user-stream balancer.
@@ -20,19 +21,20 @@ import { ExchangeEnum } from './common'
  *     N × 10 capacity.
  *
  * State (Redis-backed so the balancer is essentially stateless on
- * restart):
- *   `userStream:assignment:<uuid>`   → JSON `{ workerId, openPayload }`
+ * restart). Routing state only: the open message carries decrypted
+ * credentials and is never persisted.
+ *   `userStream:hlAssign:<uuid>`     → workerId
  *   `userStream:worker:<id>:boot`    → bootEpoch (set on worker start)
  *   `userStream:worker:<id>:hb`      → heartbeat (TTL = 3 × heartbeat)
  *   `userStream:lastBoot:<id>`       → balancer-side last-seen bootEpoch
  *
  * Reconciliation runs every `heartbeat` seconds:
- *   - missing `hb` ⇒ worker dead ⇒ rebalance its users to other workers
- *   - `boot` changed since last seen ⇒ worker restarted ⇒ re-send opens
- *     so the worker re-establishes the WS subscriptions
- *
- * Idempotency: `openStreamCallback` already increments `subscribersMap`
- * for repeat opens, so re-sends after a worker restart are harmless.
+ *   - missing `hb` ⇒ worker dead ⇒ drop its assignments and ask main-app
+ *     to re-send their opens (`serviceLog {reopen:'userStream', uuids}`);
+ *     the bots answer through `usersStreamAction` and are routed afresh
+ *   - `boot` changed since last seen ⇒ worker restarted ⇒ nothing to send:
+ *     the worker's own boot broadcast (`serviceLog {restart:'userStream'}`)
+ *     makes every bot re-send its open
  */
 
 const HL_EXCHANGES = new Set<ExchangeEnum>([
@@ -42,7 +44,9 @@ const HL_EXCHANGES = new Set<ExchangeEnum>([
 export const isHyperliquidExchange = (e: ExchangeEnum | undefined): boolean =>
   e ? HL_EXCHANGES.has(e) : false
 
-const ASSIGN_PREFIX = 'userStream:assignment:'
+// The older `userStream:assignment:` prefix is never read here; its keys
+// are removed by scripts/purgeLegacyHlAssignments.
+const ASSIGN_PREFIX = 'userStream:hlAssign:'
 const WORKER_BOOT_KEY = (id: string) => `userStream:worker:${id}:boot`
 const WORKER_HB_KEY = (id: string) => `userStream:worker:${id}:hb`
 const WORKER_CAP_KEY = (id: string) => `userStream:worker:${id}:cap`
@@ -62,11 +66,6 @@ export type WorkerOpenResponse = {
 
 type Assignment = {
   workerId: string
-  /** Original open-stream message. `null` for ghost assignments
-   *  created from worker-reported user lists when the balancer doesn't
-   *  have the original payload (e.g. lost across a balancer crash).
-   *  Ghost assignments can route close events but can't be `resendTo`'d. */
-  openPayload: unknown | null
 }
 
 type RoutedEvent =
@@ -158,6 +157,10 @@ class HyperliquidBalancer {
       // looks capped at the default 10 right after boot and the balancer
       // drops every HL open past 10.
       await this.loadWorkerCaps()
+      // Seed from what the workers report holding: covers accounts with no
+      // stored assignment (first boot after spec 002, or a lost key) so a
+      // re-sent open goes back to the worker that already has the stream.
+      for (const id of this.workers) await this.reconcileWorkerAssignments(id)
       const capStr = this.workers.map((w) => `${w}=${this.capFor(w)}`).join(',')
       logger.info(
         `Hyperliquid balancer init: ${this.assignments.size} active assignments across ${this.workers.length} workers [${capStr}]`,
@@ -217,7 +220,7 @@ class HyperliquidBalancer {
       if (!target) target = await this.leastLoadedAlive(tried)
       if (!target) break
 
-      const assignment: Assignment = { workerId: target, openPayload: payload }
+      const assignment: Assignment = { workerId: target }
       // Provisionally update the in-memory load so concurrent (sub-tick)
       // reads through `loadByWorker()` see this user; the mutex already
       // serialises us, but this keeps state coherent if we yield.
@@ -229,10 +232,7 @@ class HyperliquidBalancer {
       >(workerQueueName(target), payload, this.rpcTimeoutMs)
 
       if (result?.response?.accepted) {
-        await this.redisSet?.set(
-          `${ASSIGN_PREFIX}${uuid}`,
-          JSON.stringify(assignment),
-        )
+        await this.redisSet?.set(`${ASSIGN_PREFIX}${uuid}`, target)
         const load = this.loadByWorker().get(target) ?? 0
         const retryNote = tried.size
           ? ` (after retries through ${[...tried].join(',')})`
@@ -390,10 +390,11 @@ class HyperliquidBalancer {
         continue
       }
       if (boot !== prev) {
+        // No replay: the restarted worker's boot broadcast already made
+        // every bot re-send its open, and those route here as usual.
         logger.warn(
-          `Hyperliquid worker ${id} restarted (boot ${prev} → ${boot}) — re-sending opens`,
+          `Hyperliquid worker ${id} restarted (boot ${prev} → ${boot})`,
         )
-        await this.resendTo(id)
         this.workerBoot.set(id, boot)
         await this.redisSet?.set(LAST_BOOT_KEY(id), boot)
         states.push(`${id}=restarted(load=${load}/${this.capFor(id)})`)
@@ -454,12 +455,9 @@ class HyperliquidBalancer {
    *     report → drop it. Worker has lost / never had it; the load
    *     count was inflated.
    *   - Worker reports a uuid the balancer has no assignment for →
-   *     create a ghost assignment (workerId set, openPayload `null`).
-   *     This lets future close events route correctly. The ghost is
-   *     in-memory only — not persisted — so it disappears on balancer
-   *     restart and is rebuilt from the next worker report. We can't
-   *     `resendTo` a ghost (no payload), but the worker already holds
-   *     the user so there's nothing to resend anyway.
+   *     adopt it (assignment to that worker, persisted). This lets future
+   *     opens and closes route to the worker that holds the stream, and is
+   *     how `init()` seeds routing after a balancer restart.
    *
    * Silently no-ops if the worker hasn't yet published its user list
    * (e.g. very first tick after a fresh boot).
@@ -476,7 +474,7 @@ class HyperliquidBalancer {
     }
     const actual = new Set(reported)
     let dropped = 0
-    let ghosted = 0
+    let adopted = 0
     for (const [uuid, a] of this.assignments) {
       if (a.workerId !== workerId) continue
       if (actual.has(uuid)) continue
@@ -486,67 +484,38 @@ class HyperliquidBalancer {
     }
     for (const uuid of actual) {
       if (this.assignments.has(uuid)) continue
-      this.assignments.set(uuid, { workerId, openPayload: null })
-      ghosted++
+      this.assignments.set(uuid, { workerId })
+      await this.redisSet?.set(`${ASSIGN_PREFIX}${uuid}`, workerId)
+      adopted++
     }
-    if (dropped || ghosted) {
+    if (dropped || adopted) {
       logger.info(
-        `Hyperliquid reconcile ${workerId}: dropped=${dropped} ghosted=${ghosted}`,
+        `Hyperliquid reconcile ${workerId}: dropped=${dropped} adopted=${adopted}`,
       )
     }
   }
 
+  /** A dead worker's accounts have to move. The balancer holds no open
+   *  message to replay, so it drops the assignments and asks main-app for
+   *  fresh opens; each bot on those accounts re-sends its own, and they
+   *  route to a live worker (or park in `refusedOpens` if none has room). */
   private async rebalanceFrom(deadId: string): Promise<void> {
-    let moved = 0
-    let orphaned = 0
-    let droppedGhosts = 0
+    const uuids: string[] = []
     for (const [uuid, a] of this.assignments) {
       if (a.workerId !== deadId) continue
-      if (a.openPayload === null) {
-        // Ghost — we don't have the open payload to re-publish.
-        // The user was on the dead worker; without the original
-        // payload there's nothing we can hand to a new worker. Drop
-        // it and rely on the bot republishing.
-        this.assignments.delete(uuid)
-        droppedGhosts++
-        continue
-      }
-      const newId = await this.leastLoadedAlive(deadId)
-      if (!newId) {
-        orphaned++
-        continue
-      }
-      a.workerId = newId
-      this.assignments.set(uuid, a)
-      await this.redisSet?.set(`${ASSIGN_PREFIX}${uuid}`, JSON.stringify(a))
-      await this.rabbit.send(workerQueueName(newId), a.openPayload)
-      moved++
+      this.assignments.delete(uuid)
+      await this.redisSet?.del(`${ASSIGN_PREFIX}${uuid}`)
+      uuids.push(uuid)
     }
-    logger.info(
-      `Hyperliquid rebalance from ${deadId}: moved=${moved}, orphaned=${orphaned}, droppedGhosts=${droppedGhosts}`,
-    )
-  }
-
-  private async resendTo(restartedId: string): Promise<void> {
-    let count = 0
-    let skippedGhosts = 0
-    for (const [, a] of this.assignments) {
-      if (a.workerId !== restartedId) continue
-      if (a.openPayload === null) {
-        // Ghost assignment built from a worker's user-list report;
-        // we don't have the original payload to replay. The next bot
-        // republish for this user will recreate the real assignment.
-        skippedGhosts++
-        continue
-      }
-      await this.rabbit.send(workerQueueName(restartedId), a.openPayload)
-      count++
-    }
-    if (count || skippedGhosts) {
-      logger.info(
-        `Hyperliquid re-sent ${count} opens to ${restartedId}${skippedGhosts ? ` (${skippedGhosts} ghosts skipped)` : ''}`,
+    if (uuids.length) {
+      await this.redisSet?.publish(
+        serviceLogRedis,
+        JSON.stringify({ reopen: 'userStream', uuids }),
       )
     }
+    logger.info(
+      `Hyperliquid rebalance from ${deadId}: re-requested ${uuids.length} open(s) from main-app`,
+    )
   }
 
   // ---------------------------------------------------------------- //
@@ -631,15 +600,9 @@ class HyperliquidBalancer {
       const vals = await this.redisSet?.instance?.mGet(reply.keys)
       if (!vals) continue
       reply.keys.forEach((k: string, i: number) => {
-        const uuid = k.slice(ASSIGN_PREFIX.length)
-        const raw = vals[i]
-        if (!raw) return
-        try {
-          this.assignments.set(uuid, JSON.parse(raw) as Assignment)
-        } catch (e) {
-          logger.error(
-            `Hyperliquid balancer: could not parse assignment ${uuid}: ${e}`,
-          )
+        const workerId = vals[i]
+        if (workerId) {
+          this.assignments.set(k.slice(ASSIGN_PREFIX.length), { workerId })
         }
       })
     } while (cursor !== '0')

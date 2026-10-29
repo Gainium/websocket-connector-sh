@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.15] - 2026-10-29
+
+### Changed
+
+- Hyperliquid user-stream balancer: accounts on a worker that stops are now re-opened by the bots that use them (a targeted `serviceLog` reopen request), so the new worker's subscriber count matches the bots on each stream. A restarted worker is re-opened by its own boot broadcast. At boot, routing is seeded from the workers' published user lists.
+- Adds `src/scripts/purgeLegacyHlAssignments.ts`, a one-off removal of the older balancer routing keys.
+
 ## [1.16.14] - 2026-10-29
 
 ### Fixed
