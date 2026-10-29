@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.12] - 2026-10-29
+
+### Fixed
+
+- **Kraken spot candles were stamped one interval late.** The v2 `ohlc` feed carries the bar's opening time in `interval_begin` and its closing time in `timestamp`; the price connector stamped candles with `timestamp`, so each live Kraken spot bar was published, and archived, under the next bar's opening time. Where such a bar met one loaded from Kraken's REST API (stamped correctly), the two collided on one time and a real bar was lost, which showed on charts as a price jump. Candles are now stamped with `interval_begin`.
+
 ## [1.16.11] - 2026-10-29
 
 ### Fixed

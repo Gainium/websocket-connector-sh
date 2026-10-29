@@ -384,7 +384,16 @@ class KrakenConnector extends CommonConnector {
                 c: candle.close || '0',
                 v: candle.volume || '0',
                 i: candle.interval || msg.interval || '1m',
-                t: candle.timestamp ? +new Date(candle.timestamp) : Date.now(),
+                // `interval_begin` is the bar's opening time; `timestamp` is
+                // when it closes (one interval later). Every consumer keys a
+                // bar by its opening time, so stamping `timestamp` put each
+                // Kraken spot bar one interval late.
+                t: candle.interval_begin
+                  ? +new Date(candle.interval_begin)
+                  : candle.timestamp
+                    ? +new Date(candle.timestamp) -
+                      (Number(candle.interval) || 0) * 60_000
+                    : Date.now(),
               },
             },
             exchange,
