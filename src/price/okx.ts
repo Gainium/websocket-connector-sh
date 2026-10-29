@@ -11,6 +11,7 @@ import getAllExchangeInfo, {
   getOkxEuPerpInstruments,
 } from '../utils/exchange'
 import { OKXEnv } from '../utils/env'
+import '../utils/okxWsPort'
 import CommonConnector from './common'
 
 import type {

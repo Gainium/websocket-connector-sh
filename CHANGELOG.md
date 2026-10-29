@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.11] - 2026-10-29
+
+### Fixed
+
+- **OKX WebSocket connections used port 8443, which OKX stops accepting after 31 October 2026.** The EEA and US private streams were hardcoded to port 8443, and every other OKX socket (global and demo private streams, price and candle feeds) fell back to the `okx-api` 2.x default URLs, which also carry port 8443. All OKX WebSocket URLs now use the default port 443; host and path are unchanged.
+
 ## [1.16.10] - 2026-10-12
 
 ### Fixed

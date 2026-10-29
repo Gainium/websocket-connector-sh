@@ -124,6 +124,10 @@ import {
   type ParkContext,
 } from './utils/hyperliquidFillPark'
 import { exchangeUrl } from './utils/env'
+import {
+  OKX_EEA_PRIVATE_WS_URL,
+  OKX_US_PRIVATE_WS_URL,
+} from './utils/okxWsPort'
 import axios from 'axios'
 import { WebsocketClientUta as BitgetUtaClient } from '../bitget-custom/websocket-client-uta'
 import {
@@ -2768,9 +2772,9 @@ class UserConnector {
               market: this.OKXEnv,
               wsUrl:
                 api.okxSource === OKXSource.my
-                  ? 'wss://wseea.okx.com:8443/ws/v5/private'
+                  ? OKX_EEA_PRIVATE_WS_URL
                   : api.okxSource === OKXSource.app
-                    ? 'wss://wsus.okx.com:8443/ws/v5/private'
+                    ? OKX_US_PRIVATE_WS_URL
                     : undefined,
             },
             {
