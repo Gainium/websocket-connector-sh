@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.16] - 2026-10-30
+
+### Fixed
+
+- Hyperliquid: a cancelled order whose remaining size had shrunk without a trade was reported as partly filled by the difference, so the bot booked a quantity that never traded. A cancel like that is now checked against the account's fill history on Hyperliquid, and the report carries only the fills found there (none means nothing executed). If the lookup fails, the previous report is sent and a warning is logged. Spot and perps.
+
 ## [1.16.15] - 2026-10-29
 
 ### Changed

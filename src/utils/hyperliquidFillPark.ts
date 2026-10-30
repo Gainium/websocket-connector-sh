@@ -351,3 +351,51 @@ export function ingestUserFills<TFill extends { cloid?: string }>(
     if (deps.isParked(cloid)) deps.notifyFillArrived(cloid)
   }
 }
+
+/** Max fills Hyperliquid returns per `userFillsByTime` response. */
+const HL_FILLS_PAGE_SIZE = 2000
+/** Pages read before a lookup is declared inconclusive. */
+const DEFAULT_FILL_HISTORY_MAX_PAGES = 5
+
+/**
+ * Read one order's fills from Hyperliquid's fill history (spec 020).
+ *
+ * `fetchPage` is one `userFillsByTime` call. Fills come back oldest first, at
+ * most `pageSize` per call, so a full page continues from its last fill's
+ * time (that ms is re-read and de-duplicated by `tid`). Returns the fills for
+ * `oid` only — empty when the order never traded. Throws when the window needs
+ * more than `maxPages` pages: a partial answer must not be read as "no fills".
+ */
+export async function fetchHyperliquidOrderFills<
+  TFill extends { oid: number; tid: number; time: number },
+>(
+  fetchPage: (startTime: number, endTime: number) => Promise<TFill[]>,
+  q: {
+    oid: number
+    startTime: number
+    endTime: number
+    pageSize?: number
+    maxPages?: number
+  },
+): Promise<TFill[]> {
+  const pageSize = q.pageSize ?? HL_FILLS_PAGE_SIZE
+  const maxPages = q.maxPages ?? DEFAULT_FILL_HISTORY_MAX_PAGES
+  const seen = new Set<number>()
+  const out: TFill[] = []
+  let start = q.startTime
+  for (let page = 1; page <= maxPages; page++) {
+    const fills = (await fetchPage(start, q.endTime)) ?? []
+    for (const f of fills) {
+      if (seen.has(f.tid)) continue
+      seen.add(f.tid)
+      if (f.oid === q.oid) out.push(f)
+    }
+    if (fills.length < pageSize) return out
+    const last = fills[fills.length - 1].time
+    if (last <= start) {
+      throw new Error(`fill history page ${page} did not advance past ${start}`)
+    }
+    start = last
+  }
+  throw new Error(`fill history needs more than ${maxPages} pages`)
+}

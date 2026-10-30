@@ -119,6 +119,7 @@ import HyperliquidSymbolMap, {
   aliasHyperliquidToken,
 } from './utils/hyperliquidSymbols'
 import {
+  fetchHyperliquidOrderFills,
   HyperliquidFillParkResolver,
   ingestUserFills,
   type ParkContext,
@@ -756,6 +757,11 @@ const HL_FILL_PARK_MAX_SIZE = Number(process.env.HL_FILL_PARK_MAX_SIZE) || 5000
 const HL_FILL_REST_RETRIES = Number(process.env.HL_FILL_REST_RETRIES) || 3
 const HL_FILL_REST_RETRY_DELAY_MS =
   Number(process.env.HL_FILL_REST_RETRY_DELAY_MS) || 1000
+// Fill-history check for a cancel whose `sz` shrank (spec 020): request
+// timeout, and slack past `statusTimestamp` for the lookup window.
+const HL_FILL_HISTORY_TIMEOUT_MS =
+  Number(process.env.HL_FILL_HISTORY_TIMEOUT_MS) || 5000
+const HL_FILL_HISTORY_SLACK_MS = 5000
 
 const LAST_STREM_EVENT_TIME_KEY = 'stream:lastEventTime'
 
@@ -881,6 +887,13 @@ class UserConnector {
    * aren't buffered yet (instead of hard-dropping it and freezing the deal),
    * and resolve it from the buffer → REST → limitPx. See hyperliquidFillPark.ts.
    */
+  /** HL info client for the cancel fill-history check (spec 020). */
+  private hlInfo = new hl.InfoClient({
+    transport: new hl.HttpTransport({
+      isTestnet: process.env.HYPERLIQUIDENV === 'demo',
+      timeout: HL_FILL_HISTORY_TIMEOUT_MS,
+    }),
+  })
   private hlFillParkResolver = new HyperliquidFillParkResolver<
     hl.OrderStatus<hl.Order>,
     hl.Fill,
@@ -4439,10 +4452,15 @@ class UserConnector {
    * exactly the legacy behaviour when no fills were buffered. Pure: no buffer
    * mutation, so it's safe to call from the immediate path and the park
    * resolver alike.
+   *
+   * `fromHistory`: `fills` are the order's complete fills read from HL's fill
+   * history (spec 020), so an empty list means nothing executed — not
+   * `origSz − sz`, which HL can lower on a resting order without a fill.
    */
   private buildHyperliquidExecutionReport(
     order: hl.OrderStatus<hl.Order>,
     fills: hl.Fill[],
+    fromHistory = false,
   ): UserDataStreamEvent & { uniqueMessageId?: string } {
     const isFilled = order.status === 'filled'
     let filledSize = +order.order.origSz - +order.order.sz
@@ -4451,6 +4469,10 @@ class UserConnector {
     const pricePrecision =
       price.indexOf('.') >= 0 ? price.split('.')[1].length : 0
     if (isNaN(quote) || !isFinite(quote)) {
+      quote = 0
+    }
+    if (fromHistory && !fills.length) {
+      filledSize = 0
       quote = 0
     }
     const get = fills.length ? fills : undefined
@@ -4614,12 +4636,66 @@ class UserConnector {
         })
         continue
       }
+      if (
+        !isFilled &&
+        order.status !== 'open' &&
+        !(buffered && buffered.length) &&
+        +order.order.origSz - +order.order.sz > 0
+      ) {
+        // A terminal non-fill whose size shrank with no fill seen: HL can
+        // lower `sz` without trading, so ask its fill history (spec 020).
+        const history = await this.hlOrderFillHistory(order, ctx.user)
+        if (history) {
+          out.push(this.buildHyperliquidExecutionReport(order, history, true))
+          continue
+        }
+      }
       out.push(this.buildHyperliquidExecutionReport(order, buffered ?? []))
       if (isFilled && buffered && buffered.length) {
         hyperliquidExpirableMap.delete(cloid)
       }
     }
     return out
+  }
+
+  /** One `userFillsByTime` page for an HL account (stubbed in tests). */
+  private hlFetchFillsPage(
+    user: string,
+    startTime: number,
+    endTime: number,
+  ): Promise<hl.Fill[]> {
+    return this.hlInfo.userFillsByTime({
+      user: user as `0x${string}`,
+      startTime,
+      endTime,
+    })
+  }
+
+  /**
+   * The order's fills from HL's fill history over its lifetime, or `null`
+   * when the lookup failed — the caller then keeps the legacy
+   * `origSz − sz` report (spec 020 §4.3).
+   */
+  private async hlOrderFillHistory(
+    order: hl.OrderStatus<hl.Order>,
+    user: string,
+  ): Promise<hl.Fill[] | null> {
+    try {
+      return await fetchHyperliquidOrderFills(
+        (start, end) => this.hlFetchFillsPage(user, start, end),
+        {
+          oid: order.order.oid,
+          startTime: order.order.timestamp,
+          endTime: order.statusTimestamp + HL_FILL_HISTORY_SLACK_MS,
+        },
+      )
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : `${err}`
+      logger.warn(
+        `[hl-history] fill history lookup failed for cloid ${order.order.cloid} (oid ${order.order.oid}, ${order.status}); reporting origSz - sz as executed: ${msg}`,
+      )
+      return null
+    }
   }
 
   private prepareOkxOutboundAccountInfo(
