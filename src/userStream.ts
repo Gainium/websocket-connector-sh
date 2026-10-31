@@ -778,6 +778,48 @@ const LAST_STREM_EVENT_TIME_KEY = 'stream:lastEventTime'
 const KRAKEN_TRANSPORT_FAILURE_THRESHOLD =
   Number(process.env.USER_STREAM_TRANSPORT_FAILURE_THRESHOLD) || 4
 
+// How long a Kraken Futures private socket may sit open without
+// authenticating before we stop trusting the SDK and rebuild the client.
+// A healthy challenge round-trip takes well under a second.
+export const KRAKEN_AUTH_WATCHDOG_MS =
+  Number(process.env.KRAKEN_AUTH_WATCHDOG_MS) || 30000
+
+/**
+ * Drop an authentication promise left over from a socket that is gone.
+ *
+ * `@siebly/kraken-api` (1.1.3 through at least 1.1.8) treats
+ * `AUTHENTICATION_IN_PROGRESS` as a reserved deferred promise, so
+ * `rejectAllDeferredPromises` skips it when a socket closes. If the socket
+ * dies between sending the Futures challenge and getting the answer, the
+ * promise is never settled. On the next reconnect `assertIsAuthenticated`
+ * finds it and awaits it forever: no re-auth, no resubscribe, while the
+ * socket itself stays up and answers pings — connected but deaf.
+ *
+ * That is what happened fleet-wide after Kraken's 2026-10-30 08:00 UTC
+ * outage, where every room cycled open/close ~60 times in four minutes:
+ * no Futures `fills` / `open_orders` message reached any bot for 16 hours,
+ * until the process restarted.
+ *
+ * Called from the `reconnected` handler, which the SDK emits synchronously
+ * inside `onWsOpen` BEFORE `onWsReadyForEvents` asks for auth, so the new
+ * socket starts a fresh challenge. Removing rather than rejecting: the old
+ * awaiter belongs to a dead connection, and rejecting it would surface as an
+ * unhandled rejection in the SDK's un-awaited open handler.
+ */
+export function clearStaleKrakenAuth(
+  store: {
+    getAuthenticationInProgressPromise: (wsKey: any) => unknown
+    removeAuthenticationInProgressPromise: (wsKey: any) => unknown
+  },
+  wsKey: string,
+): boolean {
+  if (!store.getAuthenticationInProgressPromise(wsKey)) {
+    return false
+  }
+  store.removeAuthenticationInProgressPromise(wsKey)
+  return true
+}
+
 class UserConnector {
   private krakenLastUpdate: { spot: number; usdm: number } = {
     spot: 0,
@@ -3608,12 +3650,54 @@ class UserConnector {
             }
           })
 
+          // Futures only: the private socket must authenticate (challenge)
+          // before it can subscribe, and an open socket that never does is
+          // indistinguishable from a quiet account — see
+          // `clearStaleKrakenAuth`. If no `authenticated` follows an open
+          // within the window, rebuild the client rather than trust the SDK.
+          let authWatchdog: NodeJS.Timeout | undefined
+          const clearAuthWatchdog = () => {
+            if (authWatchdog) {
+              clearTimeout(authWatchdog)
+              authWatchdog = undefined
+            }
+          }
+          const armAuthWatchdog = () => {
+            if (!isFutures) {
+              return
+            }
+            clearAuthWatchdog()
+            authWatchdog = setTimeout(() => {
+              authWatchdog = undefined
+              // A breaker already owns this room and has its own retry.
+              if ((this.authCooldownUntil.get(id) ?? 0) > Date.now()) {
+                return
+              }
+              this.logger(
+                `${id} ${userId} Kraken ws open ${Math.round(
+                  KRAKEN_AUTH_WATCHDOG_MS / 1000,
+                )}s without authenticating; rebuilding the client ${api.provider}`,
+                true,
+              )
+              try {
+                close()
+              } catch {
+                /* closing a half-open client must never throw */
+              }
+              this.users = this.users.filter((u) => u.id !== id)
+              const subs = this.subscribersMap.get(id)
+              this.subscribersMap.delete(id)
+              this.scheduleAuthSelfHeal(id, subs, msg, uuid, 1000)
+            }, KRAKEN_AUTH_WATCHDOG_MS)
+          }
+
           client.on('open', () => {
             // Reaching an open socket ends the transport-failure run: whatever
             // the venue was doing, it is answering upgrades again.
             this.transportFailures.delete(id)
             lastSdkErrorText = ''
             this.logger(`${id} Kraken ws connection opened ${api.provider}`)
+            armAuthWatchdog()
           })
 
           client.on('authenticated', () => {
@@ -3622,6 +3706,7 @@ class UserConnector {
             // inheriting a minute-long backoff earned during the last one.
             this.transportFailures.delete(id)
             this.transportStrikes.delete(id)
+            clearAuthWatchdog()
             this.logger(`${id} Kraken ws authenticated ${api.provider}`)
           })
 
@@ -3648,6 +3733,12 @@ class UserConnector {
 
           client.on('reconnected', () => {
             this.logger(`${id} Kraken ws has reconnected ${api.provider}`)
+            if (clearStaleKrakenAuth(client.getWsStore(), wsKey)) {
+              this.logger(
+                `${id} Kraken ws dropped a stale auth-in-progress from the previous socket ${api.provider}`,
+              )
+            }
+            armAuthWatchdog()
             // Tell this account's bots to reconcile, exactly as the bybit and
             // bitget reconnect handlers already do. Without it the ONLY thing a
             // reconnect did was bump the flap counter, and any `executions`
@@ -3671,6 +3762,7 @@ class UserConnector {
           })
 
           const close = () => {
+            clearAuthWatchdog()
             client.closeAll(true)
             client.removeAllListeners('message')
             client.removeAllListeners('open')

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.18] - 2026-10-31
+
+### Fixed
+
+- Kraken Futures: after a reconnect, the private stream could come back connected but never sign in again, so order and fill updates stopped arriving until the service restarted. This happened when the previous connection dropped in the middle of signing in: the Kraken client library kept waiting on that old sign-in forever. The leftover sign-in is now cleared on every reconnect, and a Futures connection that has not signed in within 30 seconds of opening is rebuilt (`KRAKEN_AUTH_WATCHDOG_MS`).
+
 ## [1.16.17] - 2026-10-31
 
 ### Fixed
