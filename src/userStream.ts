@@ -762,6 +762,12 @@ const HL_FILL_REST_RETRY_DELAY_MS =
 const HL_FILL_HISTORY_TIMEOUT_MS =
   Number(process.env.HL_FILL_HISTORY_TIMEOUT_MS) || 5000
 const HL_FILL_HISTORY_SLACK_MS = 5000
+// A failed fill-history lookup is retried before `origSz − sz` is reported
+// (spec 020 §4.3): attempts after the first, and the base backoff between them
+// (doubles each attempt — 4s, 8s, 16s ≈ 30s by default).
+const HL_FILL_HISTORY_RETRIES = Number(process.env.HL_FILL_HISTORY_RETRIES) || 3
+const HL_FILL_HISTORY_RETRY_DELAY_MS =
+  Number(process.env.HL_FILL_HISTORY_RETRY_DELAY_MS) || 4000
 
 const LAST_STREM_EVENT_TIME_KEY = 'stream:lastEventTime'
 
@@ -894,6 +900,11 @@ class UserConnector {
       timeout: HL_FILL_HISTORY_TIMEOUT_MS,
     }),
   })
+  /** Retry budget for a failed cancel fill-history lookup (spec 020 §4.3). */
+  private hlHistoryRetries = HL_FILL_HISTORY_RETRIES
+  private hlHistoryRetryDelayMs = HL_FILL_HISTORY_RETRY_DELAY_MS
+  /** Cloids whose cancel report is waiting on a fill-history retry. */
+  private hlHistoryDeferred = new Set<string>()
   private hlFillParkResolver = new HyperliquidFillParkResolver<
     hl.OrderStatus<hl.Order>,
     hl.Fill,
@@ -4644,11 +4655,17 @@ class UserConnector {
       ) {
         // A terminal non-fill whose size shrank with no fill seen: HL can
         // lower `sz` without trading, so ask its fill history (spec 020).
-        const history = await this.hlOrderFillHistory(order, ctx.user)
+        if (this.hlHistoryDeferred.has(cloid)) {
+          continue
+        }
+        const history = await this.hlOrderFillHistory(order, ctx.user, 1)
         if (history) {
           out.push(this.buildHyperliquidExecutionReport(order, history, true))
           continue
         }
+        // Inconclusive: retry off this batch before trusting `origSz − sz`.
+        void this.hlRetryOrderFillHistory(order, ctx.roomId, ctx.user)
+        continue
       }
       out.push(this.buildHyperliquidExecutionReport(order, buffered ?? []))
       if (isFilled && buffered && buffered.length) {
@@ -4672,13 +4689,51 @@ class UserConnector {
   }
 
   /**
+   * Retry a shrunk cancel's failed fill-history lookup with backoff and emit
+   * its report once one succeeds. Only when every attempt fails is the legacy
+   * `origSz − sz` report emitted, logged as an error (spec 020 §4.3).
+   */
+  private async hlRetryOrderFillHistory(
+    order: hl.OrderStatus<hl.Order>,
+    roomId: string,
+    user: string,
+  ): Promise<void> {
+    const cloid = `${order.order.cloid}`
+    this.hlHistoryDeferred.add(cloid)
+    const attempts = 1 + this.hlHistoryRetries
+    try {
+      for (let attempt = 2; attempt <= attempts; attempt++) {
+        await sleep(this.hlHistoryRetryDelayMs * 2 ** (attempt - 2))
+        const history = await this.hlOrderFillHistory(order, user, attempt)
+        if (history) {
+          this.userStreamEvent(
+            roomId,
+            this.buildHyperliquidExecutionReport(order, history, true),
+          )
+          return
+        }
+      }
+      this.logger(
+        `[hl-history] fill history unavailable for cloid ${cloid} (oid ${order.order.oid}, ${order.status}) after ${attempts} attempts; reporting origSz - sz as executed`,
+        true,
+      )
+      this.userStreamEvent(
+        roomId,
+        this.buildHyperliquidExecutionReport(order, []),
+      )
+    } finally {
+      this.hlHistoryDeferred.delete(cloid)
+    }
+  }
+
+  /**
    * The order's fills from HL's fill history over its lifetime, or `null`
-   * when the lookup failed — the caller then keeps the legacy
-   * `origSz − sz` report (spec 020 §4.3).
+   * when the lookup failed — the caller then retries it (spec 020 §4.3).
    */
   private async hlOrderFillHistory(
     order: hl.OrderStatus<hl.Order>,
     user: string,
+    attempt: number,
   ): Promise<hl.Fill[] | null> {
     try {
       return await fetchHyperliquidOrderFills(
@@ -4692,7 +4747,7 @@ class UserConnector {
     } catch (err) {
       const msg = err instanceof Error ? err.message : `${err}`
       logger.warn(
-        `[hl-history] fill history lookup failed for cloid ${order.order.cloid} (oid ${order.order.oid}, ${order.status}); reporting origSz - sz as executed: ${msg}`,
+        `[hl-history] fill history lookup failed for cloid ${order.order.cloid} (oid ${order.order.oid}, ${order.status}), attempt ${attempt}/${1 + this.hlHistoryRetries}: ${msg}`,
       )
       return null
     }

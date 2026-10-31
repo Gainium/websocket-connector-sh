@@ -119,14 +119,84 @@ test('§4.2 spot coin (@N) is matched by oid the same way', async () => {
   assert.equal(+report.totalTradeQuantity, 0.01)
 })
 
-test('§4.3 history lookup fails → old origSz − sz behaviour, warned', async () => {
-  const { uc, logs } = connector(async () => {
+// A failed lookup defers the report; the retries run on the instance's own
+// delay, zeroed here so the tests don't wait out the real backoff.
+const deferred = (pages: (p: Page) => Promise<unknown[]>) => {
+  const c = connector(pages)
+  const emitted: { roomId: string; event: any }[] = []
+  const errors: string[] = []
+  c.uc.hlHistoryRetryDelayMs = 0
+  c.uc.userStreamEvent = (roomId: string, event: any) =>
+    emitted.push({ roomId, event })
+  ;(logger as any).error = (msg: string) => errors.push(msg)
+  return { ...c, emitted, errors }
+}
+
+const settle = async (done: () => boolean) => {
+  for (let i = 0; i < 200 && !done(); i++) {
+    await new Promise((r) => setTimeout(r, 1))
+  }
+}
+
+test('§4.3 history lookup fails → no report yet; a later successful lookup decides the quantity', async () => {
+  let n = 0
+  const { uc, calls, emitted, logs } = deferred(async () => {
+    if (++n < 3) throw new Error('timeout')
+    return [fill({ oid: 565056346750, tid: 10, sz: '1.08' })]
+  })
+  const out = await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
+  assert.equal(out.length, 0, 'origSz − sz must not be reported inline')
+  await settle(() => emitted.length > 0)
+  assert.equal(calls.length, 3)
+  assert.equal(emitted.length, 1)
+  assert.equal(emitted[0].roomId, 'room')
+  assert.equal(emitted[0].event.orderStatus, 'CANCELED')
+  assert.equal(+emitted[0].event.totalTradeQuantity, 0)
+  assert.equal(emitted[0].event.feePaid, undefined)
+  assert.ok(logs.some((l) => l.includes(CLOID) && l.includes(`${OID}`)))
+})
+
+test('§4.3 a deferred cancel does not hold back the rest of the batch', async () => {
+  const { uc, emitted } = deferred(async () => {
     throw new Error('timeout')
   })
-  const [report] = await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
-  assert.equal(report.orderStatus, 'CANCELED')
-  assert.ok(Math.abs(+report.totalTradeQuantity - 0.05) < 1e-9)
-  assert.ok(logs.some((l) => l.includes(CLOID) && l.includes(`${OID}`)))
+  const other = cancelFrame({ cloid: '0x01', oid: 1, sz: '1.02' })
+  const out = await uc.prepareHyperliquidOrder([cancelFrame(), other], ctx)
+  assert.equal(out.length, 1)
+  assert.equal(out[0].orderStatus, 'CANCELED')
+  await settle(() => emitted.length > 0)
+})
+
+test('§4.3 every lookup fails → origSz − sz reported once, error names cloid, oid and attempts', async () => {
+  const { uc, calls, emitted, errors } = deferred(async () => {
+    throw new Error('timeout')
+  })
+  const out = await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
+  assert.equal(out.length, 0)
+  await settle(() => emitted.length > 0)
+  const attempts = 1 + uc.hlHistoryRetries
+  assert.equal(calls.length, attempts)
+  assert.equal(emitted.length, 1)
+  assert.ok(Math.abs(+emitted[0].event.totalTradeQuantity - 0.05) < 1e-9)
+  assert.ok(
+    errors.some(
+      (l) =>
+        l.includes(CLOID) &&
+        l.includes(`${OID}`) &&
+        l.includes(`${attempts} attempt`),
+    ),
+  )
+})
+
+test('§4.3 the same cancel replayed while deferred is reported once', async () => {
+  const { uc, emitted } = deferred(async () => {
+    throw new Error('timeout')
+  })
+  await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
+  await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
+  await settle(() => emitted.length > 0)
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(emitted.length, 1)
 })
 
 test('§4.4 no history request when sz did not shrink, for open, or with buffered fills', async () => {
@@ -171,7 +241,7 @@ test('§4.5 pages forward on a full page, de-duplicates by tid, filters by oid',
   )
 })
 
-test('§4.3/§4.5 more pages than the cap → throws (caller keeps the old behaviour)', async () => {
+test('§4.3/§4.5 more pages than the cap → throws (caller retries the lookup)', async () => {
   let t = 0
   await assert.rejects(
     fetchHyperliquidOrderFills(

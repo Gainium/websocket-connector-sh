@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.17] - 2026-10-31
+
+### Fixed
+
+- Hyperliquid: when the fill-history check for a cancelled order with a shrunk size could not be read (timeout, rate limit, too many pages), the difference between the original and remaining size was still reported as executed straight away. The lookup is now retried with backoff (about 30 seconds in total) before anything is reported for that order, and the report uses the first successful answer. Only if every attempt fails is the previous size-difference report sent, logged as an error. Other orders in the same update are not delayed.
+
 ## [1.16.16] - 2026-10-30
 
 ### Fixed
