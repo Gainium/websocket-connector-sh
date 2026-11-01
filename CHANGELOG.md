@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.19] - 2026-10-31
+
+### Fixed
+
+- Hyperliquid: two identical cancel updates processed at the same moment could each start their own fill-history check and both be reported. The order is now claimed before its first check, so it is reported once.
+- Hyperliquid: Hyperliquid's fill history only keeps an account's most recent fills, so an order placed long enough ago can look fill-less even when it traded. A cancelled order's executed size is now lowered below the original-minus-remaining size only when the retained history reaches back to the order's placement; otherwise the previous size is kept and a warning is logged.
+
 ## [1.16.18] - 2026-10-31
 
 ### Fixed

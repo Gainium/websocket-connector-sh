@@ -83,7 +83,9 @@ test('§4.1 cancel with shrunk sz and no fill in HL history → 0 executed, no f
     fill({ oid: 566211066756, tid: 11, sz: '5.36' }),
   ])
   const [report] = await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
-  assert.equal(calls.length, 1)
+  // The order's window, then the §4.6 coverage probe (oldest retained fills).
+  assert.equal(calls.length, 2)
+  assert.equal(calls[1].startTime, 0)
   assert.equal(calls[0].user, '0xabc')
   assert.equal(calls[0].startTime, PLACED)
   assert.ok(calls[0].endTime >= CANCELED)
@@ -147,7 +149,8 @@ test('§4.3 history lookup fails → no report yet; a later successful lookup de
   const out = await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
   assert.equal(out.length, 0, 'origSz − sz must not be reported inline')
   await settle(() => emitted.length > 0)
-  assert.equal(calls.length, 3)
+  // Two failed window reads, the third succeeds, then the §4.6 probe.
+  assert.equal(calls.filter((c) => c.startTime !== 0).length, 3)
   assert.equal(emitted.length, 1)
   assert.equal(emitted[0].roomId, 'room')
   assert.equal(emitted[0].event.orderStatus, 'CANCELED')
@@ -197,6 +200,82 @@ test('§4.3 the same cancel replayed while deferred is reported once', async () 
   await settle(() => emitted.length > 0)
   await new Promise((r) => setTimeout(r, 20))
   assert.equal(emitted.length, 1)
+})
+
+test('§4.3 the same cancel replayed CONCURRENTLY while its lookup fails is reported once', async () => {
+  const { uc, emitted } = deferred(async () => {
+    throw new Error('timeout')
+  })
+  const outs = await Promise.all([
+    uc.prepareHyperliquidOrder([cancelFrame()], ctx),
+    uc.prepareHyperliquidOrder([cancelFrame()], ctx),
+  ])
+  assert.equal(outs.flat().length, 0)
+  await settle(() => emitted.length > 0)
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(emitted.length, 1)
+})
+
+test('§4.3 the same cancel replayed CONCURRENTLY with a good lookup is reported once', async () => {
+  const { uc, calls } = connector(async () => [])
+  const outs = await Promise.all([
+    uc.prepareHyperliquidOrder([cancelFrame()], ctx),
+    uc.prepareHyperliquidOrder([cancelFrame()], ctx),
+  ])
+  assert.equal(outs.flat().length, 1)
+  assert.equal(calls.filter((c) => c.startTime !== 0).length, 1)
+  // Released on success: a later replay is looked up again, as before.
+  const later = await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
+  assert.equal(later.length, 1)
+})
+
+// A full page served for startTime 0 whose oldest fill is `oldest`: HL has
+// evicted everything before it (it keeps only the most recent fills).
+const retained = (oldest: number) =>
+  Array.from({ length: 2000 }, (_, i) =>
+    fill({ oid: 1, tid: 100000 + i, time: oldest + i }),
+  )
+
+test('§4.6 history evicted past the order placement → origSz − sz kept, warned', async () => {
+  const { uc, calls, logs } = connector(async (p) =>
+    p.startTime === 0 ? retained(PLACED + 60_000) : [],
+  )
+  const [report] = await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
+  assert.equal(calls.length, 2)
+  assert.equal(report.orderStatus, 'CANCELED')
+  assert.ok(Math.abs(+report.totalTradeQuantity - 0.05) < 1e-9)
+  assert.ok(
+    logs.some(
+      (l) => l.includes(CLOID) && l.includes(`${OID}`) && l.includes('reach'),
+    ),
+  )
+})
+
+test('§4.6 retained history reaches before the placement → 0 executed, as today', async () => {
+  const { uc } = connector(async (p) =>
+    p.startTime === 0 ? retained(PLACED - 60_000) : [],
+  )
+  const [report] = await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
+  assert.equal(+report.totalTradeQuantity, 0)
+})
+
+test('§4.6 fills already account for origSz − sz → no coverage probe', async () => {
+  const { uc, calls } = connector(async () => [
+    fill({ tid: 1, sz: '0.05' }),
+  ])
+  const [report] = await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
+  assert.equal(calls.length, 1)
+  assert.ok(Math.abs(+report.totalTradeQuantity - 0.05) < 1e-9)
+})
+
+test('§4.6 coverage probe fails → treated as a failed lookup (deferred, retried)', async () => {
+  const { uc, emitted } = deferred(async (p) => {
+    if (p.startTime === 0) throw new Error('timeout')
+    return []
+  })
+  const out = await uc.prepareHyperliquidOrder([cancelFrame()], ctx)
+  assert.equal(out.length, 0)
+  await settle(() => emitted.length > 0)
 })
 
 test('§4.4 no history request when sz did not shrink, for open, or with buffered fills', async () => {

@@ -366,6 +366,26 @@ const DEFAULT_FILL_HISTORY_MAX_PAGES = 5
  * `oid` only — empty when the order never traded. Throws when the window needs
  * more than `maxPages` pages: a partial answer must not be read as "no fills".
  */
+/**
+ * Whether Hyperliquid's fill history still reaches back to `since` (spec 020
+ * §4.6). `userFillsByTime` serves only an account's most recent fills (about
+ * 10,000; a busy account measured on 2026-10-31 kept ~25h), so an order window
+ * that holds no fill can mean "evicted", not "never filled". `oldestPage` is
+ * the answer for `startTime: 0` — HL returns the oldest retained fills first.
+ * A short page means nothing was ever evicted; otherwise its oldest fill must
+ * be strictly older than `since` (an eviction can cut inside one millisecond).
+ */
+export function hyperliquidFillHistoryCovers(
+  oldestPage: readonly { time: number }[],
+  since: number,
+  pageSize = HL_FILLS_PAGE_SIZE,
+): boolean {
+  if (oldestPage.length < pageSize) {
+    return true
+  }
+  return oldestPage.reduce((m, f) => Math.min(m, f.time), Infinity) < since
+}
+
 export async function fetchHyperliquidOrderFills<
   TFill extends { oid: number; tid: number; time: number },
 >(

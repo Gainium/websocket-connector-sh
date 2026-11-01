@@ -120,6 +120,7 @@ import HyperliquidSymbolMap, {
 } from './utils/hyperliquidSymbols'
 import {
   fetchHyperliquidOrderFills,
+  hyperliquidFillHistoryCovers,
   HyperliquidFillParkResolver,
   ingestUserFills,
   type ParkContext,
@@ -4750,9 +4751,13 @@ class UserConnector {
         if (this.hlHistoryDeferred.has(cloid)) {
           continue
         }
+        // Claimed before the first await: an identical frame arriving while
+        // this lookup is in flight must not start a second report (§4.3).
+        this.hlHistoryDeferred.add(cloid)
         const history = await this.hlOrderFillHistory(order, ctx.user, 1)
         if (history) {
-          out.push(this.buildHyperliquidExecutionReport(order, history, true))
+          this.hlHistoryDeferred.delete(cloid)
+          out.push(this.hlHistoryReport(order, history))
           continue
         }
         // Inconclusive: retry off this batch before trusting `origSz − sz`.
@@ -4798,10 +4803,7 @@ class UserConnector {
         await sleep(this.hlHistoryRetryDelayMs * 2 ** (attempt - 2))
         const history = await this.hlOrderFillHistory(order, user, attempt)
         if (history) {
-          this.userStreamEvent(
-            roomId,
-            this.buildHyperliquidExecutionReport(order, history, true),
-          )
+          this.userStreamEvent(roomId, this.hlHistoryReport(order, history))
           return
         }
       }
@@ -4819,16 +4821,36 @@ class UserConnector {
   }
 
   /**
-   * The order's fills from HL's fill history over its lifetime, or `null`
-   * when the lookup failed — the caller then retries it (spec 020 §4.3).
+   * The report for a shrunk cancel whose history was read. Only a history that
+   * reaches back to the order's placement may lower the executed size below
+   * `origSz − sz`; one that does not is no evidence either way, so the pre-020
+   * report is kept, warned (spec 020 §4.6).
+   */
+  private hlHistoryReport(
+    order: hl.OrderStatus<hl.Order>,
+    history: { fills: hl.Fill[]; covered: boolean },
+  ): UserDataStreamEvent & { uniqueMessageId?: string } {
+    if (history.covered) {
+      return this.buildHyperliquidExecutionReport(order, history.fills, true)
+    }
+    logger.warn(
+      `[hl-history] fill history for cloid ${order.order.cloid} (oid ${order.order.oid}, ${order.status}) does not reach back to its placement at ${order.order.timestamp}; reporting origSz - sz as executed`,
+    )
+    return this.buildHyperliquidExecutionReport(order, [])
+  }
+
+  /**
+   * The order's fills from HL's fill history over its lifetime, and whether
+   * that history covers its whole life (§4.6), or `null` when the lookup
+   * failed — the caller then retries it (spec 020 §4.3).
    */
   private async hlOrderFillHistory(
     order: hl.OrderStatus<hl.Order>,
     user: string,
     attempt: number,
-  ): Promise<hl.Fill[] | null> {
+  ): Promise<{ fills: hl.Fill[]; covered: boolean } | null> {
     try {
-      return await fetchHyperliquidOrderFills(
+      const fills = await fetchHyperliquidOrderFills(
         (start, end) => this.hlFetchFillsPage(user, start, end),
         {
           oid: order.order.oid,
@@ -4836,6 +4858,16 @@ class UserConnector {
           endTime: order.statusTimestamp + HL_FILL_HISTORY_SLACK_MS,
         },
       )
+      const shrunk = +order.order.origSz - +order.order.sz
+      const filled = fills.reduce((a, f) => a + +f.sz, 0)
+      // Fills that already account for the shrink lower nothing: no probe.
+      const covered =
+        filled >= shrunk - Math.max(shrunk * 1e-9, 1e-12) ||
+        hyperliquidFillHistoryCovers(
+          await this.hlFetchFillsPage(user, 0, Date.now()),
+          order.order.timestamp,
+        )
+      return { fills, covered }
     } catch (err) {
       const msg = err instanceof Error ? err.message : `${err}`
       logger.warn(
