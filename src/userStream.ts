@@ -21,7 +21,16 @@ import { CategoryV5 } from 'bybit-api'
 import { WebsocketClient as BybitClient } from '../bybit-custom/websocket-client'
 import { WebsocketClient as OKXClient, WsChannelArgInstType } from 'okx-api'
 import { WebsocketClientV2 as BitgetClient, BitgetInstTypeV2 } from 'bitget-api'
-import { WebsocketClient as KrakenWsClient } from '@siebly/kraken-api'
+import {
+  WebsocketClient as KrakenWsClient,
+  DerivativesClient as KrakenDerivativesClient,
+} from '@siebly/kraken-api'
+import {
+  KrakenFillTotals,
+  KrakenRestFill,
+  krakenQty,
+  mergeKrakenRestFills,
+} from './utils/krakenFillSettle'
 
 /**
  * Monkeypatch @siebly/kraken-api BaseWSClient to prevent unhandled rejections
@@ -689,10 +698,21 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
 // The `fills` feed is incremental; the ExecutionReport contract is cumulative.
 // See prepareKrakenOrderMsg. Entries expire on their own so an order whose last
 // fill we never see cannot leak.
-const krakenFillTotals = new ExpirableMap<
-  string,
-  { qty: number; cost: number; fillIds: Set<string> }
->(60 * 60 * 1000)
+const krakenFillTotals = new ExpirableMap<string, KrakenFillTotals>(
+  60 * 60 * 1000,
+)
+
+// Settling a completed Kraken futures order on REST (see utils/krakenFillSettle):
+// how long to let the venue's fill history catch up with the fill that closed
+// the order, and how long the REST call may take before the stream's own total
+// is reported instead.
+const KRAKEN_FILL_SETTLE_DELAY_MS =
+  Number(process.env.KRAKEN_FILL_SETTLE_DELAY_MS) || 1000
+const KRAKEN_FILL_SETTLE_TIMEOUT_MS =
+  Number(process.env.KRAKEN_FILL_SETTLE_TIMEOUT_MS) || 5000
+
+/** The order's fills from REST, or `null` when the lookup failed. */
+type KrakenFillSettler = (orderId: string) => Promise<KrakenRestFill[] | null>
 
 /**
  * One `fills` message can carry a whole batch, and Kraken delivers it
@@ -3596,6 +3616,45 @@ class UserConnector {
 
           client.subscribe(krakenTopics, wsKey)
 
+          // REST read of a completed futures order's fills, so its FILLED
+          // report carries every fill and not only those the feed has
+          // delivered so far (utils/krakenFillSettle). `null` on any failure:
+          // the stream's own total is reported, as before.
+          const restClient = isFutures
+            ? new KrakenDerivativesClient({
+                apiKey: api.key,
+                apiSecret: api.secret,
+                ...(isDemo && { testnet: true }),
+              })
+            : undefined
+          const settleFills: KrakenFillSettler | undefined = restClient
+            ? async (orderId) => {
+                await sleep(KRAKEN_FILL_SETTLE_DELAY_MS)
+                let timer: NodeJS.Timeout | undefined
+                try {
+                  const res = await Promise.race([
+                    restClient.getFills(),
+                    new Promise<never>((_, reject) => {
+                      timer = setTimeout(
+                        () => reject(new Error('timeout')),
+                        KRAKEN_FILL_SETTLE_TIMEOUT_MS,
+                      )
+                    }),
+                  ])
+                  return (res.fills ?? []).filter((f) => f.order_id === orderId)
+                } catch (e) {
+                  this.logger(
+                    `${id} ${userId} Kraken fill settle for ${orderId} failed, reporting the stream total: ${
+                      e instanceof Error ? e.message : safeStringify(e)
+                    } ${api.provider}`,
+                  )
+                  return null
+                } finally {
+                  clearTimeout(timer)
+                }
+              }
+            : undefined
+
           client.on('message', async (msg: any) => {
             const ref = isFutures ? msg.feed : msg.channel
             if (ref.endsWith('_snapshot')) {
@@ -3612,6 +3671,7 @@ class UserConnector {
                 msg,
                 ref,
                 api.provider as ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
+                settleFills,
               )
               orders.forEach((order) => this.userStreamEvent(id, order))
             }
@@ -5185,6 +5245,7 @@ class UserConnector {
     msg: any,
     channel: string,
     exchange: ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
+    settleFills?: KrakenFillSettler,
   ): Promise<ExecutionReport[]> {
     if (!msg) {
       return []
@@ -5288,7 +5349,8 @@ class UserConnector {
 
     // Kraken futures fills format
     if (channel === 'fills' && msg.fills && Array.isArray(msg.fills)) {
-      return chronologicalKrakenFills(msg.fills).map((fill: any) => {
+      const reports: ExecutionReport[] = []
+      for (const fill of chronologicalKrakenFills(msg.fills) as any[]) {
         const symbol =
           maps.wsnameToNormalized.get(fill.instrument) || fill.instrument || ''
         // Kraken's `fills` feed reports THIS fill only (`qty`/`price`), but
@@ -5311,12 +5373,27 @@ class UserConnector {
           fillIds: new Set<string>(),
         }
         const fillId = `${fill.fill_id ?? fill.seq ?? ''}`
-        if (!totals.fillIds.has(fillId)) {
+        const isNewFill = !totals.fillIds.has(fillId)
+        if (isNewFill) {
           totals.fillIds.add(fillId)
           totals.qty += fillQty
           totals.cost += fillQty * fillPrice
         }
         krakenFillTotals.set(orderKey, totals)
+        // The order has already been reported FILLED. Whatever arrives now is
+        // an EARLIER execution delivered late (the remaining-0 fill is the last
+        // one executed); its `remaining_order_qty` is stale, and a second
+        // report would either reopen the order or, as FILLED, make main-app
+        // chase the difference with another reduce-only order. The REST settle
+        // below should already have counted it — say so if it had not.
+        if (totals.settled) {
+          if (isNewFill && totals.settled === 'reported') {
+            logger.warn(
+              `KRAKEN-LATE-FILL ${orderKey} ${fill.cli_ord_id ?? ''} fill ${fillId} qty ${fillQty} arrived after FILLED was reported; the reported total missed it (now ${krakenQty(totals.qty)})`,
+            )
+          }
+          continue
+        }
         // Status and original size from the CUMULATIVE executed quantity paired
         // with what is still open — the same arithmetic the `open_orders` feed
         // below uses, so one order cannot be read two ways (spec 009 §4.2).
@@ -5324,11 +5401,37 @@ class UserConnector {
         // where it sat in a sequence this branch did not know, and a fill that
         // omits the field failed the identity check and left the order
         // PARTIALLY_FILLED at its full quantity forever.
-        const { status, total } = krakenOpenOrderFill({
+        let { status, total } = krakenOpenOrderFill({
           qty: remaining,
           filled: totals.qty,
         })
-        return {
+        // Remaining 0 says this was the last fill EXECUTED, not that every
+        // earlier one has been delivered — the feed reorders them, sometimes by
+        // seconds, and main-app books the close on the first FILLED only. Read
+        // the order's fills from REST before reporting it (see
+        // utils/krakenFillSettle). Marked first so fills of this order that
+        // arrive while the lookup is out are absorbed into the total, not
+        // emitted with their stale remaining.
+        if (status === 'FILLED' && settleFills && orderKey) {
+          totals.settled = 'settling'
+          const restFills = await settleFills(orderKey)
+          if (restFills) {
+            const added = mergeKrakenRestFills(totals, orderKey, restFills)
+            if (added) {
+              logger.info(
+                `Kraken ${orderKey} ${fill.cli_ord_id ?? ''}: ${added} fill(s) the stream had not delivered were found on REST; executed ${krakenQty(totals.qty)}`,
+              )
+            }
+          }
+          ;({ status, total } = krakenOpenOrderFill({
+            qty: remaining,
+            filled: totals.qty,
+          }))
+        }
+        if (status === 'FILLED') {
+          totals.settled = 'reported'
+        }
+        reports.push({
           creationTime: fill.time || Date.now(),
           eventTime: fill.time || Date.now(),
           eventType: 'executionReport',
@@ -5339,15 +5442,16 @@ class UserConnector {
           orderType: fill.order_type === 'limit' ? 'LIMIT' : 'MARKET',
           originalClientOrderId: fill.cli_ord_id || fill.order_id || '',
           price: `${fillPrice}`,
-          quantity: `${total}`,
+          quantity: `${krakenQty(total)}`,
           side: fill.buy ? 'BUY' : 'SELL',
           symbol,
           totalQuoteTradeQuantity: `${totals.cost}`,
-          totalTradeQuantity: `${totals.qty}`,
+          totalTradeQuantity: `${krakenQty(totals.qty)}`,
           uniqueMessageId: `kraken${channel}${JSON.stringify(fill)}`,
           liquidation: false,
-        }
-      })
+        })
+      }
+      return reports
     }
 
     // Kraken futures open_orders format
