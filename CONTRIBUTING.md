@@ -83,7 +83,9 @@ git rebase --signoff HEAD~<N>
 
 - Open the PR against `main`.
 - Keep the diff small and focused — one PR per logical change.
-- Update [`CHANGELOG.md`](./CHANGELOG.md) if the change is user-visible.
+- If the change is user-visible, add an entry under [`.changes/`](./.changes/README.md).
+  Don't edit the `version` in `package.json` or add a release section to
+  `CHANGELOG.md`: both are assigned when the change is released.
 - CI must be green before review.
 
 PRs without a `Signed-off-by` line on every commit will be blocked until
