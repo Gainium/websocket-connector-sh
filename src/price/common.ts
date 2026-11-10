@@ -1,7 +1,6 @@
 import { parentPort } from 'worker_threads'
 import { ExchangeEnum } from '../utils/common'
 import RedisClient, { RedisWrapper } from '../utils/redis'
-import sleep from '../utils/sleep'
 import logger from '../utils/logger'
 import { stallCounter } from './stallEscalation'
 
@@ -48,6 +47,10 @@ class CommonConnector {
     }
   }
   private redis: RedisWrapper | null = null
+  /** Tickers published between two yields to the event loop (`cbWs`). */
+  private tickerYieldEvery = 200
+  /** Per exchange: the ticker frame currently being published, if any. */
+  private tickerTail: Map<ExchangeEnum, Promise<void>> = new Map()
 
   /**
    * Fix #1 (stall isolation): before crashing the whole worker on a stall, a
@@ -101,11 +104,41 @@ class CommonConnector {
     return [symbol, interval]
   }
 
-  async cbWs(trades: Ticker[], exchange: ExchangeEnum) {
+  /**
+   * Publish one ticker frame. A frame is published as fast as the loop allows:
+   * control goes back to the event loop only every `tickerYieldEvery` tickers,
+   * and through `setImmediate`, which lets pending socket I/O run without the
+   * >=1ms a timer costs. Frames of one exchange are published one after
+   * another, so a frame that arrives while a large one is still being
+   * published cannot overtake it and leave an older price as the latest
+   * message for a symbol.
+   */
+  async cbWs(trades: Ticker[], exchange: ExchangeEnum): Promise<void> {
     this.mainData[exchange].lastData = +new Date()
     this.targetedRestarts.delete(exchange)
     stallCounter.noteData(exchange, 'price')
+    const prev = this.tickerTail.get(exchange)
+    const run = prev
+      ? prev.then(() => this.publishTickers(trades, exchange))
+      : this.publishTickers(trades, exchange)
+    const tail = run.catch(() => undefined)
+    this.tickerTail.set(exchange, tail)
+    tail.then(() => {
+      if (this.tickerTail.get(exchange) === tail) {
+        this.tickerTail.delete(exchange)
+      }
+    })
+    return run
+  }
+
+  private async publishTickers(trades: Ticker[], exchange: ExchangeEnum) {
+    let sinceYield = 0
     for (const trade of trades) {
+      if (sinceYield >= this.tickerYieldEvery) {
+        sinceYield = 0
+        await new Promise<void>((resolve) => setImmediate(resolve))
+      }
+      sinceYield++
       const symbol = trade.symbol as string
       const data = {
         symbol,
@@ -125,8 +158,6 @@ class CommonConnector {
         `trade@${symbol}@${exchange}`,
         JSON.stringify({ ...data, exchange }),
       )
-
-      await sleep(0)
     }
   }
 
