@@ -99,6 +99,7 @@ import {
   resetKrakenMaps,
 } from './utils/exchange'
 import { convertSymbol, convertSymbolToKucoin } from './utils/kucoin'
+import { createKucoinFeeSettler } from './utils/kucoinFeeSettle'
 import { ExchangeEnum, mapPaperToReal, wsLoggerOptions } from './utils/common'
 // Exchange SDKs staple the signed request / outbound auth frame onto what they
 // hand us on an error path. Everything derived from an SDK error or an SDK
@@ -2467,6 +2468,62 @@ class UserConnector {
             ExchangeEnum.kucoinInverse,
             ExchangeEnum.kucoinLinear,
           ].includes(api.provider)
+          // The order topics carry no fee; a MARKET order's FILLED report
+          // waits (bounded, one lookup per order) for the REST record's fee
+          // (utils/kucoinFeeSettle). Unresolved = reported without a fee.
+          // `sendRequest` is the client's own signer; the lib exposes no
+          // futures `/fills` method.
+          const kucoinRest = client as unknown as {
+            sendRequest: (
+              endpoint: string,
+              method: 'GET',
+              params: Record<string, string>,
+              type: 'private',
+              futures?: boolean,
+            ) => Promise<{ status: string; data: unknown }>
+          }
+          const settleKucoinFee = createKucoinFeeSettler({
+            futures,
+            getSpotOrder: async (orderId) => {
+              const res = await client.getOrderById({ id: orderId })
+              return res?.status === 'OK' ? res.data : null
+            },
+            getFuturesFills: async (orderId) => {
+              const res = await kucoinRest.sendRequest(
+                '/api/v1/fills',
+                'GET',
+                { orderId },
+                'private',
+                true,
+              )
+              return res?.status === 'OK'
+                ? (res.data as { totalNum?: number; items?: [] })
+                : null
+            },
+            log: (m) => this.logger(`${id} ${userId} ${m} ${api.provider}`),
+          })
+          const emitKucoinOrder = (
+            report: Parameters<typeof this.userStreamEvent>[1] & {
+              orderStatus?: string
+              orderType?: string
+              orderId?: string
+              totalTradeQuantity?: string
+            },
+          ) => {
+            if (
+              report.orderStatus === 'FILLED' &&
+              report.orderType === 'MARKET' &&
+              report.orderId &&
+              report.orderId !== '-1'
+            ) {
+              settleKucoinFee(
+                report.orderId,
+                Number(report.totalTradeQuantity),
+              ).then((fee) => this.userStreamEvent(id, { ...report, ...fee }))
+              return
+            }
+            this.userStreamEvent(id, report)
+          }
           const closeOrder = futures
             ? await client.ws().futuresOrder((streamMsg) => {
                 const symbols =
@@ -2475,7 +2532,7 @@ class UserConnector {
                     : this.kucoinSymbols.usdm.map((s) => s.symbol)
                 const symbol = convertSymbol(streamMsg.symbol)
                 if (symbols.includes(symbol)) {
-                  this.userStreamEvent(id, {
+                  emitKucoinOrder({
                     ...streamMsg,
                     creationTime: streamMsg.eventTime || +new Date(),
                     newClientOrderId: streamMsg.newClientOrderId || '',
@@ -2491,7 +2548,7 @@ class UserConnector {
                 }
               }, handleError)
             : await client.ws().order((streamMsg) => {
-                this.userStreamEvent(id, {
+                emitKucoinOrder({
                   ...streamMsg,
                   creationTime: streamMsg.eventTime || +new Date(),
                   newClientOrderId: streamMsg.newClientOrderId || '',
