@@ -40,6 +40,16 @@ export type KrakenFillTotals = {
    * `reported`: the FILLED report has gone out.
    */
   settled?: 'settling' | 'reported'
+  /**
+   * Venue fee per currency, summed over the stream fills counted in `qty`
+   * (each `fills` message carries that fill's `fee_paid` / `fee_currency`).
+   */
+  fees?: Record<string, number>
+  /**
+   * A fill was counted from REST, which reports no fee: `fees` covers only
+   * part of the order and must not be reported as its whole cost.
+   */
+  feeIncomplete?: boolean
 }
 
 /**
@@ -64,6 +74,7 @@ export const mergeKrakenRestFills = (
     totals.fillIds.add(id)
     totals.qty += qty
     totals.cost += qty * (+f.price || 0)
+    totals.feeIncomplete = true
     added++
   }
   return added
@@ -74,4 +85,60 @@ export const mergeKrakenRestFills = (
  * + 0.0214 + 0.0087 is 0.030399999999999996). Twelve significant digits is far
  * beyond any Kraken contract step and far below the noise.
  */
+/**
+ * Add one stream fill's fee to the order's running fee. A fill without a
+ * usable fee (absent, non-numeric, blank currency) makes the total
+ * incomplete rather than silently lower. Zero is a real value here: Kraken
+ * settles the fee on the fill itself, so `fee_paid: 0` is a free fill.
+ */
+export const addKrakenFillFee = (
+  totals: KrakenFillTotals,
+  fill: { fee_paid?: unknown; fee_currency?: unknown },
+): void => {
+  const amount = Number(fill?.fee_paid)
+  const asset = `${fill?.fee_currency ?? ''}`.trim().toUpperCase()
+  if (
+    fill?.fee_paid === undefined ||
+    fill?.fee_paid === null ||
+    !Number.isFinite(amount) ||
+    !asset
+  ) {
+    totals.feeIncomplete = true
+    return
+  }
+  totals.fees = totals.fees ?? {}
+  totals.fees[asset] = (totals.fees[asset] ?? 0) + amount
+}
+
+/**
+ * The order's fee in ExecutionReport form: omitted unless every counted fill
+ * reported one and the net cost is positive (a net rebate is not a fee).
+ */
+export const krakenFillFeeFields = (
+  totals: KrakenFillTotals,
+): {
+  feePaid?: string
+  feeAsset?: string
+  feeBreakdown?: { asset: string; amount: string }[]
+} => {
+  if (totals.feeIncomplete || !totals.fees) {
+    return {}
+  }
+  const legs = Object.entries(totals.fees)
+    .map(([asset, amount]) => [asset, +amount.toPrecision(12)] as const)
+    .filter(([, amount]) => amount > 0)
+  if (legs.length === 0) {
+    return {}
+  }
+  if (legs.length === 1) {
+    return { feePaid: `${legs[0][1]}`, feeAsset: legs[0][0] }
+  }
+  return {
+    feeBreakdown: legs.map(([asset, amount]) => ({
+      asset,
+      amount: `${amount}`,
+    })),
+  }
+}
+
 export const krakenQty = (n: number): number => +n.toPrecision(12)

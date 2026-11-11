@@ -30,6 +30,8 @@ import {
   KrakenRestFill,
   krakenQty,
   mergeKrakenRestFills,
+  addKrakenFillFee,
+  krakenFillFeeFields,
 } from './utils/krakenFillSettle'
 
 /**
@@ -4515,7 +4517,18 @@ class UserConnector {
         // populated today, but this is a follow-up: capture `cumFeeDetail`'s
         // shape and migrate before Bybit stops filling the old fields.
         feePaid: data.cumExecFee,
-        feeAsset: data.feeCurrency,
+        // Bybit fills `feeCurrency` for spot only; on linear/inverse it is
+        // "". A blank currency cannot be placed on the pair, so consumers
+        // fell back to the estimate. Derivatives fees settle in the settle
+        // coin — quote for linear, base for inverse — the same rule the
+        // REST mapper (exchange-connector `orderFee`) applies.
+        ...(data.feeCurrency
+          ? { feeAsset: data.feeCurrency }
+          : category === 'linear'
+            ? { feeSide: 'quote' as const }
+            : category === 'inverse'
+              ? { feeSide: 'base' as const }
+              : {}),
       }))
   }
 
@@ -5378,6 +5391,7 @@ class UserConnector {
           totals.fillIds.add(fillId)
           totals.qty += fillQty
           totals.cost += fillQty * fillPrice
+          addKrakenFillFee(totals, fill)
         }
         krakenFillTotals.set(orderKey, totals)
         // The order has already been reported FILLED. Whatever arrives now is
@@ -5449,6 +5463,7 @@ class UserConnector {
           totalTradeQuantity: `${krakenQty(totals.qty)}`,
           uniqueMessageId: `kraken${channel}${JSON.stringify(fill)}`,
           liquidation: false,
+          ...krakenFillFeeFields(totals),
         })
       }
       return reports
