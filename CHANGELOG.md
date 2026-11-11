@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.22] - 2026-11-11
+
+### Fixed
+
+- Price stream: tickers of a multi-symbol frame were published one per timer tick, so the last symbols of a large frame went out noticeably later than the first and consecutive frames interleaved. A frame is now published in one pass, yielding to the event loop every 200 tickers, and frames of the same exchange are published in arrival order.
+
 ## [1.16.21] - 2026-11-09
 
 ### Security
