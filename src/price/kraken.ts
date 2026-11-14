@@ -28,6 +28,10 @@ const chunkSize = 100 // Symbols per subscription request
 // takes a symbol list), at most one message per window.
 const candleFlushMs = 500
 
+// Backoff before re-sending candle subscribes Kraken refused with "Exceeded msg
+// rate" when the refusal cannot be tied to a batch we sent.
+const candleRateRetryMs = 5_000
+
 // Kraken's candle OHLC feed is trade-driven (no periodic kline frames), so thin
 // markets legitimately go quiet well past the default candle timeout. Widen the
 // stall window for Kraken; the connection-liveness check (isFeedAlive) is the
@@ -139,13 +143,20 @@ type KrakenCandleClient = {
   // connection, so a rejection that names no symbol (a rate-limit error
   // carries only a req_id) belongs to the head batch.
   pending: CandleSub[][]
-  // Every wsname queued, sent or subscribed on this socket. Subscribing one a
-  // second time is answered "Already subscribed to one ohlc interval on this
-  // symbol" — naming no symbol, so it would read as a rejection of the batch.
-  wsnames: Set<string>
+  // Every wsname queued, sent or subscribed on this socket, with its room.
+  // Subscribing one a second time is answered "Already subscribed to one ohlc
+  // interval on this symbol" — naming no symbol, so it would read as a
+  // rejection of the batch. Also the source of truth for resubscribing after a
+  // reconnect.
+  wsnames: Map<string, CandleSub>
+  // wsnames Kraken acked on the current connection.
+  acked: Set<string>
+  // Pending re-send after an unattributable "Exceeded msg rate".
+  retryTimer: ReturnType<typeof setTimeout> | null
 }
 
 const alreadySubscribed = /already subscribed/i
+const rateLimited = /exceeded msg rate/i
 
 type CandleSub = { room: string; wsname: string }
 
@@ -545,12 +556,12 @@ class KrakenConnector extends CommonConnector {
     // One socket per interval — sharing one across intervals is what Kraken
     // rejects, leaving the extra timeframes without candles.
     const entry = this.getSpotCandleClient(krakenInterval)
-    entry.wsnames.add(wsnameSymbol)
-
-    entry.queue.push({
+    const sub: CandleSub = {
       room: this.getCandleRoomName(symbol, ExchangeEnum.kraken, interval),
       wsname: wsnameSymbol,
-    })
+    }
+    entry.wsnames.set(wsnameSymbol, sub)
+    entry.queue.push(sub)
     entry.subs++
     this.scheduleCandleFlush(entry)
   }
@@ -586,6 +597,31 @@ class KrakenConnector extends CommonConnector {
   }
 
   /**
+   * Re-send, after a backoff, every symbol of a spot candle socket that is
+   * neither acked nor already queued/in flight. Used when Kraken refuses a
+   * subscribe for rate ("Exceeded msg rate") and the refusal names no symbol
+   * and matches no batch we are waiting on — without this those symbols stay
+   * recorded as subscribed while receiving nothing.
+   */
+  private scheduleCandleRetry(entry: KrakenCandleClient) {
+    if (entry.retryTimer) {
+      return
+    }
+    entry.retryTimer = setTimeout(() => {
+      entry.retryTimer = null
+      const inFlight = new Set(
+        [...entry.queue, ...entry.pending.flat()].map((s) => s.wsname),
+      )
+      for (const [wsname, sub] of entry.wsnames) {
+        if (!entry.acked.has(wsname) && !inFlight.has(wsname)) {
+          entry.queue.push(sub)
+        }
+      }
+      this.scheduleCandleFlush(entry)
+    }, candleRateRetryMs)
+  }
+
+  /**
    * Pick (or open) the spot candle socket that owns `interval`. Never returns a
    * client already carrying a different interval — that is the whole point.
    */
@@ -598,7 +634,8 @@ class KrakenConnector extends CommonConnector {
     }
 
     const pending: KrakenCandleClient['pending'] = []
-    const wsnames: KrakenCandleClient['wsnames'] = new Set()
+    const wsnames: KrakenCandleClient['wsnames'] = new Map()
+    const acked: KrakenCandleClient['acked'] = new Set()
 
     // Take `wsname` out of the batch that sent it (the head batch when the
     // payload names no symbol); returns what was removed.
@@ -635,6 +672,10 @@ class KrakenConnector extends CommonConnector {
         }
         const failed = settle(data?.symbol)
         if (!failed.length) {
+          if (rateLimited.test(data?.error ?? '')) {
+            this.scheduleCandleRetry(entry)
+            return ` — rate-limited subscribe matches no pending batch; re-sending unacked symbols at interval ${interval} in ${candleRateRetryMs / 1000}s`
+          }
           return ''
         }
         // A rejected subscribe never delivers a single candle, so stop
@@ -657,7 +698,31 @@ class KrakenConnector extends CommonConnector {
       if (data?.method !== 'subscribe' || !data?.success) {
         return
       }
+      if (data?.result?.symbol) {
+        acked.add(data.result.symbol)
+      }
       settle(data?.result?.symbol)
+    })
+
+    // The kraken-api client stores every subscribe() call — one per flush
+    // window — as its own topic and replays them all back-to-back as soon as
+    // the socket reconnects. A socket filled over many windows therefore sent
+    // one message per window in the same instant, and Kraken refused the tail
+    // with "Exceeded msg rate" — refusals we were not tracking, so those
+    // symbols went candle-less until the next restart. Take the replay over:
+    // this listener runs synchronously before the client reads its topic store,
+    // so empty the store and re-send every symbol through the paced flush
+    // (chunkSize per message, one message per window).
+    client.on('reconnected', (data) => {
+      if (data?.wsKey !== spotWsKey) {
+        return
+      }
+      client.getWsStore().getTopics(spotWsKey).clear()
+      // In-flight batches died with the old connection; their acks never come.
+      pending.length = 0
+      acked.clear()
+      entry.queue = [...wsnames.values()]
+      this.scheduleCandleFlush(entry)
     })
 
     const entry: KrakenCandleClient = {
@@ -668,6 +733,8 @@ class KrakenConnector extends CommonConnector {
       flushTimer: null,
       pending,
       wsnames,
+      acked,
+      retryTimer: null,
     }
     this.krakenSpotCandleClients.push(entry)
     return entry
@@ -925,6 +992,7 @@ class KrakenConnector extends CommonConnector {
       }
     } else {
       for (const c of this.krakenSpotCandleClients) {
+        if (c.retryTimer) clearTimeout(c.retryTimer)
         c.client.closeAll(true)
         c.client.removeAllListeners()
       }
@@ -1019,6 +1087,7 @@ class KrakenConnector extends CommonConnector {
       k.client.removeAllListeners()
     })
     this.krakenSpotCandleClients.forEach((k) => {
+      if (k.retryTimer) clearTimeout(k.retryTimer)
       k.client.closeAll(true)
       k.client.removeAllListeners()
     })
