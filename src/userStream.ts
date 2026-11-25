@@ -2,6 +2,7 @@ import { convert, convertFutures } from './utils/binance'
 import {
   krakenOpenOrderFill,
   krakenOpenOrdersRemovalIsFill,
+  isKrakenLiquidationFill,
 } from './utils/krakenOpenOrders'
 import { WebsocketClient } from 'binance'
 import { withLosslessOrderIds } from './binance-custom'
@@ -5532,7 +5533,9 @@ class UserConnector {
           totalQuoteTradeQuantity: `${totals.cost}`,
           totalTradeQuantity: `${krakenQty(totals.qty)}`,
           uniqueMessageId: `kraken${channel}${JSON.stringify(fill)}`,
-          liquidation: false,
+          // A venue liquidation chunk (fill_type), so main-app closes the deal
+          // it ended instead of dropping it as an unknown order.
+          liquidation: isKrakenLiquidationFill(fill),
           ...krakenFillFeeFields(totals),
         })
       }

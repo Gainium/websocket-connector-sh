@@ -69,3 +69,32 @@ export const krakenOpenOrderFill = (
 export const krakenOpenOrdersRemovalIsFill = (
   reason: string | null | undefined,
 ): boolean => `${reason ?? ''}`.toLowerCase() === 'full_fill'
+
+/**
+ * Is this Kraken Futures `fills` feed entry a forced close of the account's
+ * own position, not an order it placed?
+ *
+ * Kraken tags every fill with `fill_type`. A liquidation comes in chunks, each
+ * under its own venue order id and with no `cli_ord_id`: the account history
+ * shows them as `PartialLiquidation` / `Liquidation`. Before this, every
+ * Kraken futures fill went out as `liquidation: false`, so main-app dropped
+ * the chunks as orders it did not know. The deal kept tracking a position the
+ * venue had already closed, and booked none of the liquidation loss.
+ *
+ * `unwindBankrupt` / `unwindCounterparty` are the venue force-closing the
+ * account's position too (bankruptcy unwind and auto-deleveraging), which is
+ * what the `liquidation` flag means on Binance (`autoclose-`) as well.
+ * `assignor` / `assignee` are NOT included: they are the takeover side, where
+ * this account receives or hands over a position under a transfer.
+ */
+export const isKrakenLiquidationFill = (fill: {
+  fill_type?: unknown
+  fillType?: unknown
+}): boolean => {
+  const type = `${fill?.fill_type ?? fill?.fillType ?? ''}`.toLowerCase()
+  return (
+    type.includes('liquidation') ||
+    type === 'unwindbankrupt' ||
+    type === 'unwindcounterparty'
+  )
+}
