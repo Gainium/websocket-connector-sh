@@ -3356,6 +3356,7 @@ class UserConnector {
                         msg.data,
                         msg.ts,
                         uuid || userId,
+                        msg.arg.instType,
                       )
                 if (convertedMessage) {
                   this.userStreamEvent(id, convertedMessage)
@@ -5256,9 +5257,21 @@ class UserConnector {
     msg: BitgetFuturesBalance[],
     time: number,
     userId: string,
+    instType?: string,
   ): OutboundAccountPosition | undefined {
     const balances = msg.map((m) => {
-      const available = +m.available
+      // In cross mode the venue accepts a new order only up to
+      // `maxOpenPosAvailable`, which nets the open cross positions'
+      // unrealized loss out; `available` does not. Cap `free` at it (never
+      // raise it) on the linear product types, as the REST balance does
+      // (exchange-connector-sh spec 051); `locked` keeps the partition.
+      const spendable =
+        instType === 'COIN-FUTURES'
+          ? NaN
+          : parseFloat(`${m.maxOpenPosAvailable ?? ''}`)
+      const available = Number.isFinite(spendable)
+        ? Math.max(Math.min(+m.available, spendable), 0)
+        : +m.available
       const margin = +m.equity - +((m as any).unrealizedPL ?? '0') - available
 
       return {
