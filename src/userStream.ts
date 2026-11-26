@@ -5053,21 +5053,39 @@ class UserConnector {
                   ? d.accountType === 'SPOT'
                   : d.accountType === 'UNIFIED',
       )
-      .flatMap((d) => d.coin)
-      .map((b) => {
-        const locked = `${
+      .flatMap((d) => d.coin.map((b) => ({ d, b })))
+      .map(({ d, b }) => {
+        const committed =
           parseFloat(b.locked || '0') +
           parseFloat(b.totalOrderIM || '0') +
           parseFloat(b.totalPositionIM || '0')
-        }`
+        const raw =
+          parseFloat(b.free || '0') +
+          parseFloat(b.walletBalance || '0') -
+          committed
+        // Unified accounts: the venue checks a new order against the
+        // account's `totalAvailableBalance` (USD), which nets out open
+        // positions' unrealized loss; `raw` does not. Cap USDT/USDC (never
+        // raise) and let `locked` take the rest, as the REST balance does
+        // (exchange-connector-sh spec 052; spec 024 here).
+        let cap = NaN
+        if (
+          d.accountType === 'UNIFIED' &&
+          (b.coin === 'USDT' || b.coin === 'USDC')
+        ) {
+          const pool = parseFloat(`${d.totalAvailableBalance ?? ''}`)
+          const equity = parseFloat(`${b.equity ?? ''}`)
+          const usd = parseFloat(`${b.usdValue ?? ''}`)
+          const price = equity > 0 && usd > 0 ? usd / equity : 1
+          cap = Number.isFinite(pool) ? Math.max(pool, 0) / price : NaN
+        }
+        const free = Number.isFinite(cap)
+          ? Math.max(Math.min(raw, cap), 0)
+          : raw
         return {
           asset: b.coin,
-          free: `${
-            parseFloat(b.free || '0') +
-            parseFloat(b.walletBalance || '0') -
-            +locked
-          }`,
-          locked,
+          free: `${free}`,
+          locked: `${committed + (raw - free)}`,
         }
       })
     if (!balances.length) {
